@@ -72,6 +72,20 @@ class OrtRuntime {
   /// 本进程是否已经装上运行时。
   static bool get isLoaded => _instance != null;
 
+  /// 释放 OrtEnv 并清掉单例；没装过时什么也不做。
+  ///
+  /// **进程退出前必须调一次**（所有会话先 close）。不调的话 env 一直活到 C++
+  /// 静态析构阶段，而 libonnxruntime 里日志管理器的 mutex 先于它销毁，env 析构
+  /// 去锁它就是 `mutex lock failed: Invalid argument` → abort(134)。macOS 官方
+  /// 1.22.0 的 arm64 / x86_64 两份库都实测中招；Linux / Windows 只是碰巧析构顺序
+  /// 无害。调过之后再 [instance] 会重新装一份。
+  static void shutdown() {
+    final OrtRuntime? rt = _instance;
+    if (rt == null) return;
+    _instance = null;
+    rt.api.ref.ReleaseEnv.asFunction<void Function(Pointer<OrtEnv>)>()(rt.env);
+  }
+
   static OrtRuntime _open(String? override) {
     final List<String> candidates = override != null && override.isNotEmpty
         ? <String>[override]

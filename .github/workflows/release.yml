@@ -196,7 +196,8 @@ jobs:
           [ "$RUNNER_OS" = "Windows" ] && exe=stage/fushi-subs/fushi-subs.exe
           "$exe" --help
           "$exe" doctor
-          "$exe" models list | head -20
+          # 别接 `| head`：head 关掉管道后 Dart 写 stdout 抛 Broken pipe，退出码 255。
+          "$exe" models list
 
       - name: Package
         shell: bash
