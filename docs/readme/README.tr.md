@@ -55,6 +55,16 @@ Komut satırı aracı ince bir istemci gibi de davranıp işi uzak bir sunucuya 
 fushi-subs transcribe -l ja --server http://192.168.1.10:8642 audiobook.m4b -o out.srt
 ```
 
+Aynı kitabın EPUB'ı varsa eşleşen cue'lar kitabın metnini olduğu gibi (noktalama ve tırnaklar dahil) alır ve token zamanları varsa kitabın cümle sınırlarında yeniden bölünür. Tek adımda ya da sonradan mevcut bir altyazı üzerinde, ASR'yi yeniden çalıştırmadan:
+
+```bash
+# Tek adımda yazıya dök ve kitaba hizala
+fushi-subs transcribe -l ja --book novel.epub audiobook.m4b -o out.srt
+
+# Mevcut bir altyazıyı sonradan hizala; yanındaki out.tokens.jsonl dosyasını (transcribe -o yazar) kullanarak cümle sınırlarında yeniden böler
+fushi-subs align --book novel.epub out.srt -o aligned.srt
+```
+
 ### Ön koşullar
 
 | Bağımlılık | Notlar |

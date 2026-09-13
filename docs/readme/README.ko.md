@@ -51,6 +51,16 @@ CLI는 얇은 클라이언트 역할만 하면서 실제 작업을 원격 서버
 fushi-subs transcribe -l ja --server http://192.168.1.10:8642 audiobook.m4b -o out.srt
 ```
 
+같은 책의 EPUB이 있으면 일치한 cue는 책 본문 그대로(문장 부호·따옴표 포함)로 바뀌고, 토큰별 시각이 있으면 본문의 문장 경계에서 다시 나뉩니다. 한 번에 처리해도 되고, 나중에 기존 자막에 대해 ASR을 다시 돌리지 않고 해도 됩니다:
+
+```bash
+# 전사와 책 정렬을 한 번에
+fushi-subs transcribe -l ja --book novel.epub audiobook.m4b -o out.srt
+
+# 기존 자막을 나중에 정렬. 옆의 out.tokens.jsonl(transcribe -o가 기록)이 있으면 문장 경계에서 다시 분할
+fushi-subs align --book novel.epub out.srt -o aligned.srt
+```
+
 ### 사전 요구 사항
 
 | 의존성 | 설명 |

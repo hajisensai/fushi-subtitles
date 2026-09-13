@@ -54,6 +54,16 @@ De CLI kan ook als dunne client fungeren en het werk aan een externe server over
 fushi-subs transcribe -l ja --server http://192.168.1.10:8642 audiobook.m4b -o out.srt
 ```
 
+Met de EPUB van hetzelfde boek nemen herkende cues de boektekst letterlijk over (inclusief leestekens en aanhalingstekens) en worden ze, als er tijden per token zijn, opnieuw gesplitst op de zinsgrenzen van het boek. In één keer, of later op een bestaande ondertitel zonder de ASR opnieuw te draaien:
+
+```bash
+# Transcriberen en in één keer op het boek uitlijnen
+fushi-subs transcribe -l ja --book novel.epub audiobook.m4b -o out.srt
+
+# Een bestaande ondertitel later uitlijnen; gebruikt het naastgelegen out.tokens.jsonl (geschreven door transcribe -o) om op zinsgrenzen te hersplitsen
+fushi-subs align --book novel.epub out.srt -o aligned.srt
+```
+
 ### Vereisten
 
 | Afhankelijkheid | Opmerkingen |

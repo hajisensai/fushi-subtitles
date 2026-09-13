@@ -9,6 +9,7 @@ import 'package:args/command_runner.dart';
 import 'package:fushi_asr/asr.dart';
 import 'package:fushi_asr_server/asr_server.dart';
 
+import 'align_command.dart';
 import 'doctor.dart';
 
 /// 建命令行。
@@ -18,6 +19,7 @@ CommandRunner<int> buildAsrCommandRunner() {
     '多语言语音识别生成字幕。',
   )
     ..addCommand(TranscribeCommand())
+    ..addCommand(AlignCommand())
     ..addCommand(ModelsCommand())
     ..addCommand(ServeCommand())
     ..addCommand(DoctorCommand());
@@ -62,12 +64,19 @@ class TranscribeCommand extends Command<int> {
       ..addOption('language',
           abbr: 'l',
           help: '语言标签（ja / en / zh / yue / …）。省略则按 --list-languages 里的清单选')
-      ..addOption('output', abbr: 'o', help: '输出文件；省略写 stdout')
+      ..addOption('output',
+          abbr: 'o',
+          help: '输出文件；省略写 stdout。给了文件且没有 --book 时，逐 token 时间 sidecar '
+              '`<输出名>.tokens.jsonl` 写在旁边，之后 `align` 可拿它按正文句界重切')
       ..addOption('format',
           abbr: 'f',
           defaultsTo: 'srt',
           allowed: <String>['srt', 'vtt', 'json'],
           help: '字幕格式')
+      ..addOption('book',
+          abbr: 'b',
+          help: '转录完直接按这本 EPUB 的正文对齐（命中 cue 换成正文原文、按句界重切）；'
+              '等价于 transcribe 之后再 align')
       ..addFlag('clean-speech',
           help: '断言素材是干净朗读（有声书/口述）：语音与静默能量差 30 dB 以上，'
               '走零模型调用的能量门限切段。默认按混音素材处理（动画/影视/任何带 '
@@ -102,6 +111,14 @@ class TranscribeCommand extends Command<int> {
     final SubtitleFormat format = SubtitleFormat.fromName(formatName)!;
     final bool quiet = argResults!['quiet'] as bool;
     final String? serverUrl = argResults!['server'] as String?;
+    final String? bookPath = argResults!['book'] as String?;
+    if (bookPath != null && serverUrl != null) {
+      usageException('--book 暂不支持与 --server 同用：服务端只回字幕文本，本机拿不到逐词时间');
+    }
+    if (bookPath != null && !File(bookPath).existsSync()) {
+      stderr.writeln('EPUB 不存在：$bookPath');
+      return 2;
+    }
 
     final ({AsrModelRegistry registry, Directory? dataRoot}) ctx =
         await _context(this);
@@ -128,6 +145,7 @@ class TranscribeCommand extends Command<int> {
         ? AsrAudioProfile.cleanSpeech
         : AsrAudioProfile.mixedAudio;
 
+    final String? out = argResults!['output'] as String?;
     final String text;
     if (serverUrl != null) {
       text = await _viaServer(serverUrl, paths.single, language, format, quiet);
@@ -160,10 +178,30 @@ class TranscribeCommand extends Command<int> {
             '（${(outcome.audioMs / outcome.elapsed.inMilliseconds).toStringAsFixed(1)}× 实时），'
             'EP=${outcome.provider}');
       }
-      text = outcome.text;
+      if (bookPath != null) {
+        final TranscribeCancellation cancellation = TranscribeCancellation();
+        final EpubBook book =
+            await readCancellableEpubBook(bookPath, cancellation);
+        final BookAlignedSubtitles aligned = await alignTranscriptionWithBook(
+            book, outcome, format,
+            cancellation: cancellation);
+        if (!quiet) printAlignmentStats(aligned.stats);
+        text = aligned.text;
+      } else {
+        text = outcome.text;
+        // sidecar 只配原始 cue 序列：对齐后的 cue 已被重切，行号对不上，不写。
+        final List<AsrCueTokenTiming>? timings = outcome.tokenTimings;
+        if (out != null &&
+            timings != null &&
+            timings.length == outcome.cues.length) {
+          final String tokensPath = defaultTokensPath(out);
+          await File(tokensPath)
+              .writeAsString(serializeAsrCueTokenTimings(timings));
+          if (!quiet) stderr.writeln('写入 $tokensPath（逐 token 时间 sidecar）');
+        }
+      }
     }
 
-    final String? out = argResults!['output'] as String?;
     if (out == null) {
       // 字幕走 stdout，日志与进度一律走 stderr —— 这样 `fushi-subs transcribe … > a.srt`
       // 拿到的是干净的字幕。

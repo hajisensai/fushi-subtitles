@@ -55,6 +55,16 @@ La CLI también puede actuar como cliente ligero y delegar el trabajo en un serv
 fushi-subs transcribe -l ja --server http://192.168.1.10:8642 audiobook.m4b -o out.srt
 ```
 
+Con el EPUB del mismo libro, los cues que coinciden toman el texto del libro tal cual (puntuación y comillas incluidas) y, si hay tiempos por token, se vuelven a dividir en los límites de frase del libro. En un solo paso, o más tarde sobre un subtítulo existente sin repetir el ASR:
+
+```bash
+# Transcribir y alinear con el libro en un solo paso
+fushi-subs transcribe -l ja --book novel.epub audiobook.m4b -o out.srt
+
+# Alinear más tarde un subtítulo existente; usa el out.tokens.jsonl contiguo (escrito por transcribe -o) para redividir en los límites de frase
+fushi-subs align --book novel.epub out.srt -o aligned.srt
+```
+
 ### Requisitos previos
 
 | Dependencia | Notas |
