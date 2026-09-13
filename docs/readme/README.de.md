@@ -27,6 +27,10 @@ ausführbare Datei für die Kommandozeile heißt `fushi-subs`.
   zerlegt Cues anschließend anhand der Emissionszeiten pro Token an Satzgrenzen neu – „ein Cue
   deckt mehrere Sätze ab“ ging messbar von 18 → 0 zurück.
 
+## Installation
+
+Vorgefertigte Archive gibt es auf der [Releases-Seite](https://github.com/hajisensai/fushi-subtitles/releases): Linux (x64 / arm64), macOS (Apple Silicon / Intel) und Windows (x64 / arm64). Entpacken, `fushi-subs` in den `PATH` legen, ffmpeg installieren (siehe „Voraussetzungen“) und dann `fushi-subs doctor` ausführen – es meldet, ob ONNX Runtime und ffmpeg nutzbar sind. Die Linux- und macOS-Archive enthalten ONNX Runtime neben der ausführbaren Datei; unter Windows wird es beim ersten Start automatisch heruntergeladen. macOS-Binaries sind unsigniert: nach dem Entpacken einmal `xattr -dr com.apple.quarantine fushi-subs/` ausführen.
+
 ## Schnellstart
 
 ```bash

@@ -24,6 +24,10 @@
   되메워 놓친 구간을 회수한 다음, 토큰별 발화 시각을 이용해 문장 경계에서 cue를 다시 나눕니다.
   "cue 하나가 여러 문장을 덮는" 사례는 실측 18 → 0으로 줄었습니다.
 
+## 설치
+
+빌드된 아카이브는 [Releases 페이지](https://github.com/hajisensai/fushi-subtitles/releases)에 있습니다: Linux(x64 / arm64), macOS(Apple Silicon / Intel), Windows(x64 / arm64). 압축을 풀고 `fushi-subs`를 `PATH`에 두고 ffmpeg를 설치한 뒤(「사전 요구 사항」 참조) `fushi-subs doctor`를 실행하세요. ONNX Runtime과 ffmpeg가 사용 가능한지 알려줍니다. Linux / macOS 아카이브에는 ONNX Runtime이 실행 파일 옆에 포함되어 있고, Windows에서는 첫 실행 시 자동으로 다운로드됩니다. macOS 바이너리는 서명되지 않았습니다: 압축 해제 후 `xattr -dr com.apple.quarantine fushi-subs/`를 한 번 실행하세요.
+
 ## 빠른 시작
 
 ```bash

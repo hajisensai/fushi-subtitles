@@ -27,6 +27,10 @@ opdrachtregel heet `fushi-subs`.
   vullen en splitst de fragmenten daarna opnieuw op zinsgrenzen met behulp van de emissietijden per
   token — "één fragment dat meerdere zinnen beslaat" gemeten 18 → 0.
 
+## Installatie
+
+Kant-en-klare archieven staan op de [Releases-pagina](https://github.com/hajisensai/fushi-subtitles/releases): Linux (x64 / arm64), macOS (Apple Silicon / Intel) en Windows (x64 / arm64). Pak uit, zet `fushi-subs` in je `PATH`, installeer ffmpeg (zie „Vereisten”) en draai `fushi-subs doctor` – het meldt of ONNX Runtime en ffmpeg bruikbaar zijn. De Linux- en macOS-archieven bevatten ONNX Runtime naast het uitvoerbare bestand; op Windows wordt het bij de eerste start automatisch gedownload. macOS-binaries zijn niet ondertekend: voer na het uitpakken eenmalig `xattr -dr com.apple.quarantine fushi-subs/` uit.
+
 ## Snel aan de slag
 
 ```bash

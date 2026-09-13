@@ -27,6 +27,10 @@ perintahnya bernama `fushi-subs`.
   lalu memotong ulang cue pada batas kalimat memakai waktu emisi per token — kasus "satu cue
   mencakup beberapa kalimat" terukur 18 → 0.
 
+## Instalasi
+
+Arsip siap pakai ada di [halaman Releases](https://github.com/hajisensai/fushi-subtitles/releases): Linux (x64 / arm64), macOS (Apple Silicon / Intel), dan Windows (x64 / arm64). Ekstrak, letakkan `fushi-subs` di `PATH`, pasang ffmpeg (lihat «Prasyarat»), lalu jalankan `fushi-subs doctor` — ia melaporkan apakah ONNX Runtime dan ffmpeg bisa dipakai. Arsip Linux / macOS menyertakan ONNX Runtime di samping berkas eksekusi; di Windows diunduh otomatis saat pertama dijalankan. Biner macOS tidak ditandatangani: setelah ekstrak jalankan sekali `xattr -dr com.apple.quarantine fushi-subs/`.
+
 ## Mulai cepat
 
 ```bash

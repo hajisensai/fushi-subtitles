@@ -1,0 +1,274 @@
+# fushi-subs 六平台发布：linux-x64 / linux-arm64 / macos-arm64 / macos-x64 /
+# windows-x64 / windows-arm64，发到本仓 GitHub Release。
+#
+# ── 触发 ────────────────────────────────────────────────────────────────────
+# * 手动 workflow_dispatch：beta（预发布，tag `v<version>-beta.<run_number>`）或
+#   formal（正式，tag `v<version>`）。`publish=false` 只构建 + 传 artifact，不发
+#   Release——改这个文件后先这样跑一遍再动真格。
+# * 推 `v*` tag：tag 必须以 `v<packages/asr_cli/pubspec.yaml 的 version>` 开头，
+#   带 `-` 的算预发布。
+#
+# ── 每个包里有什么 ─────────────────────────────────────────────────────────
+#   fushi-subs(.exe)          dart compile exe 单文件，web UI 已编进去
+#   libonnxruntime.*          仅 Linux / macOS：官方 CPU 版 1.22.0，放在 exe 旁边
+#                             （asr_onnx_ffi 的查找顺序：ASR_ONNXRUNTIME_LIB > 托管
+#                             下载 > exe 同级 > 系统路径）。Windows **有意不带**：
+#                             首跑会自动下 DirectML 版（GPU 加速），exe 旁若已有
+#                             CPU 版会抢先被选中、静默丢掉 GPU。
+#   README.md / LICENSE
+# ffmpeg 不随包，用户自装（README「Prerequisites」）。
+#
+# ── 冒烟门 ────────────────────────────────────────────────────────────────
+# 每个平台都用**打包的那份可执行文件**跑 `fushi-subs doctor`：随包 / 自动下载的
+# ONNX Runtime 在该 OS/架构真能加载、ffmpeg 解析得到，退出码 0 才允许打包。
+# 这一步在 Windows 上会真走一遍 NuGet 下载路径，等于把首跑体验也测了。
+name: release
+
+on:
+  workflow_dispatch:
+    inputs:
+      channel:
+        description: Release channel (beta = prerelease; formal = normal release)
+        type: choice
+        required: true
+        default: beta
+        options:
+          - beta
+          - formal
+      publish:
+        description: Publish a GitHub Release (false = build + upload artifacts only)
+        type: boolean
+        required: true
+        default: true
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  DART_VERSION: '3.13.3'
+  ORT_VERSION: '1.22.0'
+
+jobs:
+  meta:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.resolve.outputs.version }}
+      tag: ${{ steps.resolve.outputs.tag }}
+      name: ${{ steps.resolve.outputs.name }}
+      prerelease: ${{ steps.resolve.outputs.prerelease }}
+      publish: ${{ steps.resolve.outputs.publish }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Resolve version / tag / channel
+        id: resolve
+        shell: bash
+        env:
+          EVENT: ${{ github.event_name }}
+          REF_NAME: ${{ github.ref_name }}
+          INPUT_CHANNEL: ${{ github.event.inputs.channel }}
+          INPUT_PUBLISH: ${{ github.event.inputs.publish }}
+          RUN_NUMBER: ${{ github.run_number }}
+        run: |
+          set -euo pipefail
+          VERSION=$(sed -n 's/^version: *//p' packages/asr_cli/pubspec.yaml | tr -d '"'"'" | sed 's/+.*//')
+          [ -n "$VERSION" ] || { echo "::error::packages/asr_cli/pubspec.yaml has no version:"; exit 1; }
+          PUBLISH=true
+          if [ "$EVENT" = "push" ]; then
+            TAG="$REF_NAME"
+            case "$TAG" in
+              "v${VERSION}"|"v${VERSION}-"*) : ;;
+              *) echo "::error title=Tag/version mismatch::tag $TAG but packages/asr_cli/pubspec.yaml says $VERSION"; exit 1 ;;
+            esac
+            case "$TAG" in *-*) PRERELEASE=true ;; *) PRERELEASE=false ;; esac
+          else
+            PUBLISH="${INPUT_PUBLISH:-true}"
+            case "${INPUT_CHANNEL:-beta}" in
+              beta)   TAG="v${VERSION}-beta.${RUN_NUMBER}"; PRERELEASE=true ;;
+              formal) TAG="v${VERSION}"; PRERELEASE=false ;;
+              *) echo "::error::channel must be beta or formal"; exit 1 ;;
+            esac
+          fi
+          {
+            echo "version=$VERSION"
+            echo "tag=$TAG"
+            echo "name=fushi-subs $TAG"
+            echo "prerelease=$PRERELEASE"
+            echo "publish=$PUBLISH"
+          } >> "$GITHUB_OUTPUT"
+          echo "version=$VERSION tag=$TAG prerelease=$PRERELEASE publish=$PUBLISH"
+
+  build:
+    needs: meta
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Linux 用 22.04（glibc 2.35）：dart compile exe 产物只动态链 glibc，构建机
+          # 的 glibc 就是产物的最低要求，老一点覆盖面大一点。
+          - target: linux-x64
+            os: ubuntu-22.04
+            arch: x64
+            ort_archive: onnxruntime-linux-x64
+          - target: linux-arm64
+            os: ubuntu-22.04-arm
+            arch: arm64
+            ort_archive: onnxruntime-linux-aarch64
+          - target: macos-arm64
+            os: macos-15
+            arch: arm64
+            ort_archive: onnxruntime-osx-arm64
+          - target: macos-x64
+            os: macos-15-intel
+            arch: x64
+            ort_archive: onnxruntime-osx-x86_64
+          - target: windows-x64
+            os: windows-2022
+            arch: x64
+            ort_archive: ''
+          - target: windows-arm64
+            os: windows-11-arm
+            arch: arm64
+            ort_archive: ''
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dart-lang/setup-dart@v1
+        with:
+          sdk: ${{ env.DART_VERSION }}
+          architecture: ${{ matrix.arch }}
+
+      - name: Install ffmpeg (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends ffmpeg
+      - name: Install ffmpeg (macOS)
+        if: runner.os == 'macOS'
+        run: brew install ffmpeg
+      - name: Install ffmpeg (Windows)
+        if: runner.os == 'Windows'
+        run: choco install ffmpeg -y --no-progress
+
+      - name: Pub get
+        run: dart pub get
+
+      - name: Compile
+        shell: bash
+        run: |
+          set -euo pipefail
+          exe=fushi-subs
+          [ "$RUNNER_OS" = "Windows" ] && exe=fushi-subs.exe
+          mkdir -p stage/fushi-subs
+          dart compile exe packages/asr_cli/bin/asr.dart -o "stage/fushi-subs/$exe"
+          cp README.md LICENSE stage/fushi-subs/
+          ls -la stage/fushi-subs
+
+      # Linux / macOS：官方 CPU 版 ORT 放在 exe 旁边。`cp -a` 保留 .so.1 / .1.22.0.dylib
+      # 的符号链接，tar 也保留——目标机上 dlopen 的是裸名，链接断了就是「找不到库」。
+      - name: Bundle ONNX Runtime
+        if: matrix.ort_archive != ''
+        shell: bash
+        env:
+          ORT_ARCHIVE: ${{ matrix.ort_archive }}
+        run: |
+          set -euo pipefail
+          name="${ORT_ARCHIVE}-${ORT_VERSION}"
+          curl -fsSL --retry 3 -o "$RUNNER_TEMP/ort.tgz" \
+            "https://github.com/microsoft/onnxruntime/releases/download/v${ORT_VERSION}/${name}.tgz"
+          tar -xzf "$RUNNER_TEMP/ort.tgz" -C "$RUNNER_TEMP"
+          cp -a "$RUNNER_TEMP/$name/lib/"libonnxruntime.* stage/fushi-subs/
+          ls -la stage/fushi-subs
+
+      - name: Smoke (doctor + help + models list, from the packaged binary)
+        shell: bash
+        env:
+          ASR_DATA_DIR: ${{ runner.temp }}/asr-data
+        run: |
+          set -euo pipefail
+          exe=stage/fushi-subs/fushi-subs
+          [ "$RUNNER_OS" = "Windows" ] && exe=stage/fushi-subs/fushi-subs.exe
+          "$exe" --help
+          "$exe" doctor
+          "$exe" models list | head -20
+
+      - name: Package
+        shell: bash
+        env:
+          VERSION: ${{ needs.meta.outputs.version }}
+          TARGET: ${{ matrix.target }}
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          if [ "$RUNNER_OS" = "Windows" ]; then
+            (cd stage && 7z a -tzip "../dist/fushi-subs-${VERSION}-${TARGET}.zip" fushi-subs > /dev/null)
+          else
+            tar -C stage -czf "dist/fushi-subs-${VERSION}-${TARGET}.tar.gz" fushi-subs
+          fi
+          ls -la dist
+      - uses: actions/upload-artifact@v4
+        with:
+          name: fushi-subs-${{ matrix.target }}
+          path: dist/*
+          if-no-files-found: error
+
+  publish:
+    needs:
+      - meta
+      - build
+    if: needs.meta.outputs.publish == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: fushi-subs-*
+          path: dist
+          merge-multiple: true
+      - name: Checksums
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd dist
+          sha256sum fushi-subs-* > SHA256SUMS
+          cat SHA256SUMS
+      - name: Release notes
+        id: notes
+        shell: bash
+        run: |
+          set -euo pipefail
+          {
+            echo "body<<NOTES_EOF"
+            cat <<'MD'
+          `fushi-subs` command line + built-in web UI (`fushi-subs serve`), one archive per platform.
+
+          | Archive | Contents |
+          |---|---|
+          | `linux-x64` / `linux-arm64` | `fushi-subs` + `libonnxruntime.so` (CPU, glibc >= 2.35) |
+          | `macos-arm64` / `macos-x64` | `fushi-subs` + `libonnxruntime.dylib` (CPU; unsigned — run `xattr -dr com.apple.quarantine fushi-subs/` after unzipping) |
+          | `windows-x64` / `windows-arm64` | `fushi-subs.exe`; ONNX Runtime (DirectML, GPU-capable) is downloaded automatically on first run. Needs the Microsoft Visual C++ Redistributable. |
+
+          **ffmpeg is required and not bundled** — install it from your package manager and keep it on `PATH`
+          (or point `ASR_FFMPEG` at it). Run `fushi-subs doctor` to check the environment.
+
+          Verify downloads against `SHA256SUMS`.
+          MD
+            echo "NOTES_EOF"
+          } >> "$GITHUB_OUTPUT"
+      - name: Publish GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ needs.meta.outputs.tag }}
+          target_commitish: ${{ github.sha }}
+          name: ${{ needs.meta.outputs.name }}
+          body: ${{ steps.notes.outputs.body }}
+          prerelease: ${{ needs.meta.outputs.prerelease }}
+          generate_release_notes: true
+          files: |
+            dist/fushi-subs-*
+            dist/SHA256SUMS

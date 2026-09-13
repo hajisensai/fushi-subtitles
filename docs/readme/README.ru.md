@@ -27,6 +27,10 @@
   режет реплики по границам предложений, опираясь на время появления каждого токена, — «одна реплика
   накрывает несколько предложений» измерено как 18 → 0.
 
+## Установка
+
+Готовые архивы лежат на [странице Releases](https://github.com/hajisensai/fushi-subtitles/releases): Linux (x64 / arm64), macOS (Apple Silicon / Intel) и Windows (x64 / arm64). Распакуйте, положите `fushi-subs` в `PATH`, установите ffmpeg (см. «Требования») и запустите `fushi-subs doctor` — он покажет, доступны ли ONNX Runtime и ffmpeg. В архивах для Linux и macOS ONNX Runtime лежит рядом с исполняемым файлом; в Windows он скачивается автоматически при первом запуске. Бинарники для macOS не подписаны: после распаковки один раз выполните `xattr -dr com.apple.quarantine fushi-subs/`.
+
 ## Быстрый старт
 
 ```bash

@@ -27,6 +27,10 @@ se chama `fushi-subs`.
   redivide as legendas nos limites de frase usando os tempos de emissão por token — "uma legenda
   cobrindo várias frases" medido em 18 → 0.
 
+## Instalação
+
+Os arquivos pré-compilados estão na [página de Releases](https://github.com/hajisensai/fushi-subtitles/releases): Linux (x64 / arm64), macOS (Apple Silicon / Intel) e Windows (x64 / arm64). Descompacte, coloque `fushi-subs` no seu `PATH`, instale o ffmpeg (veja «Pré-requisitos») e rode `fushi-subs doctor` — ele informa se o ONNX Runtime e o ffmpeg estão utilizáveis. Os arquivos de Linux e macOS trazem o ONNX Runtime ao lado do executável; no Windows ele é baixado automaticamente na primeira execução. Os binários de macOS não são assinados: após descompactar, rode uma vez `xattr -dr com.apple.quarantine fushi-subs/`.
+
 ## Início rápido
 
 ```bash

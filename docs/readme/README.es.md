@@ -28,6 +28,10 @@ llama `fushi-subs`.
   después vuelve a dividir los cues en los límites de frase usando los tiempos de emisión por token;
   los casos de «un cue que abarca varias frases» pasaron de 18 a 0 en la medición.
 
+## Instalación
+
+Los archivos precompilados están en la [página de Releases](https://github.com/hajisensai/fushi-subtitles/releases): Linux (x64 / arm64), macOS (Apple Silicon / Intel) y Windows (x64 / arm64). Descomprime, pon `fushi-subs` en tu `PATH`, instala ffmpeg (ver «Requisitos previos») y ejecuta `fushi-subs doctor`: informa si ONNX Runtime y ffmpeg están disponibles. Los archivos de Linux y macOS incluyen ONNX Runtime junto al ejecutable; en Windows se descarga automáticamente en la primera ejecución. Los binarios de macOS no están firmados: ejecuta una vez `xattr -dr com.apple.quarantine fushi-subs/` tras descomprimir.
+
 ## Inicio rápido
 
 ```bash

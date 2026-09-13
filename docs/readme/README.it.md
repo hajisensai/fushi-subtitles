@@ -27,6 +27,10 @@ Estratto da [Fushi](https://github.com/hajisensai/Fushi) in un repository autono
   gli ancoraggi e infine risuddivide le battute sui confini di frase usando i tempi di emissione
   per token — «una battuta che copre più frasi» misurata 18 → 0.
 
+## Installazione
+
+Gli archivi precompilati sono nella [pagina Releases](https://github.com/hajisensai/fushi-subtitles/releases): Linux (x64 / arm64), macOS (Apple Silicon / Intel) e Windows (x64 / arm64). Estrai, metti `fushi-subs` nel `PATH`, installa ffmpeg (vedi «Prerequisiti») e poi esegui `fushi-subs doctor`: riporta se ONNX Runtime e ffmpeg sono utilizzabili. Gli archivi Linux e macOS includono ONNX Runtime accanto all'eseguibile; su Windows viene scaricato automaticamente al primo avvio. I binari macOS non sono firmati: dopo l'estrazione esegui una volta `xattr -dr com.apple.quarantine fushi-subs/`.
+
 ## Avvio rapido
 
 ```bash
