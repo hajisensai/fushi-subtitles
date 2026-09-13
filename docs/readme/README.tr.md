@@ -28,6 +28,10 @@ dosyasının adı `fushi-subs`.
   üretim zamanlarını kullanarak blokları cümle sınırlarından yeniden böler — "birkaç cümleyi
   kapsayan tek blok" ölçümü 18 → 0 oldu.
 
+## Kurulum
+
+Önceden derlenmiş arşivler [Releases sayfasında](https://github.com/hajisensai/fushi-subtitles/releases): Linux (x64 / arm64), macOS (Apple Silicon / Intel) ve Windows (x64 / arm64). Açın, `fushi-subs` dosyasını `PATH` içine koyun, ffmpeg kurun (bkz. «Ön koşullar») ve `fushi-subs doctor` çalıştırın – ONNX Runtime ile ffmpeg kullanılabilir mi bildirir. Linux ve macOS arşivlerinde ONNX Runtime çalıştırılabilir dosyanın yanında gelir; Windows'ta ilk çalıştırmada otomatik indirilir. macOS ikilileri imzasızdır: açtıktan sonra bir kez `xattr -dr com.apple.quarantine fushi-subs/` çalıştırın.
+
 ## Hızlı başlangıç
 
 ```bash

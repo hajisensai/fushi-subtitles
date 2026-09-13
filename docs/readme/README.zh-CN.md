@@ -19,6 +19,10 @@ Fushi 反过来引用它。命令行可执行文件叫 `fushi-subs`。
 - **有声书对齐**（`fushi_asr_align`）：把字幕 cue 与 EPUB 正文逐句对上，用锚点回填捞回漏配的段，
   再用逐 token 发射时间按正文句界重切——「一条 cue 盖了好几句」实测 18 → 0。
 
+## 安装
+
+预编译包在 [Releases 页面](https://github.com/hajisensai/fushi-subtitles/releases)：Linux（x64 / arm64）、macOS（Apple Silicon / Intel）、Windows（x64 / arm64）。解压后把 `fushi-subs` 放进 `PATH`，装好 ffmpeg（见「前置依赖」），再跑 `fushi-subs doctor`——它会报告 ONNX Runtime 和 ffmpeg 是否可用。Linux / macOS 包里 ONNX Runtime 就放在可执行文件旁边；Windows 首次运行时自动下载。macOS 二进制未签名：解压后跑一次 `xattr -dr com.apple.quarantine fushi-subs/`。
+
 ## 快速开始
 
 ```bash

@@ -25,6 +25,10 @@
   アンカー間を埋め戻して取りこぼした箇所を回収し、さらにトークン単位の発話時刻を使って文境界で
   cue を切り直します。「1 つの cue が複数の文をまたぐ」件数は実測で 18 → 0 になりました。
 
+## インストール
+
+ビルド済みアーカイブは [Releases ページ](https://github.com/hajisensai/fushi-subtitles/releases) にあります：Linux（x64 / arm64）、macOS（Apple Silicon / Intel）、Windows（x64 / arm64）。展開して `fushi-subs` を `PATH` に置き、ffmpeg をインストール（「前提条件」参照）してから `fushi-subs doctor` を実行してください。ONNX Runtime と ffmpeg が使えるかを報告します。Linux / macOS のアーカイブには ONNX Runtime が実行ファイルの隣に同梱され、Windows では初回実行時に自動ダウンロードされます。macOS のバイナリは未署名です：展開後に一度 `xattr -dr com.apple.quarantine fushi-subs/` を実行してください。
+
 ## クイックスタート
 
 ```bash

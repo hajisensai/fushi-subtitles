@@ -9,6 +9,8 @@ import 'package:args/command_runner.dart';
 import 'package:fushi_asr/asr.dart';
 import 'package:fushi_asr_server/asr_server.dart';
 
+import 'doctor.dart';
+
 /// 建命令行。
 CommandRunner<int> buildAsrCommandRunner() {
   final CommandRunner<int> runner = CommandRunner<int>(
@@ -17,7 +19,8 @@ CommandRunner<int> buildAsrCommandRunner() {
   )
     ..addCommand(TranscribeCommand())
     ..addCommand(ModelsCommand())
-    ..addCommand(ServeCommand());
+    ..addCommand(ServeCommand())
+    ..addCommand(DoctorCommand());
   runner.argParser
     ..addOption('models',
         help: '模型清单 JSON（与内置清单按 id 合并；也可用 ASR_MODELS_MANIFEST）')
