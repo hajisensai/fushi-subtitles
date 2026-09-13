@@ -1,6 +1,6 @@
 name: fushi_asr_cli
 description: fushi-subs command line - transcribe, models, serve.
-version: 0.1.0
+version: 0.1.1
 publish_to: none
 resolution: workspace
 

@@ -1,6 +1,6 @@
 name: fushi_asr_align
 description: EPUB and text to audio alignment - sentence matching, anchor gap filling, cue resegmentation.
-version: 0.1.0
+version: 0.1.1
 publish_to: none
 resolution: workspace
 
