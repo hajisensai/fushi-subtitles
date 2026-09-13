@@ -66,7 +66,7 @@ fushi-subs align --book novel.epub out.srt -o aligned.srt
 
 | 依存関係 | 備考 |
 |---|---|
-| **ONNX Runtime** | `onnxruntime.dll` / `libonnxruntime.so` / `libonnxruntime.dylib`（**1.22 以上**。これより古いと `GetApi(22)` が nullptr を返すため、インストール済みでも使えません）。探索順は、`ASR_ONNXRUNTIME_LIB` 環境変数 → 必要に応じて取得される管理下のコピー → 実行ファイルと同じ場所 → システムの検索パス。**Windows では使えるバージョンが見つからない場合に自動でダウンロードします**（NuGet の `Microsoft.ML.OnnxRuntime.DirectML`、17.9 MB、sha256 で固定、配置先は `<データルート>/asr_runtime/`）。GitHub リリースの CPU 専用ビルドではなく DirectML ビルドを使うのは、そうしないと GPU アクセラレーションが黙って失われるためです。`DirectML.dll` 自体は Windows のシステムコンポーネントから供給されます。加えて Microsoft Visual C++ 再頒布可能パッケージも必要です。macOS では `script/bootstrap_macos.sh` を、Linux ではディストリビューションのパッケージマネージャーを使ってください。 |
+| **ONNX Runtime** | `onnxruntime.dll` / `libonnxruntime.so` / `libonnxruntime.dylib`（**1.22 以上**。これより古いと `GetApi(22)` が nullptr を返すため、インストール済みでも使えません）。探索順は、`ASR_ONNXRUNTIME_LIB` 環境変数 → 必要に応じて取得される管理下のコピー → 実行ファイルと同じ場所 → システムの検索パス。**Windows では使えるバージョンが見つからない場合に自動でダウンロードします**（NuGet の `Microsoft.ML.OnnxRuntime.DirectML`、17.9 MB、sha256 で固定、配置先は `<データルート>/asr_runtime/`）。GitHub リリースの CPU 専用ビルドではなく DirectML ビルドを使うのは、そうしないと GPU アクセラレーションが黙って失われるためです。`DirectML.dll` は Windows 向けリリースアーカイブに同梱され、実行ファイルのディレクトリ → `ASR_DIRECTML_LIB` → `System32` の順で解決されます（Windows 10 同梱のものは 2020 年のビルドで ORT 1.22 では使えないため、システムのコピーは最後の手段です。どれが選ばれたかは `fushi-subs doctor` が表示します）。加えて Microsoft Visual C++ 再頒布可能パッケージも必要です。macOS では `script/bootstrap_macos.sh` を、Linux ではディストリビューションのパッケージマネージャーを使ってください。 |
 | **ffmpeg** | 任意の音声／動画を 16 kHz モノラル PCM にデコードします。探索順は `ASR_FFMPEG` → 実行ファイルと同じ場所 → `PATH`。`ffprobe` は任意です（無い場合は総再生時間が分からないため、進捗のパーセンテージが不正確になります）。 |
 
 その他の環境変数：`ASR_DATA_DIR`（モデルとジョブディレクトリのルート）と

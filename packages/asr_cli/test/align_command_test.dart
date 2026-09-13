@@ -104,4 +104,65 @@ void main() {
     expect(await run(['${dir.path}/nope.srt', '--book', epub, '-o', out]), 2);
     expect(File(out).existsSync(), isFalse);
   });
+
+  test('--matches writes one JSON line per output cue with book positions',
+      () async {
+    await File(defaultTokensPath(srt)).writeAsString(_tokens());
+    final String matches = '${dir.path}/matches.jsonl';
+    expect(
+        await run([srt, '--book', epub, '-o', out, '--matches', matches]), 0);
+    final List<String> lines =
+        (await File(matches).readAsString()).trim().split('\n');
+    final List<SubtitleCue> cues = parseSrt(await File(out).readAsString());
+    expect(lines, hasLength(cues.length));
+    expect(cues, hasLength(2), reason: '带 sidecar 时重切成两句');
+    for (int i = 0; i < lines.length; i++) {
+      final Map<String, Object?> row =
+          jsonDecode(lines[i]) as Map<String, Object?>;
+      expect(row['cue'], i + 1);
+      expect(row['section'], 0);
+      expect(row['start'], isA<int>());
+      expect((row['end'] as int), greaterThan(row['start'] as int));
+      expect((row['score'] as num), greaterThan(0));
+    }
+    // 第二句紧接第一句：位置单调。
+    final int end1 = (jsonDecode(lines[0]) as Map)['end'] as int;
+    final int start2 = (jsonDecode(lines[1]) as Map)['start'] as int;
+    expect(start2, greaterThanOrEqualTo(end1));
+  });
+
+  test('--window/--threshold/--max-misses are validated and applied', () async {
+    expect(
+        await run([
+          srt,
+          '--book',
+          epub,
+          '-o',
+          out,
+          '--window',
+          '120',
+          '--threshold',
+          '0.9',
+          '--max-misses',
+          '5'
+        ]),
+        0);
+    expect(parseSrt(await File(out).readAsString()).single.text,
+        '夢見る時がある。転入生がやってくる。');
+    expect(() => run([srt, '--book', epub, '--window', '0']),
+        throwsA(isA<UsageException>()));
+    expect(() => run([srt, '--book', epub, '--threshold', '1.5']),
+        throwsA(isA<UsageException>()));
+    expect(() => run([srt, '--book', epub, '--max-misses', 'x']),
+        throwsA(isA<UsageException>()));
+  });
+
+  test('transcribe --help shows the shared alignment options', () async {
+    final List<String> lines = <String>[];
+    final runner = buildAsrCommandRunner();
+    final Command<int> transcribe = runner.commands['transcribe']!;
+    lines.add(transcribe.usage);
+    expect(lines.single, contains('--window'));
+    expect(lines.single, contains('--matches'));
+  });
 }

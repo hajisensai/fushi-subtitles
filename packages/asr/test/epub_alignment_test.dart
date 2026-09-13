@@ -93,5 +93,55 @@ void main() {
           await alignCuesWithBook(book, cues, [timing], SubtitleFormat.srt);
       expect(a.text, b.text);
     });
+
+    test('matches: one per output cue, positions in the book, unmatched = -1',
+        () async {
+      final noise = [
+        ...cues,
+        const SubtitleCue(
+            index: 2, startMs: 20000, endMs: 21000, text: 'zzzz qqqq xxxx'),
+      ];
+      final aligned =
+          await alignCuesWithBook(book, noise, null, SubtitleFormat.srt);
+      final out = parseSrt(aligned.text);
+      expect(aligned.matches, hasLength(out.length));
+      final CueMatch hit = aligned.matches.first;
+      expect(hit.matched, isTrue);
+      expect(hit.sectionIndex, 0);
+      // 归一化正文里「夢見る時がある。転入生がやってくる。」的区间：起点在
+      // 「たとえば、」之后，终点不超过本节长度。
+      expect(hit.normCharStart, greaterThan(0));
+      expect(hit.normCharEnd, greaterThan(hit.normCharStart));
+      expect(
+          hit.normCharEnd, lessThanOrEqualTo(book.sections.single.text.length));
+      expect(aligned.matches.last, same(CueMatch.unmatched));
+      expect(out.last.text, 'zzzz qqqq xxxx', reason: '未命中保留听写');
+    });
+
+    test('default options: auto-probe over 50/200/350, stats say which won',
+        () async {
+      final aligned =
+          await alignCuesWithBook(book, cues, null, SubtitleFormat.srt);
+      final probe = aligned.stats['probeWindows'] as Map<String, Object?>;
+      expect(probe.keys, unorderedEquals(['50', '200', '350']));
+      expect(EpubCueMatcher.defaultProbeWindows,
+          contains(aligned.stats['searchWindow']));
+      expect(aligned.stats['similarityThreshold'],
+          EpubSrtMatcher.defaultSimilarityThreshold);
+    });
+
+    test('explicit window: no probe, stats echo the parameters', () async {
+      final aligned = await alignCuesWithBook(
+          book, cues, null, SubtitleFormat.srt,
+          options: const BookAlignOptions(
+              searchWindow: 120,
+              similarityThreshold: 0.9,
+              maxConsecutiveMisses: 7));
+      expect(aligned.stats['searchWindow'], 120);
+      expect(aligned.stats['probeWindows'], isNull);
+      expect(aligned.stats['similarityThreshold'], 0.9);
+      expect(aligned.stats['maxConsecutiveMisses'], 7);
+      expect(parseSrt(aligned.text).single.text, '夢見る時がある。転入生がやってくる。');
+    });
   });
 }

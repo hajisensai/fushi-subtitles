@@ -12,6 +12,7 @@ import 'package:ffi/ffi.dart';
 import 'package:crypto/crypto.dart';
 import 'package:path/path.dart' as p;
 
+import 'package:fushi_asr_onnx_ffi/src/directml_runtime.dart';
 import 'package:fushi_asr_onnx_ffi/src/ffi/onnxruntime_bindings.dart';
 import 'package:fushi_asr_onnx_ffi/src/ort_runtime.dart';
 import 'package:fushi_asr_onnx_ffi/src/ffi_onnx_session.dart';
@@ -221,7 +222,17 @@ class FfiOnnxSessionFactory implements OnnxSessionFactory {
                         Pointer<OrtSessionOptions>, int)>()(
                 options, GraphOptimizationLevel.ORT_ENABLE_BASIC.value));
       }
-      _appendProvider(api, options, preferred, coreMlCache: coreMlCache);
+      // DirectML：先把我们选中的 DirectML.dll 装进进程，ORT 之后按裸名加载拿到
+      // 的就是它，而不是 System32 里 Windows 10 自带的 1.0（见 directml_runtime.dart）。
+      final DirectMlResolution? dml =
+          preferred == OnnxExecutionProvider.directml
+              ? DirectMlRuntime.ensureLoaded()
+              : null;
+      try {
+        _appendProvider(api, options, preferred, coreMlCache: coreMlCache);
+      } on OrtException catch (error) {
+        throw _withDirectMlHint(error, dml);
+      }
 
       final profileDir = Platform.environment['ASR_ORT_PROFILE_DIR'];
       final profile = preferred == OnnxExecutionProvider.coreml &&
@@ -251,9 +262,12 @@ class FfiOnnxSessionFactory implements OnnxSessionFactory {
         }
       }
 
-      final FfiOnnxSession session =
-          FfiOnnxSession.create(runtime, bytes, options, profiling: profile);
-      return session;
+      try {
+        return FfiOnnxSession.create(runtime, bytes, options,
+            profiling: profile);
+      } on OrtException catch (error) {
+        throw _withDirectMlHint(error, dml);
+      }
     } finally {
       if (options != nullptr) {
         api.ref.ReleaseSessionOptions
@@ -261,6 +275,14 @@ class FfiOnnxSessionFactory implements OnnxSessionFactory {
       }
       calloc.free(optionsOut);
     }
+  }
+
+  /// DML 建会话失败时把「用的是哪份 DirectML.dll、版本够不够」缀在 ORT 原话后面。
+  /// ORT 自己的报错只有 HRESULT（`887A0004`），不会说是 DLL 太旧。
+  static OrtException _withDirectMlHint(
+      OrtException error, DirectMlResolution? dml) {
+    if (dml == null) return error;
+    return OrtException(error.code, '${error.message}；${dml.describe()}');
   }
 
   void _appendProvider(Pointer<OrtApi> api, Pointer<OrtSessionOptions> options,

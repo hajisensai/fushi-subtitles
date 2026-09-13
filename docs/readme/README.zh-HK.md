@@ -60,7 +60,7 @@ fushi-subs align --book novel.epub out.srt -o aligned.srt
 
 | 相依項 | 說明 |
 |---|---|
-| **ONNX Runtime** | `onnxruntime.dll` / `libonnxruntime.so` / `libonnxruntime.dylib`（**1.22+**，低於此版本 `GetApi(22)` 會回傳 nullptr，就算裝了也用不了）。尋找順序：`ASR_ONNXRUNTIME_LIB` 環境變數 → 按需下載的託管副本 → 可執行檔同層目錄 → 系統搜尋路徑。**Windows 上找不到可用版本時會自動下載**（NuGet 的 `Microsoft.ML.OnnxRuntime.DirectML`，17.9 MB，以 sha256 釘死，落在 `<資料根目錄>/asr_runtime/`）；下載的是 DirectML 那一份而非 GitHub release 的純 CPU 版，否則 GPU 加速會無聲消失。`DirectML.dll` 本身來自 Windows 內建的系統元件。另外還需要 Microsoft Visual C++ Redistributable。macOS 請用 `script/bootstrap_macos.sh`，Linux 則用發行版的套件管理員。 |
+| **ONNX Runtime** | `onnxruntime.dll` / `libonnxruntime.so` / `libonnxruntime.dylib`（**1.22+**，低於此版本 `GetApi(22)` 會回傳 nullptr，就算裝了也用不了）。尋找順序：`ASR_ONNXRUNTIME_LIB` 環境變數 → 按需下載的託管副本 → 可執行檔同層目錄 → 系統搜尋路徑。**Windows 上找不到可用版本時會自動下載**（NuGet 的 `Microsoft.ML.OnnxRuntime.DirectML`，17.9 MB，以 sha256 釘死，落在 `<資料根目錄>/asr_runtime/`）；下載的是 DirectML 那一份而非 GitHub release 的純 CPU 版，否則 GPU 加速會無聲消失。`DirectML.dll` 隨 Windows 發佈套件附帶，按可執行檔目錄 → `ASR_DIRECTML_LIB` → `System32` 的次序解析（Windows 10 內建的是 2020 年的舊版，ORT 1.22 用不到，系統那份只是最後兜底；`fushi-subs doctor` 會報出選中的是哪一份）。另外還需要 Microsoft Visual C++ Redistributable。macOS 請用 `script/bootstrap_macos.sh`，Linux 則用發行版的套件管理員。 |
 | **ffmpeg** | 用來把任意音訊／視訊解碼成 16 kHz 單聲道 PCM。尋找順序：`ASR_FFMPEG` → 可執行檔同層 → `PATH`。`ffprobe` 為選用（少了它就探不出總長度，進度百分比會不準）。 |
 
 其他環境變數：`ASR_DATA_DIR`（模型與工作目錄的根）與 `ASR_MODELS_MANIFEST`（自備的模型清單）。
