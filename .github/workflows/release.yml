@@ -15,6 +15,7 @@
 #                             下载 > exe 同级 > 系统路径）。Windows **有意不带**：
 #                             首跑会自动下 DirectML 版（GPU 加速），exe 旁若已有
 #                             CPU 版会抢先被选中、静默丢掉 GPU。
+#   start.cmd / start.command / start.sh   双击 = `fushi-subs serve --open`（起服务 + 开浏览器）
 #   README.md / LICENSE
 # ffmpeg 不随包，用户自装（README「Prerequisites」）。
 #
@@ -168,6 +169,12 @@ jobs:
           mkdir -p stage/fushi-subs
           dart compile exe packages/asr_cli/bin/asr.dart -o "stage/fushi-subs/$exe"
           cp README.md LICENSE stage/fushi-subs/
+          # 双击启动脚本：Windows 给 .cmd，macOS 给 .command（Finder 可双击），Linux 给 .sh。
+          case "$RUNNER_OS" in
+            Windows) cp packages/asr_cli/launcher/start.cmd stage/fushi-subs/ ;;
+            macOS)   cp packages/asr_cli/launcher/start.command stage/fushi-subs/ ;;
+            *)       cp packages/asr_cli/launcher/start.sh stage/fushi-subs/ ;;
+          esac
           ls -la stage/fushi-subs
 
       # Linux / macOS：官方 CPU 版 ORT 放在 exe 旁边。`cp -a` 保留 .so.1 / .1.22.0.dylib
@@ -246,7 +253,7 @@ jobs:
           {
             echo "body<<NOTES_EOF"
             cat <<'MD'
-          `fushi-subs` command line + built-in web UI (`fushi-subs serve`), one archive per platform.
+          `fushi-subs` command line + built-in web UI, one archive per platform. **Double-click `start.cmd` (Windows) / `start.command` (macOS) / run `./start.sh` (Linux)** to start the server and open the web UI in your browser; or use the CLI directly (`fushi-subs transcribe -l en file.mp3 > file.srt`).
 
           | Archive | Contents |
           |---|---|
