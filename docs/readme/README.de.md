@@ -31,6 +31,8 @@ ausführbare Datei für die Kommandozeile heißt `fushi-subs`.
 
 Vorgefertigte Archive gibt es auf der [Releases-Seite](https://github.com/hajisensai/fushi-subtitles/releases): Linux (x64 / arm64), macOS (Apple Silicon / Intel) und Windows (x64 / arm64). Entpacken, `fushi-subs` in den `PATH` legen, ffmpeg installieren (siehe „Voraussetzungen“) und dann `fushi-subs doctor` ausführen – es meldet, ob ONNX Runtime und ffmpeg nutzbar sind. Die Linux- und macOS-Archive enthalten ONNX Runtime neben der ausführbaren Datei; unter Windows wird es beim ersten Start automatisch heruntergeladen. macOS-Binaries sind unsigniert: nach dem Entpacken einmal `xattr -dr com.apple.quarantine fushi-subs/` ausführen.
 
+Nur die Web-Oberfläche? Im entpackten Ordner `start.cmd` (Windows) / `start.command` (macOS) doppelklicken oder `./start.sh` (Linux) ausführen – startet den Server und öffnet die Seite im Browser.
+
 ## Schnellstart
 
 ```bash

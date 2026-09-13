@@ -29,6 +29,8 @@ Extracted from [Fushi](https://github.com/hajisensai/Fushi) into a standalone re
 
 Prebuilt archives are on the [Releases page](https://github.com/hajisensai/fushi-subtitles/releases): Linux (x64 / arm64), macOS (Apple Silicon / Intel) and Windows (x64 / arm64). Unpack, put `fushi-subs` on your `PATH`, install ffmpeg (see [Prerequisites](#prerequisites)), then run `fushi-subs doctor` — it reports whether ONNX Runtime and ffmpeg are usable. Linux and macOS archives ship ONNX Runtime next to the executable; on Windows it is downloaded automatically on first run. macOS binaries are unsigned: run `xattr -dr com.apple.quarantine fushi-subs/` once after unpacking.
 
+Just want the web UI? Double-click `start.cmd` (Windows) / `start.command` (macOS) or run `./start.sh` (Linux) inside the unpacked folder — it starts the server and opens the page in your browser.
+
 ## Quick start
 
 ```bash

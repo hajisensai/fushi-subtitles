@@ -28,6 +28,8 @@ ONNX ที่ถอดเปลี่ยนได้** ทำงานฝั่
 
 ไฟล์ที่คอมไพล์แล้วอยู่ที่[หน้า Releases](https://github.com/hajisensai/fushi-subtitles/releases): Linux (x64 / arm64), macOS (Apple Silicon / Intel) และ Windows (x64 / arm64) แตกไฟล์ นำ `fushi-subs` ไปไว้ใน `PATH` ติดตั้ง ffmpeg (ดู «สิ่งที่ต้องมี») แล้วรัน `fushi-subs doctor` ซึ่งจะรายงานว่า ONNX Runtime และ ffmpeg ใช้งานได้หรือไม่ ไฟล์สำหรับ Linux / macOS มี ONNX Runtime อยู่ข้างไฟล์โปรแกรม ส่วน Windows จะดาวน์โหลดอัตโนมัติเมื่อรันครั้งแรก ไบนารี macOS ไม่ได้ลงนาม: หลังแตกไฟล์ให้รัน `xattr -dr com.apple.quarantine fushi-subs/` หนึ่งครั้ง
 
+ต้องการแค่หน้าเว็บ? ดับเบิลคลิก `start.cmd` (Windows) / `start.command` (macOS) หรือรัน `./start.sh` (Linux) ในโฟลเดอร์ที่แตกไฟล์แล้ว จะเริ่มเซิร์ฟเวอร์และเปิดหน้าเว็บในเบราว์เซอร์ให้
+
 ## เริ่มต้นอย่างรวดเร็ว
 
 ```bash

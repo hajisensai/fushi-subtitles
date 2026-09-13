@@ -29,6 +29,8 @@
 
 الأرشيفات الجاهزة موجودة في [صفحة Releases](https://github.com/hajisensai/fushi-subtitles/releases): Linux (x64 / arm64) و macOS (Apple Silicon / Intel) و Windows (x64 / arm64). فكّ الضغط، ضع `fushi-subs` في `PATH`، ثبّت ffmpeg (انظر «المتطلبات»)، ثم شغّل `fushi-subs doctor` — يخبرك إن كان ONNX Runtime و ffmpeg جاهزين. أرشيفات Linux و macOS تحوي ONNX Runtime بجوار الملف التنفيذي؛ على Windows يُنزَّل تلقائياً عند أول تشغيل. ثنائيات macOS غير موقّعة: بعد فك الضغط شغّل مرة واحدة `xattr -dr com.apple.quarantine fushi-subs/`.
 
+تريد واجهة الويب فقط؟ انقر نقراً مزدوجاً على `start.cmd` (Windows) / `start.command` (macOS) أو شغّل `./start.sh` (Linux) داخل المجلد المفكوك — يشغّل الخادم ويفتح الصفحة في المتصفح.
+
 ## البداية السريعة
 
 ```bash

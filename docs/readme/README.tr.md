@@ -32,6 +32,8 @@ dosyasının adı `fushi-subs`.
 
 Önceden derlenmiş arşivler [Releases sayfasında](https://github.com/hajisensai/fushi-subtitles/releases): Linux (x64 / arm64), macOS (Apple Silicon / Intel) ve Windows (x64 / arm64). Açın, `fushi-subs` dosyasını `PATH` içine koyun, ffmpeg kurun (bkz. «Ön koşullar») ve `fushi-subs doctor` çalıştırın – ONNX Runtime ile ffmpeg kullanılabilir mi bildirir. Linux ve macOS arşivlerinde ONNX Runtime çalıştırılabilir dosyanın yanında gelir; Windows'ta ilk çalıştırmada otomatik indirilir. macOS ikilileri imzasızdır: açtıktan sonra bir kez `xattr -dr com.apple.quarantine fushi-subs/` çalıştırın.
 
+Sadece web arayüzü mü lazım? Açılan klasörde `start.cmd` (Windows) / `start.command` (macOS) dosyasına çift tıklayın ya da `./start.sh` (Linux) çalıştırın – sunucu başlar ve sayfa tarayıcıda açılır.
+
 ## Hızlı başlangıç
 
 ```bash

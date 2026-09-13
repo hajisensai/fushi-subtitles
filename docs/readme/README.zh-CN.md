@@ -23,6 +23,8 @@ Fushi 反过来引用它。命令行可执行文件叫 `fushi-subs`。
 
 预编译包在 [Releases 页面](https://github.com/hajisensai/fushi-subtitles/releases)：Linux（x64 / arm64）、macOS（Apple Silicon / Intel）、Windows（x64 / arm64）。解压后把 `fushi-subs` 放进 `PATH`，装好 ffmpeg（见「前置依赖」），再跑 `fushi-subs doctor`——它会报告 ONNX Runtime 和 ffmpeg 是否可用。Linux / macOS 包里 ONNX Runtime 就放在可执行文件旁边；Windows 首次运行时自动下载。macOS 二进制未签名：解压后跑一次 `xattr -dr com.apple.quarantine fushi-subs/`。
 
+只想用网页界面？在解压目录里双击 `start.cmd`（Windows）/ `start.command`（macOS）或运行 `./start.sh`（Linux）——它会起服务并在浏览器里打开页面。
+
 ## 快速开始
 
 ```bash

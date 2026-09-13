@@ -29,6 +29,8 @@ thế**, chạy phía máy chủ và được điều khiển từ CLI hoặc gi
 
 Bản dựng sẵn có ở [trang Releases](https://github.com/hajisensai/fushi-subtitles/releases): Linux (x64 / arm64), macOS (Apple Silicon / Intel) và Windows (x64 / arm64). Giải nén, đặt `fushi-subs` vào `PATH`, cài ffmpeg (xem «Yêu cầu»), rồi chạy `fushi-subs doctor` — nó cho biết ONNX Runtime và ffmpeg có dùng được không. Gói Linux / macOS kèm sẵn ONNX Runtime cạnh file thực thi; trên Windows nó được tải tự động ở lần chạy đầu. Binary macOS chưa ký: sau khi giải nén chạy một lần `xattr -dr com.apple.quarantine fushi-subs/`.
 
+Chỉ cần giao diện web? Nhấp đúp `start.cmd` (Windows) / `start.command` (macOS) hoặc chạy `./start.sh` (Linux) trong thư mục đã giải nén — nó khởi động máy chủ và mở trang trong trình duyệt.
+
 ## Bắt đầu nhanh
 
 ```bash
