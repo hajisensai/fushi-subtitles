@@ -21,8 +21,15 @@ export 'src/reusing_onnx_session_factory.dart' show ReusingOnnxSessionFactory;
 export 'src/ffi_onnx_session.dart' show FfiOnnxSession;
 export 'src/ffi_onnx_session_factory.dart'
     show FfiOnnxSessionFactory, buildFfiOnnxFactory;
+export 'src/directml_runtime.dart'
+    show DirectMlResolution, DirectMlRuntime, kDirectMlRequiredVersion;
 export 'src/ort_runtime.dart'
-    show OrtException, OrtRuntime, OrtRuntimeUnavailable, kOrtApiVersion;
+    show
+        OrtException,
+        OrtRuntime,
+        OrtRuntimeUnavailable,
+        kOrtApiVersion,
+        readNativeCString;
 export 'src/ort_provisioning.dart'
     show
         OrtProvisionCorrupt,

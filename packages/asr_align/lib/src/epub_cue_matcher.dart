@@ -88,6 +88,24 @@ class EpubCueMatcher {
     );
     return Isolate.run(() => _probeAndFillEntrypoint(req));
   }
+
+  /// [probeInIsolate] 的同步版（含回填）：已经身在后台 isolate / compute 任务里
+  /// 时用——再开一层 isolate 只是多拷一遍全书。UI isolate 上别调。
+  static ProbeResult probe({
+    required List<EpubSection> sections,
+    required List<AlignCue> cues,
+    List<int> windows = defaultProbeWindows,
+    double similarityThreshold = EpubSrtMatcher.defaultSimilarityThreshold,
+    int maxConsecutiveMisses = EpubSrtMatcher.defaultMaxConsecutiveMisses,
+  }) =>
+      _probeAndFill(
+        sections: sections,
+        cues: cues,
+        windows: windows,
+        similarityThreshold: similarityThreshold,
+        maxConsecutiveMisses: maxConsecutiveMisses,
+        gapFiller: gapFiller,
+      );
 }
 
 /// [EpubCueMatcher.matchInIsolate] / [EpubCueMatcher.probeInIsolate] 发给
@@ -138,23 +156,34 @@ MatchResult _matchAndFillEntrypoint(_MatchAndFillRequest req) {
   return req.gapFiller.fill(sections: req.sections, cues: cues, result: core);
 }
 
-ProbeResult _probeAndFillEntrypoint(_MatchAndFillRequest req) {
-  final List<AlignCue> cues = req.rebuildCues();
+ProbeResult _probeAndFillEntrypoint(_MatchAndFillRequest req) => _probeAndFill(
+      sections: req.sections,
+      cues: req.rebuildCues(),
+      windows: req.windows,
+      similarityThreshold: req.similarityThreshold,
+      maxConsecutiveMisses: req.maxConsecutiveMisses,
+      gapFiller: req.gapFiller,
+    );
+
+ProbeResult _probeAndFill({
+  required List<EpubSection> sections,
+  required List<AlignCue> cues,
+  required List<int> windows,
+  required double similarityThreshold,
+  required int maxConsecutiveMisses,
+  required AnchorGapFiller gapFiller,
+}) {
   final ProbeResult probe = EpubSrtMatcher.probe(
-    sections: req.sections,
+    sections: sections,
     cues: cues,
-    windows: req.windows,
-    similarityThreshold: req.similarityThreshold,
-    maxConsecutiveMisses: req.maxConsecutiveMisses,
+    windows: windows,
+    similarityThreshold: similarityThreshold,
+    maxConsecutiveMisses: maxConsecutiveMisses,
   );
   final MatchResult? best = probe.bestResult;
   if (best == null) return probe;
   return ProbeResult(
     perWindow: probe.perWindow,
-    bestResult: req.gapFiller.fill(
-      sections: req.sections,
-      cues: cues,
-      result: best,
-    ),
+    bestResult: gapFiller.fill(sections: sections, cues: cues, result: best),
   );
 }

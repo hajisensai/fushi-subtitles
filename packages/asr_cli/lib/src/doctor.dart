@@ -35,12 +35,19 @@ class DoctorReport {
     required this.providers,
     required this.ffmpeg,
     required this.ffprobe,
+    this.directml,
   });
 
   final DoctorProbe ort;
 
   /// ORT 装上后探到的加速 EP 名；装不上时为空。
   final List<String> providers;
+
+  /// Windows 且 ORT 带 DirectML EP 时：进程会用哪份 `DirectML.dll`、够不够新。
+  /// `GetAvailableProviders` 只说 EP 编译进去了，不说建得出 DML 设备；Windows 10
+  /// System32 里那份 1.0 就是「EP 在、设备建不出、静默回落 CPU」的典型。
+  /// 不参与 [healthy]：CPU 照样能转录，只是慢。
+  final DirectMlResolution? directml;
   final DoctorProbe ffmpeg;
 
   /// ffprobe 可选（缺了只是进度百分比不准），不参与 [healthy]。
@@ -57,16 +64,21 @@ Future<DoctorReport> collectDoctorReport({
 }) async {
   final DoctorProbe ort = await _probeOrt(onDownload);
   List<String> providers = const <String>[];
+  DirectMlResolution? directml;
   if (ort.ok) {
     final Set<OnnxExecutionProvider> eps =
         await FfiOnnxSessionFactory().availableAcceleratedProviders();
     providers = eps.map((OnnxExecutionProvider e) => e.name).toList()..sort();
+    if (Platform.isWindows && eps.contains(OnnxExecutionProvider.directml)) {
+      directml = DirectMlRuntime.ensureLoaded();
+    }
   }
   return DoctorReport(
     ort: ort,
     providers: providers,
     ffmpeg: await _probeTool(resolveFfmpegExecutable()),
     ffprobe: await _probeTool(resolveFfprobeExecutable()),
+    directml: directml,
   );
 }
 
@@ -125,6 +137,12 @@ String formatDoctorReport(DoctorReport report) {
   if (report.ort.ok) {
     b.writeln('  加速后端: '
         '${report.providers.isEmpty ? "无（仅 CPU）" : report.providers.join(", ")}');
+    final DirectMlResolution? dml = report.directml;
+    if (dml != null) {
+      b.writeln(dml.found && dml.meetsRequirement
+          ? '  ✓ ${dml.describe()}'
+          : '  △ ${dml.describe()}\n    GPU 加速大概率建不出设备而回落 CPU（能转录，只是慢）');
+    }
   }
   b.writeln(_line('ffmpeg', report.ffmpeg));
   b.writeln(_line('ffprobe', report.ffprobe, optional: true));

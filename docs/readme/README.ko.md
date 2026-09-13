@@ -65,7 +65,7 @@ fushi-subs align --book novel.epub out.srt -o aligned.srt
 
 | 의존성 | 설명 |
 |---|---|
-| **ONNX Runtime** | `onnxruntime.dll` / `libonnxruntime.so` / `libonnxruntime.dylib` (**1.22 이상** — 그보다 낮으면 `GetApi(22)`가 nullptr를 반환하므로, 설치돼 있어도 쓸 수 없습니다). 탐색 순서: `ASR_ONNXRUNTIME_LIB` 환경 변수 → 필요할 때 받아 두는 관리 사본 → 실행 파일과 같은 위치 → 시스템 검색 경로. **Windows에서는 사용할 수 있는 버전이 없으면 자동으로 내려받습니다**(NuGet의 `Microsoft.ML.OnnxRuntime.DirectML`, 17.9 MB, sha256으로 고정, `<데이터 루트>/asr_runtime/`에 배치). GitHub 릴리스의 CPU 전용 빌드가 아니라 DirectML 빌드를 쓰는 이유는, 그렇지 않으면 GPU 가속이 조용히 사라지기 때문입니다. `DirectML.dll` 자체는 Windows 시스템 구성 요소에서 제공됩니다. Microsoft Visual C++ 재배포 가능 패키지도 필요합니다. macOS에서는 `script/bootstrap_macos.sh`를, Linux에서는 배포판 패키지 관리자를 사용하세요. |
+| **ONNX Runtime** | `onnxruntime.dll` / `libonnxruntime.so` / `libonnxruntime.dylib` (**1.22 이상** — 그보다 낮으면 `GetApi(22)`가 nullptr를 반환하므로, 설치돼 있어도 쓸 수 없습니다). 탐색 순서: `ASR_ONNXRUNTIME_LIB` 환경 변수 → 필요할 때 받아 두는 관리 사본 → 실행 파일과 같은 위치 → 시스템 검색 경로. **Windows에서는 사용할 수 있는 버전이 없으면 자동으로 내려받습니다**(NuGet의 `Microsoft.ML.OnnxRuntime.DirectML`, 17.9 MB, sha256으로 고정, `<데이터 루트>/asr_runtime/`에 배치). GitHub 릴리스의 CPU 전용 빌드가 아니라 DirectML 빌드를 쓰는 이유는, 그렇지 않으면 GPU 가속이 조용히 사라지기 때문입니다. `DirectML.dll`은 Windows 릴리스 아카이브에 함께 들어 있으며 실행 파일 디렉터리 → `ASR_DIRECTML_LIB` → `System32` 순서로 찾습니다(Windows 10에 내장된 사본은 2020년 빌드라 ORT 1.22가 쓸 수 없으므로 시스템 사본은 마지막 수단일 뿐입니다. 어느 것이 선택됐는지는 `fushi-subs doctor`가 알려 줍니다). Microsoft Visual C++ 재배포 가능 패키지도 필요합니다. macOS에서는 `script/bootstrap_macos.sh`를, Linux에서는 배포판 패키지 관리자를 사용하세요. |
 | **ffmpeg** | 임의의 오디오/비디오를 16 kHz 모노 PCM으로 디코딩합니다. 탐색 순서: `ASR_FFMPEG` → 실행 파일과 같은 위치 → `PATH`. `ffprobe`는 선택 사항입니다(없으면 전체 길이를 알 수 없어 진행률 백분율이 부정확해집니다). |
 
 그 밖의 환경 변수: `ASR_DATA_DIR`(모델과 작업 디렉터리의 루트), `ASR_MODELS_MANIFEST`(직접 만든

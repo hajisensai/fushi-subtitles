@@ -15,6 +15,13 @@
 #                             下载 > exe 同级 > 系统路径）。Windows **有意不带**：
 #                             首跑会自动下 DirectML 版（GPU 加速），exe 旁若已有
 #                             CPU 版会抢先被选中、静默丢掉 GPU。
+#   DirectML.dll              仅 Windows：Microsoft.AI.DirectML 1.15.4（ORT 1.22 的
+#                             DirectML 包在 NuGet 上声明的依赖）。Windows 10 的
+#                             System32 里是 2020 年的 1.0，ORT 建不出 DML 设备、静默
+#                             回落 CPU（下游实测 GPU 个位数、慢十倍）；Windows 11 自带
+#                             1.15.5 不受影响。引擎按「exe 同级 > System32」解析并预
+#                             加载（asr_onnx_ffi/src/directml_runtime.dart），所以随包
+#                             这份在两边都是被选中的那份。附 LICENSE-DirectML.txt。
 #   start.cmd / start.command / start.sh   双击 = `fushi-subs serve --open`（起服务 + 开浏览器）
 #   README.md / LICENSE
 # ffmpeg 不随包，用户自装（README「Prerequisites」）。
@@ -55,6 +62,11 @@ concurrency:
 env:
   DART_VERSION: '3.13.3'
   ORT_VERSION: '1.22.0'
+  # Microsoft.AI.DirectML nupkg（202 MB，为其中一个 18 MB 的 DLL；只在 CI 拖，不让
+  # 用户机器下）。版本 = ORT_VERSION 那份 DirectML 包在 NuGet 上声明的依赖；换 ORT
+  # 版本时去 microsoft.ml.onnxruntime.directml.nuspec 里对一遍。
+  DML_VERSION: '1.15.4'
+  DML_SHA256: '4e7cb7ddce8cf837a7a75dc029209b520ca0101470fcdf275c1f49736a3615b9'
 
 jobs:
   meta:
@@ -193,6 +205,25 @@ jobs:
           cp -a "$RUNNER_TEMP/$name/lib/"libonnxruntime.* stage/fushi-subs/
           ls -la stage/fushi-subs
 
+      # Windows：随包 DirectML.dll（见文件头）。sha256 钉死——下来的是要装进用户进程的
+      # 机器码。按架构取 bin/<arch>-win/。
+      - name: Bundle DirectML (Windows)
+        if: runner.os == 'Windows'
+        shell: bash
+        env:
+          ARCH: ${{ matrix.arch }}
+        run: |
+          set -euo pipefail
+          pkg="$RUNNER_TEMP/directml.nupkg"
+          curl -fsSL --retry 3 -o "$pkg" \
+            "https://api.nuget.org/v3-flatcontainer/microsoft.ai.directml/${DML_VERSION}/microsoft.ai.directml.${DML_VERSION}.nupkg"
+          echo "${DML_SHA256}  $pkg" | sha256sum -c -
+          mkdir -p "$RUNNER_TEMP/directml"
+          7z x -y -o"$RUNNER_TEMP/directml" "$pkg" "bin/${ARCH}-win/DirectML.dll" LICENSE.txt > /dev/null
+          cp "$RUNNER_TEMP/directml/bin/${ARCH}-win/DirectML.dll" stage/fushi-subs/DirectML.dll
+          cp "$RUNNER_TEMP/directml/LICENSE.txt" stage/fushi-subs/LICENSE-DirectML.txt
+          ls -la stage/fushi-subs
+
       - name: Smoke (doctor + help + models list, from the packaged binary)
         shell: bash
         env:
@@ -202,7 +233,12 @@ jobs:
           exe=stage/fushi-subs/fushi-subs
           [ "$RUNNER_OS" = "Windows" ] && exe=stage/fushi-subs/fushi-subs.exe
           "$exe" --help
-          "$exe" doctor
+          "$exe" doctor | tee "$RUNNER_TEMP/doctor.txt"
+          # Windows：doctor 必须报出用的是随包那份 DirectML.dll 且版本够——否则包里那
+          # 个 18 MB 就是死重，还会让人误以为 Win10 上的 GPU 问题已经修了。
+          if [ "$RUNNER_OS" = "Windows" ]; then
+            grep -F "✓ DirectML.dll = $(cygpath -w "$PWD/stage/fushi-subs/DirectML.dll")" "$RUNNER_TEMP/doctor.txt"
+          fi
           # 别接 `| head`：head 关掉管道后 Dart 写 stdout 抛 Broken pipe，退出码 255。
           "$exe" models list
 
@@ -259,7 +295,7 @@ jobs:
           |---|---|
           | `linux-x64` / `linux-arm64` | `fushi-subs` + `libonnxruntime.so` (CPU, glibc >= 2.35) |
           | `macos-arm64` / `macos-x64` | `fushi-subs` + `libonnxruntime.dylib` (CPU; unsigned — run `xattr -dr com.apple.quarantine fushi-subs/` after unzipping) |
-          | `windows-x64` / `windows-arm64` | `fushi-subs.exe`; ONNX Runtime (DirectML, GPU-capable) is downloaded automatically on first run. Needs the Microsoft Visual C++ Redistributable. |
+          | `windows-x64` / `windows-arm64` | `fushi-subs.exe` + `DirectML.dll` ${{ env.DML_VERSION }} (Windows 10 ships a 2020 DirectML that ORT cannot use; bundling it keeps GPU acceleration on). ONNX Runtime (DirectML, GPU-capable) is downloaded automatically on first run. Needs the Microsoft Visual C++ Redistributable. |
 
           **ffmpeg is required and not bundled** — install it from your package manager and keep it on `PATH`
           (or point `ASR_FFMPEG` at it). Run `fushi-subs doctor` to check the environment.

@@ -3,8 +3,10 @@
 /// 进程内单例：`OrtEnv` 按 ORT 的契约每进程一个就够，而且建它不便宜。
 library;
 
+import 'dart:convert';
 import 'dart:ffi';
 import 'dart:io';
+import 'dart:typed_data';
 
 import 'package:ffi/ffi.dart';
 import 'package:path/path.dart' as p;
@@ -156,8 +158,19 @@ class OrtRuntime {
     }
     // Dart 没有 DynamicLibrary.close：版本不合的库会留在进程里（一个模块句柄）。
     // 换下一个候选比让它毒死整条链划算。
+    //
+    // 符号查找与 open 一样是判据的一部分，同样只能记失败、不能抛：Windows 的
+    // System32 里可能有一份**同名却不导出 `OrtGetApiBase`** 的 DLL（实测 error
+    // 127 ERROR_PROC_NOT_FOUND）。lookup 抛出的 ArgumentError 一旦冒出去，
+    // 「跳过不可用候选、继续往下找」就整个废掉；更糟的是 `ensureOrtRuntime()`
+    // 开头就调这里，异常在下载分支之前抛出，托管运行时永远装不上。
     final OnnxRuntimeBindings bindings = OnnxRuntimeBindings(lib);
-    final Pointer<OrtApiBase> base = bindings.OrtGetApiBase();
+    final Pointer<OrtApiBase> base;
+    try {
+      base = bindings.OrtGetApiBase();
+    } catch (error) {
+      return (null, '不是 ONNX Runtime（找不到 OrtGetApiBase：$error）');
+    }
     if (base == nullptr) return (null, 'OrtGetApiBase 返回空');
     final Pointer<OrtApi> api =
         base.ref.GetApi.asFunction<Pointer<OrtApi> Function(int)>()(
@@ -170,7 +183,7 @@ class OrtRuntime {
           base.ref.GetVersionString.asFunction<Pointer<Char> Function()>()();
       return (
         null,
-        '版本 ${version == nullptr ? "未知" : version.cast<Utf8>().toDartString()}'
+        '版本 ${version == nullptr ? "未知" : readNativeCString(version)}'
             '，不支持 API 版本 $kOrtApiVersion（需要 1.22 或更新）'
       );
     }
@@ -227,7 +240,7 @@ class OrtRuntime {
     final Pointer<OrtApiBase> base = bindings.OrtGetApiBase();
     final Pointer<Char> v =
         base.ref.GetVersionString.asFunction<Pointer<Char> Function()>()();
-    return v == nullptr ? 'unknown' : v.cast<Utf8>().toDartString();
+    return v == nullptr ? 'unknown' : readNativeCString(v);
   }
 }
 
@@ -239,9 +252,28 @@ void checkOrtStatus(Pointer<OrtApi> api, Pointer<OrtStatus> status) {
   final Pointer<Char> message = api.ref.GetErrorMessage
       .asFunction<Pointer<Char> Function(Pointer<OrtStatus>)>()(status);
   final String text =
-      message == nullptr ? '(no message)' : message.cast<Utf8>().toDartString();
+      message == nullptr ? '(no message)' : readNativeCString(message);
   api.ref.ReleaseStatus.asFunction<void Function(Pointer<OrtStatus>)>()(status);
   throw OrtException(code, text);
+}
+
+/// 读原生 NUL 结尾字符串，**非法 UTF-8 不抛**。
+///
+/// ORT 的错误消息不保证是 UTF-8：Windows 上 DML/D3D 的 HRESULT 描述来自
+/// 系统 `FormatMessageA`，走的是当前 ANSI 代码页（中文系统 GBK）。直接
+/// `Utf8.toDartString()` 遇到它抛 `FormatException: Unexpected extension byte
+/// (at offset 169)`——真正的错因（`887A0004 DXGI_ERROR_UNSUPPORTED`：DirectML
+/// 太旧 / 显卡不支持 D3D12）被一个偏移量顶替，用户只能瞎猜。这里按字节读到
+/// NUL，坏字节用 U+FFFD 顶替，能读的部分（错误码、源文件、行号全是 ASCII）
+/// 原样保留。[maxBytes] 是没有 NUL 时的兜底上限。
+String readNativeCString(Pointer<Char> pointer, {int maxBytes = 1 << 16}) {
+  final Pointer<Uint8> bytes = pointer.cast<Uint8>();
+  int length = 0;
+  while (length < maxBytes && bytes[length] != 0) {
+    length++;
+  }
+  final Uint8List view = bytes.asTypedList(length);
+  return utf8.decode(view, allowMalformed: true);
 }
 
 /// 一个通过版本判据的候选。

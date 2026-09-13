@@ -87,6 +87,7 @@ class TranscribeCommand extends Command<int> {
       ..addFlag('no-download', help: '缺模型时报错而不是自动下载', negatable: false)
       ..addOption('server', help: '把活交给远端 asr 服务端（http://host:port），本机不跑推理')
       ..addFlag('quiet', abbr: 'q', help: '不打进度', negatable: false);
+    addBookAlignOptions(argParser);
   }
 
   @override
@@ -115,6 +116,7 @@ class TranscribeCommand extends Command<int> {
     if (bookPath != null && serverUrl != null) {
       usageException('--book 暂不支持与 --server 同用：服务端只回字幕文本，本机拿不到逐词时间');
     }
+    final BookAlignOptions alignOptions = parseBookAlignOptions(argResults!);
     if (bookPath != null && !File(bookPath).existsSync()) {
       stderr.writeln('EPUB 不存在：$bookPath');
       return 2;
@@ -184,8 +186,9 @@ class TranscribeCommand extends Command<int> {
             await readCancellableEpubBook(bookPath, cancellation);
         final BookAlignedSubtitles aligned = await alignTranscriptionWithBook(
             book, outcome, format,
-            cancellation: cancellation);
+            cancellation: cancellation, options: alignOptions);
         if (!quiet) printAlignmentStats(aligned.stats);
+        await writeAlignMatchesIfRequested(argResults!, aligned, quiet: quiet);
         text = aligned.text;
       } else {
         text = outcome.text;
