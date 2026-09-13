@@ -52,6 +52,16 @@ dart run packages/asr_cli/bin/asr.dart serve
 fushi-subs transcribe -l ja --server http://192.168.1.10:8642 audiobook.m4b -o out.srt
 ```
 
+إذا توفّر EPUB لنفس الكتاب، تأخذ المقاطع المتطابقة نصّ الكتاب كما هو (بعلامات الترقيم وعلامات الاقتباس)، وعند توفّر أزمنة الرموز تُقسَّم من جديد عند حدود جمل الكتاب. إمّا في خطوة واحدة، أو لاحقًا على ترجمة موجودة دون إعادة تشغيل التعرّف على الكلام:
+
+```bash
+# النسخ والمحاذاة مع الكتاب في خطوة واحدة
+fushi-subs transcribe -l ja --book novel.epub audiobook.m4b -o out.srt
+
+# محاذاة ترجمة موجودة لاحقًا؛ يلتقط out.tokens.jsonl المجاور (يكتبه transcribe -o) لإعادة التقسيم عند حدود الجمل
+fushi-subs align --book novel.epub out.srt -o aligned.srt
+```
+
 ### المتطلبات المسبقة
 
 | الاعتمادية | ملاحظات |

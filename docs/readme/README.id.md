@@ -54,6 +54,16 @@ CLI juga bisa bertindak sebagai klien tipis dan menyerahkan pekerjaannya ke serv
 fushi-subs transcribe -l ja --server http://192.168.1.10:8642 audiobook.m4b -o out.srt
 ```
 
+Dengan EPUB dari buku yang sama, cue yang cocok memakai teks buku apa adanya (termasuk tanda baca dan tanda kutip) dan, bila ada waktu per token, dipecah ulang pada batas kalimat buku. Sekali jalan, atau nanti pada subtitle yang sudah ada tanpa mengulang ASR:
+
+```bash
+# Transkripsi dan selaraskan ke buku sekali jalan
+fushi-subs transcribe -l ja --book novel.epub audiobook.m4b -o out.srt
+
+# Selaraskan subtitle yang sudah ada belakangan; memakai out.tokens.jsonl di sebelahnya (ditulis transcribe -o) untuk memecah ulang pada batas kalimat
+fushi-subs align --book novel.epub out.srt -o aligned.srt
+```
+
 ### Prasyarat
 
 | Dependensi | Catatan |

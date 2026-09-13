@@ -46,6 +46,16 @@ CLI 也可以只當一個輕量客戶端，把工作交給遠端伺服器：
 fushi-subs transcribe -l ja --server http://192.168.1.10:8642 audiobook.m4b -o out.srt
 ```
 
+手上有同一本書的 EPUB 時，命中的 cue 會換成正文原文（標點、引號一併帶回），有逐詞時間時還會按正文句界重切。可以一步到位，也可以之後對現有字幕做、不重跑識別：
+
+```bash
+# 轉錄並直接按書對齊
+fushi-subs transcribe -l ja --book novel.epub audiobook.m4b -o out.srt
+
+# 之後對現有字幕做對齊；會自動找旁邊的 out.tokens.jsonl（transcribe -o 寫出）來按句界重切
+fushi-subs align --book novel.epub out.srt -o aligned.srt
+```
+
 ### 前置需求
 
 | 相依項 | 說明 |

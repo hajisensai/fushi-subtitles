@@ -52,6 +52,16 @@ CLI cũng có thể đóng vai trò một client mỏng và giao việc cho máy
 fushi-subs transcribe -l ja --server http://192.168.1.10:8642 audiobook.m4b -o out.srt
 ```
 
+Nếu có EPUB của cùng cuốn sách, các cue khớp sẽ lấy nguyên văn trong sách (kể cả dấu câu và ngoặc kép) và, khi có thời điểm theo token, được tách lại theo ranh giới câu của sách. Làm một lần, hoặc làm sau trên phụ đề sẵn có mà không chạy lại ASR:
+
+```bash
+# Chuyển giọng nói thành chữ và căn theo sách trong một lần
+fushi-subs transcribe -l ja --book novel.epub audiobook.m4b -o out.srt
+
+# Căn phụ đề sẵn có về sau; dùng out.tokens.jsonl nằm cạnh (do transcribe -o ghi) để tách lại theo ranh giới câu
+fushi-subs align --book novel.epub out.srt -o aligned.srt
+```
+
 ### Yêu cầu tiên quyết
 
 | Phụ thuộc | Ghi chú |

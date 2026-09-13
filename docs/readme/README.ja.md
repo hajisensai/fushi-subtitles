@@ -52,6 +52,16 @@ CLI はシンクライアントとして振る舞い、処理をリモートサ�
 fushi-subs transcribe -l ja --server http://192.168.1.10:8642 audiobook.m4b -o out.srt
 ```
 
+同じ本の EPUB があれば、一致した cue は本文そのまま（句読点・引用符込み）に置き換わり、トークン単位の時刻があれば本文の文境界で再分割されます。一度に済ませても、既存の字幕に対して後から（ASR を再実行せずに）行っても構いません：
+
+```bash
+# 書き起こしと本文アラインを一度に
+fushi-subs transcribe -l ja --book novel.epub audiobook.m4b -o out.srt
+
+# 既存の字幕を後からアライン。隣の out.tokens.jsonl（transcribe -o が書き出す）があれば文境界で再分割
+fushi-subs align --book novel.epub out.srt -o aligned.srt
+```
+
 ### 前提条件
 
 | 依存関係 | 備考 |

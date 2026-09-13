@@ -358,14 +358,26 @@ String serializeAsrCuesToSrt(List<AsrCue> cues) {
 /// `{"t":[token...],"o":[相对 cue 起点的毫秒...]}`。SRT 是给通用解析器的出境
 /// 格式，token 时间装不进去；导入链路认出转录产物后按行号配回
 /// （`AsrTranscriptionService.attachCueTokenTiming`）。
-String serializeAsrCueTokens(List<AsrCue> cues) {
+String serializeAsrCueTokens(List<AsrCue> cues) => _serializeTokenRows(
+      <(List<String>, List<int>)>[
+        for (final AsrCue cue in cues)
+          if (cue.text.isNotEmpty) (cue.tokens, cue.tokenOffsetsMs),
+      ],
+    );
+
+/// 与 [serializeAsrCueTokens] 同一格式，但输入是已经和 SRT 行号对齐的
+/// [AsrCueTokenTiming] 列表（转录结果读回后的形态：`TranscribeOutcome.tokenTimings`）。
+/// 调用方保证列表与写出的 SRT 一一对应，这里不再按空文本过滤。
+String serializeAsrCueTokenTimings(List<AsrCueTokenTiming> timings) =>
+    _serializeTokenRows(<(List<String>, List<int>)>[
+      for (final AsrCueTokenTiming t in timings) (t.tokens, t.offsetsMs),
+    ]);
+
+String _serializeTokenRows(List<(List<String>, List<int>)> rows) {
   final StringBuffer sb = StringBuffer();
-  for (final AsrCue cue in cues) {
-    if (cue.text.isEmpty) continue;
+  for (final (List<String> tokens, List<int> offsets) in rows) {
     sb
-      ..write(
-        jsonEncode(<String, Object?>{'t': cue.tokens, 'o': cue.tokenOffsetsMs}),
-      )
+      ..write(jsonEncode(<String, Object?>{'t': tokens, 'o': offsets}))
       ..write('\n');
   }
   return sb.toString();
