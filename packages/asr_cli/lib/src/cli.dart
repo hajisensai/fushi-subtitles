@@ -9,6 +9,8 @@ import 'package:args/command_runner.dart';
 import 'package:fushi_asr/asr.dart';
 import 'package:fushi_asr_server/asr_server.dart';
 
+import 'doctor.dart';
+
 /// 建命令行。
 CommandRunner<int> buildAsrCommandRunner() {
   final CommandRunner<int> runner = CommandRunner<int>(
@@ -17,12 +19,12 @@ CommandRunner<int> buildAsrCommandRunner() {
   )
     ..addCommand(TranscribeCommand())
     ..addCommand(ModelsCommand())
-    ..addCommand(ServeCommand());
+    ..addCommand(ServeCommand())
+    ..addCommand(DoctorCommand());
   runner.argParser
     ..addOption('models',
         help: '模型清单 JSON（与内置清单按 id 合并；也可用 ASR_MODELS_MANIFEST）')
-    ..addOption('data-dir',
-        help: '模型与任务目录的根（也可用 ASR_DATA_DIR）');
+    ..addOption('data-dir', help: '模型与任务目录的根（也可用 ASR_DATA_DIR）');
   return runner;
 }
 
@@ -58,7 +60,8 @@ class TranscribeCommand extends Command<int> {
   TranscribeCommand() {
     argParser
       ..addOption('language',
-          abbr: 'l', help: '语言标签（ja / en / zh / yue / …）。省略则按 --list-languages 里的清单选')
+          abbr: 'l',
+          help: '语言标签（ja / en / zh / yue / …）。省略则按 --list-languages 里的清单选')
       ..addOption('output', abbr: 'o', help: '输出文件；省略写 stdout')
       ..addOption('format',
           abbr: 'f',
@@ -268,9 +271,7 @@ class _ModelsPullCommand extends Command<int> {
     argParser
       ..addOption('language', abbr: 'l', help: '语言标签')
       ..addOption('variant',
-          allowed: <String>['fp32', 'int8'],
-          defaultsTo: 'int8',
-          help: '编码器变体');
+          allowed: <String>['fp32', 'int8'], defaultsTo: 'int8', help: '编码器变体');
   }
 
   @override
@@ -357,6 +358,7 @@ class ServeCommand extends Command<int> {
           help: '接口令牌（请求带 Authorization: Bearer <token>）；省略则不鉴权')
       ..addFlag('cpu', help: '强制 CPU', negatable: false)
       ..addFlag('coreml', help: '使用 macOS CoreML（FP32 模型）', negatable: false)
+      ..addFlag('open', help: '启动后用系统默认浏览器打开网页界面（双击启动脚本用）', negatable: false)
       ..addOption('concurrency',
           defaultsTo: '1', help: '同时跑几个转录任务。**默认 1**：GPU 会话并发建很容易把显存撑爆');
   }
@@ -392,27 +394,43 @@ class ServeCommand extends Command<int> {
     TranscribeRunner? multilingualRunner;
     List<TranscribeBackend>? backends;
     if (Platform.isMacOS && !(argResults!['cpu'] as bool)) {
-      macRunner = TranscribeRunner(registry: ctx.registry, dataRoot: ctx.dataRoot, forceCoreMl: true);
-      multilingualRunner = TranscribeRunner(registry: ctx.registry, dataRoot: ctx.dataRoot);
-      final apple = AppleTranscribeRunner(executablePath:
-        Platform.environment['ASR_APPLE_TRANSCRIBE'] ??
-        '${File(Platform.resolvedExecutable).parent.path}/apple_transcribe');
+      macRunner = TranscribeRunner(
+          registry: ctx.registry, dataRoot: ctx.dataRoot, forceCoreMl: true);
+      multilingualRunner =
+          TranscribeRunner(registry: ctx.registry, dataRoot: ctx.dataRoot);
+      final apple = AppleTranscribeRunner(
+          executablePath: Platform.environment['ASR_APPLE_TRANSCRIBE'] ??
+              '${File(Platform.resolvedExecutable).parent.path}/apple_transcribe');
       String? coreMlReason;
       try {
-        if (!(await FfiOnnxSessionFactory().availableAcceleratedProviders()).contains(OnnxExecutionProvider.coreml)) {
+        if (!(await FfiOnnxSessionFactory().availableAcceleratedProviders())
+            .contains(OnnxExecutionProvider.coreml)) {
           coreMlReason = '当前 ONNX Runtime 未包含 CoreML';
         }
-      } catch (e) { coreMlReason = 'CoreML 运行时不可用：$e'; }
+      } catch (e) {
+        coreMlReason = 'CoreML 运行时不可用：$e';
+      }
       backends = [
-        TranscribeBackend(id: 'default', name: 'Fushi 原版 · CPU（推荐）',
-          description: '日语使用原版 ReazonSpeech INT8 快速路径；其他语言按原有模型处理，缺模型时自动下载',
-          service: multilingualRunner, languages: ctx.registry.languages.map((l) => l.tag).toList()),
-        TranscribeBackend(id: 'apple', name: 'Apple SpeechTranscriber',
-          description: 'macOS 原生 · 日语 · 本地转录 · 每次任务独立加载',
-          service: apple, languages: ['ja'], unavailableReason: await apple.unavailableReason()),
-        TranscribeBackend(id: 'coreml', name: 'ReazonSpeech · CoreML（实验）',
-          description: '日语 FP32 · CoreML + CPU · 常驻会话；当前导出图分区较多，可能慢于原版 INT8',
-          service: macRunner, languages: ['ja'], unavailableReason: coreMlReason),
+        TranscribeBackend(
+            id: 'default',
+            name: 'Fushi 原版 · CPU（推荐）',
+            description: '日语使用原版 ReazonSpeech INT8 快速路径；其他语言按原有模型处理，缺模型时自动下载',
+            service: multilingualRunner,
+            languages: ctx.registry.languages.map((l) => l.tag).toList()),
+        TranscribeBackend(
+            id: 'apple',
+            name: 'Apple SpeechTranscriber',
+            description: 'macOS 原生 · 日语 · 本地转录 · 每次任务独立加载',
+            service: apple,
+            languages: ['ja'],
+            unavailableReason: await apple.unavailableReason()),
+        TranscribeBackend(
+            id: 'coreml',
+            name: 'ReazonSpeech · CoreML（实验）',
+            description: '日语 FP32 · CoreML + CPU · 常驻会话；当前导出图分区较多，可能慢于原版 INT8',
+            service: macRunner,
+            languages: ['ja'],
+            unavailableReason: coreMlReason),
       ];
     }
     final AsrServer server = AsrServer(
@@ -429,6 +447,7 @@ class ServeCommand extends Command<int> {
       );
       stderr.writeln('fushi-subs 服务端已启动：$uri');
       stderr.writeln('界面：$uri　　API：${uri}v1/transcribe');
+      if (argResults!['open'] as bool) await openInBrowser(uri);
       await ProcessSignal.sigint.watch().first;
       stderr.writeln('\n收到 SIGINT，停止服务');
       await server.stop();
@@ -438,5 +457,26 @@ class ServeCommand extends Command<int> {
       await multilingualRunner?.close();
     }
     return 0;
+  }
+}
+
+/// 用系统默认浏览器打开 [uri]；打不开只警告不失败——服务端本身已经起来了。
+///
+/// 监听在 0.0.0.0 时浏览器要连的是回环地址，不是通配地址。
+Future<void> openInBrowser(Uri uri) async {
+  final Uri target = uri.host == '0.0.0.0' || uri.host == '::'
+      ? uri.replace(host: '127.0.0.1')
+      : uri;
+  final String url = target.toString();
+  final (String exe, List<String> args) = Platform.isWindows
+      // `start` 是 cmd 内建；第一个引号参数是窗口标题，空串占位免得 URL 被当标题。
+      ? ('cmd', <String>['/c', 'start', '', url])
+      : Platform.isMacOS
+          ? ('open', <String>[url])
+          : ('xdg-open', <String>[url]);
+  try {
+    await Process.start(exe, args, mode: ProcessStartMode.detached);
+  } catch (e) {
+    stderr.writeln('打不开浏览器（$e），请手动访问 $url');
   }
 }

@@ -11,7 +11,7 @@ if ! dart analyze packages; then
   status=1
 fi
 
-for package in asr_core asr_onnx_ffi asr_align asr asr_server; do
+for package in asr_core asr_onnx_ffi asr_align asr asr_server asr_cli; do
   echo "==> Testing packages/$package"
   if ! (cd "$ROOT_DIR/packages/$package" && dart test); then
     status=1
