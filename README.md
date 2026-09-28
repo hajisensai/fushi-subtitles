@@ -156,6 +156,7 @@ back as the last line.
 | `fushi_asr_core` | The pure-Dart transcription core: VAD segmentation, fbank, RNN-T greedy Loop graph / CTC decoding, batching and bucketing, fp16 graph conversion, model manifest and downloads, SRT output. **No Flutter, no dart:ffi, no bundled ONNX backend** | `meta` `path` `crypto` |
 | `fushi_asr_onnx_ffi` | The dart:ffi ONNX Runtime backend (CPU / DirectML / CUDA) | `fushi_asr_core` `ffi` |
 | `fushi_asr_align` | EPUB / text ↔ audio alignment: sentence-level Dice matching (including a ruby reading track), gap backfilling between anchors, cue re-splitting on sentence boundaries | `fushi_asr_core` |
+| `fushi_asr_subtitles` | Subtitle formats; retiming an existing subtitle against an ASR transcript; aligning a subtitle to a reference subtitle track by cue start times only (CM-break segments, multi-reference voting) and a byte-preserving timestamp rewriter for SRT / VTT / ASS | `fushi_asr_core` |
 | `fushi_asr` | The facade: a one-call `TranscribeRunner` plus subtitle formats | the two above |
 | `fushi_asr_server` | The HTTP server and client plus the web UI | `fushi_asr` |
 | `fushi_asr_cli` | The `asr` command line | `fushi_asr` `fushi_asr_server` `args` |
@@ -171,6 +172,7 @@ dart analyze packages
 cd packages/asr_core && dart test        # 326 tests
 cd packages/asr_onnx_ffi && dart test    # 15 tests, needs a real onnxruntime (the group skips without one)
 cd packages/asr_align && dart test       # 15 tests
+cd packages/asr_subtitles && dart test   # 104 tests
 cd packages/asr && dart test             # 10 tests
 cd packages/asr_server && dart test      # 10 tests
 ```
@@ -196,3 +198,8 @@ The implementation plan and design trade-offs are in [docs/PLAN.md](docs/PLAN.md
 
 GPL-3.0, see [LICENSE](LICENSE). The headers under `third_party/onnxruntime/` come from ONNX
 Runtime (MIT) and keep their original license.
+
+The reference-track alignment in `fushi_asr_subtitles` (`subtitle_reference_alignment.dart`)
+follows the approach and the empirically chosen thresholds of
+[Tsubasa](https://github.com/SonicSandbox/Tsubasa-sync) (GPL-3.0, `tsubasa/align/objective.py` and
+`fit.py`). It is a Dart rewrite of the idea, not a line-by-line port.
