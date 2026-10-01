@@ -11,8 +11,16 @@
 /// 历史：这套逻辑最初绑着漫画 OCR 的 `MangaOcrModelFile` / `MangaOcrDownloadEvent`
 /// 住在 `lib/src/ocr/manga_ocr_model_downloader.dart`；有声书 ASR 接入后抬到本
 /// 文件，OCR 那边改成薄适配（类型转换），行为与测试原样保留。
+///
+/// 连接健康（[ModelDownloadResilience]）：几 GB 的单文件要在一条 TCP 连接上跑
+/// 很久，而代理出口 / 链路会中途劣化——实测同一代理下，跑了 3 小时的旧连接只剩
+/// 50 KB/s，新开一条连接 11 MB/s。旧实现对卡死没有空闲超时（进度条永远不动）、
+/// 对劣化没有任何感知、对中途断线直接整条失败，用户只能手动「取消 → 继续」来换
+/// 连接。现在由下载器自己做这件事：卡死 / 劣化 / 瞬时传输错误都断开当前连接，
+/// 用 Range 从 `.part` 当前长度续传。
 library;
 
+import 'dart:async';
 import 'dart:io';
 import 'dart:math' as math;
 
@@ -84,16 +92,92 @@ List<String> defaultHuggingFaceUrlCandidates(String url) {
 List<String> _defaultUrlCandidates(DownloadableModelFile file) =>
     defaultHuggingFaceUrlCandidates(file.url);
 
+/// 下载连接的健康策略：何时判定一条连接坏了、换几次连接才放弃。
+///
+/// 三种情况都会「断开当前连接 → Range 续传」：
+/// - **卡死**：等响应头或两次数据之间超过 [stallTimeout] 没有字节。
+/// - **劣化**：每 [speedWindow] 结算一次窗口速度，低于本次下载出现过的最好窗口
+///   速度的 1/[degradedRatio]。还没有像样的参照（最好速度不到
+///   [minReferenceBytesPerSecond]）时，每个文件允许试探性换一次连接——开局就
+///   分到坏出口的连接没有「变慢」可比。连续 [maxDegradedReconnects] 次换连接
+///   都没回到正常速度，就认定是网络本身慢，本文件不再因劣化换连接。
+/// - **瞬时错误**：连接中断、TLS / socket 错误、5xx / 429。
+///
+/// 只有「换了连接却一个字节都没多下到」才计入失败；连续失败 [maxFailedAttempts]
+/// 次后放弃当前候选（换镜像或抛出最后一个错误），两次尝试之间按
+/// [retryBackoff] 指数退避。404 之类确定性错误不重试。
+class ModelDownloadResilience {
+  const ModelDownloadResilience({
+    this.stallTimeout = const Duration(seconds: 30),
+    this.speedWindow = const Duration(seconds: 15),
+    this.degradedRatio = 10,
+    this.minReferenceBytesPerSecond = 512 * 1024,
+    this.maxDegradedReconnects = 3,
+    this.maxFailedAttempts = 4,
+    this.retryBackoff = const Duration(seconds: 1),
+  });
+
+  final Duration stallTimeout;
+  final Duration speedWindow;
+  final int degradedRatio;
+  final int minReferenceBytesPerSecond;
+  final int maxDegradedReconnects;
+  final int maxFailedAttempts;
+  final Duration retryBackoff;
+}
+
+/// 服务器回了非预期状态码。[isTransient] 为真（5xx / 429）时下载器会重试。
+class ModelDownloadStatusException extends HttpException {
+  ModelDownloadStatusException(this.statusCode, String message, {super.uri})
+      : super(message);
+
+  final int statusCode;
+
+  bool get isTransient =>
+      statusCode >= 500 || statusCode == HttpStatus.tooManyRequests;
+}
+
+/// 当前连接速度远低于本次下载的正常水平，主动断开换连接。
+class _DegradedConnection implements Exception {
+  const _DegradedConnection(this.bytesPerSecond);
+
+  final int bytesPerSecond;
+
+  @override
+  String toString() => 'connection degraded to $bytesPerSecond B/s';
+}
+
+/// 一次 [ModelFileDownloader.downloadAll] 范围内的速度参照（跨文件、跨重连）。
+class _SpeedReference {
+  int peakBytesPerSecond = 0;
+}
+
+/// 单个文件的劣化判定状态（跨该文件的多次重连）。
+class _DegradeState {
+  int reconnects = 0;
+}
+
+bool _isRetryable(Object error) {
+  if (error is ModelDownloadStatusException) return error.isTransient;
+  return error is IOException ||
+      error is TimeoutException ||
+      error is _DegradedConnection;
+}
+
 /// 模型下载器。[createClient] 可注入（测试指向本地 HttpServer）。
 class ModelFileDownloader {
   ModelFileDownloader({
     HttpClient Function()? createClient,
     List<String> Function(DownloadableModelFile file)? urlCandidates,
     this.progressByteInterval = kModelDownloadProgressInterval,
-  }) : _createClient = createClient ?? _defaultClient,
-       _urlCandidates = urlCandidates ?? _defaultUrlCandidates;
+    this.resilience = const ModelDownloadResilience(),
+  })  : _createClient = createClient ?? _defaultClient,
+        _urlCandidates = urlCandidates ?? _defaultUrlCandidates;
 
   final HttpClient Function() _createClient;
+
+  /// 连接健康策略（卡死 / 劣化 / 瞬时错误时换连接续传）。
+  final ModelDownloadResilience resilience;
 
   /// 单文件的下载候选 URL 序列（主源 + 镜像）。可注入：镜像回退这条分支只有
   /// 把候选序列做成参数才测得到——真实候选写死了 huggingface 域名，测试里的
@@ -132,6 +216,7 @@ class ModelFileDownloader {
     }
     await targetDir.create(recursive: true);
     final HttpClient client = _createClient();
+    final _SpeedReference reference = _SpeedReference();
     try {
       for (final DownloadableModelFile file in files) {
         final File target = File(p.join(targetDir.path, file.fileName));
@@ -144,7 +229,7 @@ class ModelFileDownloader {
           );
           continue;
         }
-        yield* _downloadFile(client, file, target);
+        yield* _downloadFile(client, file, target, reference);
       }
       final DownloadableModelFile last = files.last;
       yield ModelDownloadEvent(
@@ -163,34 +248,76 @@ class ModelFileDownloader {
   /// 换源不清 `.part`——镜像与主源是同一个 blob，续传直接接上；万一遇到内容不
   /// 一致的源，rename 前的长度校验仍会拦下并删掉坏 `.part`。全部候选都失败时抛
   /// 最后一个错误，语义与单源时代一致。
+  ///
+  /// 同一候选内，可重试的失败（见 [ModelDownloadResilience]）断开连接后用 Range
+  /// 续传；有进度的重连立即进行、不计失败，没进度的才计数并退避。
   Stream<ModelDownloadEvent> _downloadFile(
     HttpClient client,
     DownloadableModelFile file,
     File target,
+    _SpeedReference reference,
   ) async* {
     final List<String> candidates = _urlCandidates(file);
+    final File part = File('${target.path}.part');
+    final _DegradeState degrade = _DegradeState();
     Object? lastError;
     StackTrace? lastStack;
     for (final String url in candidates) {
-      try {
-        // 逐事件转发而不是 `yield*`：async* 里 `yield*` 委托出去的错误直接流向
-        // 下游监听者，**不经过**这里的 try/catch——那样写出来的回退循环长得
-        // 像模像样，实际第一个候选一失败就整条流报错，永远换不到镜像。
-        await for (final ModelDownloadEvent event in _downloadFileFrom(
-          client,
-          file,
-          target,
-          url,
-        )) {
-          yield event;
+      int failures = 0;
+      while (failures < resilience.maxFailedAttempts) {
+        final int before = _lengthOf(part);
+        try {
+          // 逐事件转发而不是 `yield*`：async* 里 `yield*` 委托出去的错误直接流向
+          // 下游监听者，**不经过**这里的 try/catch——那样写出来的回退循环长得
+          // 像模像样，实际第一个候选一失败就整条流报错，永远换不到镜像。
+          await for (final ModelDownloadEvent event in _downloadFileFrom(
+            client,
+            file,
+            target,
+            url,
+            reference,
+            degrade,
+          )) {
+            yield event;
+          }
+          return;
+        } on Object catch (error, stack) {
+          lastError = error;
+          lastStack = stack;
+          if (!_isRetryable(error)) break;
+          failures = _lengthOf(part) > before ? 0 : failures + 1;
+          await _backoff(failures);
         }
-        return;
-      } on Object catch (error, stack) {
-        lastError = error;
-        lastStack = stack;
       }
     }
     Error.throwWithStackTrace(lastError!, lastStack!);
+  }
+
+  static int _lengthOf(File file) => file.existsSync() ? file.lengthSync() : 0;
+
+  /// 第 n 次连续无进度失败后等 retryBackoff × 2^(n-1)；有进度（n=0）立即重连，
+  /// 用完次数的那一次也不等（马上换候选 / 抛错）。
+  Future<void> _backoff(int failures) async {
+    if (failures <= 0 || failures >= resilience.maxFailedAttempts) return;
+    await Future<void>.delayed(resilience.retryBackoff * (1 << (failures - 1)));
+  }
+
+  /// 结算一个测速窗口：更新参照，劣化时抛 [_DegradedConnection] 断开连接。
+  void _checkSpeed(int rate, _SpeedReference reference, _DegradeState degrade) {
+    final int peak = reference.peakBytesPerSecond;
+    reference.peakBytesPerSecond = math.max(peak, rate);
+    if (degrade.reconnects >= resilience.maxDegradedReconnects) return;
+    final bool hasReference = peak >= resilience.minReferenceBytesPerSecond;
+    final bool degraded = hasReference
+        ? rate * resilience.degradedRatio < peak
+        : rate < resilience.minReferenceBytesPerSecond &&
+            degrade.reconnects == 0;
+    if (!degraded) {
+      if (hasReference) degrade.reconnects = 0;
+      return;
+    }
+    degrade.reconnects++;
+    throw _DegradedConnection(rate);
   }
 
   Stream<ModelDownloadEvent> _downloadFileFrom(
@@ -198,6 +325,8 @@ class ModelFileDownloader {
     DownloadableModelFile file,
     File target,
     String url,
+    _SpeedReference reference,
+    _DegradeState degrade,
   ) async* {
     final File part = File('${target.path}.part');
     int offset = part.existsSync() ? part.lengthSync() : 0;
@@ -206,7 +335,10 @@ class ModelFileDownloader {
     if (offset > 0) {
       request.headers.set(HttpHeaders.rangeHeader, 'bytes=$offset-');
     }
-    final HttpClientResponse response = await request.close();
+    // 等响应头也算卡死窗口：连上了却迟迟不回头的连接与读到一半不动是同一种坏。
+    final HttpClientResponse response = await request.close().timeout(
+          resilience.stallTimeout,
+        );
 
     if (offset > 0 &&
         response.statusCode == HttpStatus.requestedRangeNotSatisfiable &&
@@ -239,13 +371,16 @@ class ModelFileDownloader {
       offset = 0;
     } else {
       await response.drain<void>();
-      throw HttpException(
+      throw ModelDownloadStatusException(
+        response.statusCode,
         'download ${file.fileName} failed: HTTP ${response.statusCode}',
         uri: Uri.parse(url),
       );
     }
 
     int lastEmitted = -1;
+    final Stopwatch window = Stopwatch()..start();
+    int windowBytes = 0;
     try {
       yield ModelDownloadEvent(
         fileName: file.fileName,
@@ -253,9 +388,20 @@ class ModelFileDownloader {
         totalBytes: total,
       );
       lastEmitted = received;
-      await for (final List<int> chunk in response) {
+      // 两次数据之间超过 stallTimeout 即 TimeoutException：退出循环会取消订阅，
+      // dart:io 随之销毁这条 socket，重连拿到的是新连接。
+      await for (final List<int> chunk in response.timeout(
+        resilience.stallTimeout,
+      )) {
         sink.add(chunk);
         received += chunk.length;
+        windowBytes += chunk.length;
+        if (window.elapsed >= resilience.speedWindow) {
+          final int micros = math.max(1, window.elapsedMicroseconds);
+          _checkSpeed(windowBytes * 1000000 ~/ micros, reference, degrade);
+          windowBytes = 0;
+          window.reset();
+        }
         if (received - lastEmitted >= progressByteInterval) {
           yield ModelDownloadEvent(
             fileName: file.fileName,
