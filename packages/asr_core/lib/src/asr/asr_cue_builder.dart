@@ -20,6 +20,7 @@
 library;
 
 import 'dart:convert';
+import 'dart:math' as math;
 
 import 'package:meta/meta.dart';
 import 'package:fushi_asr_core/src/asr/asr_types.dart';
@@ -214,7 +215,10 @@ class AsrCueBuilder {
       final bool isFirst = s == 0;
       final bool isLast = s == sentences.length - 1;
 
-      int start = isFirst ? seg.startMs : firstTokenMs - leadInMs;
+      // 段首 cue 从 VAD 未外扩的语音起点开始：外扩 pad 只为喂模型防首字被吃，
+      // 拿它当起点字幕会比人声早约半秒。缺 raw（旧检查点）时退回外扩边界。
+      int start =
+          isFirst ? (seg.rawStartMs ?? seg.startMs) : firstTokenMs - leadInMs;
       if (cues.isNotEmpty && start < cues.last.endMs) start = cues.last.endMs;
       if (start < seg.startMs) start = seg.startMs;
 
@@ -240,8 +244,10 @@ class AsrCueBuilder {
           tokens: List<String>.unmodifiable(
             idx.map((int i) => seg.tokens[i]),
           ),
+          // 段首 cue 改从 raw 起点开始后，前几个 token 的发射时刻常早于起点（RNN-T
+          // 首 token 实测比真实开口早约 0.44 s）：夹到 0，偏移不出现负数且保持单调。
           tokenOffsetsMs: List<int>.unmodifiable(
-            idx.map((int i) => seg.tokenTimesMs[i] - start),
+            idx.map((int i) => math.max(0, seg.tokenTimesMs[i] - start)),
           ),
         ),
       );

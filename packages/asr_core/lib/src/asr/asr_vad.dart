@@ -462,6 +462,9 @@ class AsrVadSegmenter implements AsrSegmenter {
         AsrSpeechSegment(
           startSample: paddedStart,
           samples: _retained.slice(paddedStart, paddedEnd),
+          // pad 只加在喂模型的音频上；时间轴留着真人开口/收口的边界给下游。
+          rawStartMs: start * 1000 ~/ kAsrSampleRate,
+          rawEndMs: end * 1000 ~/ kAsrSampleRate,
         ),
       );
       _lastPaddedEnd = paddedEnd;

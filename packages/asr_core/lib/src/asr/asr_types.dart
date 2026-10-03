@@ -234,10 +234,20 @@ class AsrSpeechSegment {
   const AsrSpeechSegment({
     required this.startSample,
     required this.samples,
+    this.rawStartMs,
+    this.rawEndMs,
   });
 
   final int startSample;
   final Float32List samples;
+
+  /// VAD **未外扩**的语音窗口（毫秒，相对文件）。[startSample] 是外扩 pad 之后的起点：
+  /// pad 是喂模型防首字被吃的，时间轴不该跟着提前——直接拿它当 cue 起点，字幕比人声
+  /// 早约 [kAsrVadDefaultSpeechPadMs]（实测某 7 小时日语有声书中位 472 ms，而 raw 起点
+  /// 离能量包络的真实开口中位 −28 ms）。非 VAD 切段（强制切分路径之外的旧检查点、
+  /// 测试替身）为 null，下游按外扩边界走。
+  final int? rawStartMs;
+  final int? rawEndMs;
 
   int get endSample => startSample + samples.length;
   int get startMs => startSample * 1000 ~/ kAsrSampleRate;
@@ -290,6 +300,8 @@ class AsrTranscribedSegment {
     required this.endMs,
     required this.tokens,
     required this.tokenTimesMs,
+    this.rawStartMs,
+    this.rawEndMs,
   }) : assert(tokens.length == tokenTimesMs.length);
 
   factory AsrTranscribedSegment.fromDecoded({
@@ -301,6 +313,8 @@ class AsrTranscribedSegment {
       audioFileIndex: audioFileIndex,
       startMs: speech.startMs,
       endMs: speech.endMs,
+      rawStartMs: speech.rawStartMs,
+      rawEndMs: speech.rawEndMs,
       tokens: List<String>.unmodifiable(decoded.tokens),
       tokenTimesMs: List<int>.unmodifiable(
         decoded.tokenOffsetsMs.map((int o) => speech.startMs + o),
@@ -319,6 +333,8 @@ class AsrTranscribedSegment {
       tokenTimesMs: List<int>.unmodifiable(
         (json['m'] as List<Object?>).map((Object? v) => (v as num).toInt()),
       ),
+      rawStartMs: (json['rs'] as num?)?.toInt(),
+      rawEndMs: (json['re'] as num?)?.toInt(),
       // 旧检查点可能还带 `me` / `eb`（已删除的声学调轴产物）：只读自己认的键，
       // 多出来的一律忽略，旧任务照样能恢复。
     );
@@ -335,6 +351,11 @@ class AsrTranscribedSegment {
   /// 每个 token 的发射时间（毫秒，相对该音频文件）。
   final List<int> tokenTimesMs;
 
+  /// VAD 未外扩的语音窗口（毫秒，相对该音频文件），见 [AsrSpeechSegment.rawStartMs]。
+  /// 旧检查点里没有（null），cue 起点按 [startMs] 走。
+  final int? rawStartMs;
+  final int? rawEndMs;
+
   String get text => tokens.join();
 
   Map<String, Object?> toJson() => <String, Object?>{
@@ -343,6 +364,8 @@ class AsrTranscribedSegment {
         'e': endMs,
         't': tokens,
         'm': tokenTimesMs,
+        if (rawStartMs != null) 'rs': rawStartMs,
+        if (rawEndMs != null) 're': rawEndMs,
       };
 }
 
@@ -372,6 +395,17 @@ abstract interface class AsrPcmSource {
     int chunkSeconds = 600,
   });
 }
+
+/// 「音频本身解不完」类 [AsrPcmDecodeException] 的报错里都带这句。
+///
+/// 转录任务在后台 isolate 跑，异常过边界后只剩文本；宿主据此（[isAsrIncompleteAudioFailure]）
+/// 给出「文件损坏或未下载完整，请重新获取」这种可操作的提示，而不是原样甩一段
+/// ffmpeg 细节。改措辞要同时改测试里钉住它的用例。
+const String kAsrIncompleteAudioMarker = 'audio file is damaged or incomplete';
+
+/// 错误（或其文本）是不是「音频文件损坏 / 未下载完整，只能解出一部分」。
+bool isAsrIncompleteAudioFailure(Object error) =>
+    error.toString().contains(kAsrIncompleteAudioMarker);
 
 class AsrPcmDecodeException implements Exception {
   const AsrPcmDecodeException(this.audioPath, this.message);

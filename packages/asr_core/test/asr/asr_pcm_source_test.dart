@@ -101,6 +101,25 @@ class _MissingFfmpegBackend implements FfmpegBackend {
       throw const ProcessException('ffprobe', <String>[], 'not found', 2);
 }
 
+/// 只有 ffmpeg、没有 ffprobe 的后端：`run` 一律以 [banner] 作 stderr、退出码 1
+/// （`ffmpeg -i` 不给输出文件时的真实表现）。
+class _NoProbeFfmpegBackend implements FfmpegBackend {
+  _NoProbeFfmpegBackend(this.banner);
+
+  final String banner;
+  final List<List<String>> calls = <List<String>>[];
+
+  @override
+  Future<FfmpegRunResult> run(List<String> args, Duration timeout) async {
+    calls.add(List<String>.of(args));
+    return FfmpegRunResult(returnCode: 1, output: banner);
+  }
+
+  @override
+  Future<FfmpegRunResult> runProbe(List<String> args, Duration timeout) =>
+      throw const ProcessException('ffprobe', <String>[], 'not found', 2);
+}
+
 /// 真 ffmpeg 后端：直接把参数交给 PATH（或指定路径）的可执行文件，绕开生产端的
 /// 「覆盖 > 捆绑 > PATH」解析（那条链读 `Platform.environment`，测试里注入不了）。
 class _ExecutableFfmpegBackend implements FfmpegBackend {
@@ -468,6 +487,21 @@ void main() {
       expect(parseFfprobeDurationMs(''), isNull);
     });
 
+    test('parseFfmpegDurationBannerMs', () {
+      expect(
+        parseFfmpegDurationBannerMs(
+          "Input #0, mov,mp4,m4a, from 'a.m4b':\n"
+          '  Duration: 06:10:57.76, start: 0.000000, bitrate: 126 kb/s\n'
+          'At least one output file must be specified',
+        ),
+        22257760,
+      );
+      expect(parseFfmpegDurationBannerMs('  Duration: 00:00:01.5, start'), 1500);
+      expect(parseFfmpegDurationBannerMs('  Duration: N/A, bitrate: N/A'), isNull);
+      expect(parseFfmpegDurationBannerMs('  Duration: 00:00:00.00,'), isNull);
+      expect(parseFfmpegDurationBannerMs(''), isNull);
+    });
+
     test('buildAsrProbeDurationArgs', () {
       expect(buildAsrProbeDurationArgs(inputPath: 'a.m4b'), <String>[
         '-v', 'quiet', '-print_format', 'json', '-show_entries', //
@@ -607,9 +641,31 @@ void main() {
       expect(leftovers(), isEmpty);
     });
 
-    test('超过余量的内部短块：明确报解码缺口，不平移后续音频或填静音', () async {
+    test('接缝漂移在容差内：逻辑位置跟随实际长度，不补静音不丢样本', () async {
       final _FakeFfmpegBackend backend = _FakeFfmpegBackend(<_Scripted>[
         _Scripted(bytes: _s16le(List<int>.filled(15995, 1))),
+        _Scripted(bytes: _s16le(List<int>.filled(16000, 2))),
+      ]);
+      final FfmpegAsrPcmSource source = FfmpegAsrPcmSource(
+        backend: backend,
+        tempDir: tempRoot,
+        parallelism: 1,
+      );
+      final List<AsrPcmChunk> chunks =
+          await source.decode(input.path, chunkSeconds: 1).toList();
+      expect(chunks, hasLength(2));
+      expect(chunks[0].startSample, 0);
+      expect(chunks[0].samples, hasLength(15995));
+      // 下一块报成首尾相接的位置（15995），而不是名义的 16000。
+      expect(chunks[1].startSample, 15995);
+      expect(chunks[1].samples, hasLength(16000));
+      expect(leftovers(), isEmpty);
+    });
+
+    test('超过容差的内部短块：明确报解码缺口，不平移后续音频或填静音', () async {
+      final int gap = kAsrPcmMaxBlockDriftSamples + 1;
+      final _FakeFfmpegBackend backend = _FakeFfmpegBackend(<_Scripted>[
+        _Scripted(bytes: _s16le(List<int>.filled(16000 - gap, 1))),
         _Scripted(bytes: _s16le(List<int>.filled(16000, 2))),
       ]);
       final FfmpegAsrPcmSource source = FfmpegAsrPcmSource(
@@ -622,10 +678,77 @@ void main() {
         throwsA(isA<AsrPcmDecodeException>().having(
           (AsrPcmDecodeException e) => e.message,
           'message',
-          allOf(contains('short non-final PCM block'), contains('gap=5 samples')),
+          allOf(
+            contains('short non-final PCM block'),
+            contains('gap=$gap samples'),
+            contains(kAsrIncompleteAudioMarker),
+          ),
         )),
       );
       expect(leftovers(), isEmpty);
+    });
+
+    test('离文件末尾还远的空块：是解码故障，不当 EOF 静默截断', () async {
+      // 6 秒的文件只解出第 1 秒（未下载完的文件后面是全零、ffmpeg 一个包都解不出时
+      // 就是这样：正常退出、输出为空）。
+      final _FakeFfmpegBackend backend = _FakeFfmpegBackend(
+        <_Scripted>[
+          _Scripted(bytes: _s16le(List<int>.filled(16000, 3))),
+          const _Scripted(),
+        ],
+        probeOutput: '{"format":{"duration":"6.000"}}',
+      );
+      final FfmpegAsrPcmSource source = FfmpegAsrPcmSource(
+        backend: backend,
+        tempDir: tempRoot,
+        parallelism: 1,
+      );
+      await expectLater(
+        source.decode(input.path, chunkSeconds: 1).toList(),
+        throwsA(isA<AsrPcmDecodeException>().having(
+          (AsrPcmDecodeException e) => e.message,
+          'message',
+          allOf(
+            contains('stops decoding at 0:00:01 of 0:00:06'),
+            contains(kAsrIncompleteAudioMarker),
+          ),
+        )),
+      );
+      expect(leftovers(), isEmpty);
+    });
+
+    test('离探测时长不到 1 秒的空块：仍是真 EOF', () async {
+      final _FakeFfmpegBackend backend = _FakeFfmpegBackend(
+        <_Scripted>[
+          _Scripted(bytes: _s16le(List<int>.filled(16000, 3))),
+          const _Scripted(),
+        ],
+        probeOutput: '{"format":{"duration":"1.900"}}',
+      );
+      final FfmpegAsrPcmSource source = FfmpegAsrPcmSource(
+        backend: backend,
+        tempDir: tempRoot,
+        parallelism: 1,
+      );
+      final List<AsrPcmChunk> chunks =
+          await source.decode(input.path, chunkSeconds: 1).toList();
+      expect(chunks, hasLength(1));
+      expect(chunks.single.samples, hasLength(16000));
+    });
+
+    test('decode 复用 probeDurationMs 探到的时长，不再起第二个探测进程', () async {
+      final _FakeFfmpegBackend backend = _FakeFfmpegBackend(
+        <_Scripted>[_Scripted(bytes: _s16le(List<int>.filled(16000, 3)))],
+        probeOutput: '{"format":{"duration":"1.000"}}',
+      );
+      final FfmpegAsrPcmSource source = FfmpegAsrPcmSource(
+        backend: backend,
+        tempDir: tempRoot,
+        parallelism: 1,
+      );
+      expect(await source.probeDurationMs(input.path), 1000);
+      await source.decode(input.path, chunkSeconds: 1).toList();
+      expect(backend.probeCalls, hasLength(1));
     });
 
     test('最后一块少 5 样本后到 EOF：保留全部尾部样本，不补静音', () async {
@@ -1019,6 +1142,19 @@ void main() {
         'format=duration', input.path,
       ]);
       expect(backend.calls, isEmpty, reason: '探时长不该跑 ffmpeg');
+    });
+
+    test('probeDurationMs：没有 ffprobe 时退回 ffmpeg 横幅', () async {
+      final _NoProbeFfmpegBackend backend = _NoProbeFfmpegBackend(
+        '  Duration: 00:01:02.50, start: 0.000000, bitrate: 128 kb/s\n',
+      );
+      final FfmpegAsrPcmSource source = FfmpegAsrPcmSource(
+        backend: backend,
+        tempDir: tempRoot,
+        parallelism: 1,
+      );
+      expect(await source.probeDurationMs(input.path), 62500);
+      expect(backend.calls.single, <String>['-hide_banner', '-i', input.path]);
     });
 
     test('probeDurationMs：ffprobe 非零退出 / 文件不存在 → null', () async {

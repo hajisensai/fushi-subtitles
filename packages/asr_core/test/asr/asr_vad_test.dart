@@ -146,6 +146,9 @@ void main() {
       final AsrSpeechSegment s = segs.single;
       expect(s.startSample, 7680 - ms(200));
       expect(s.endSample, 24064 + ms(200));
+      // 时间轴另带未外扩的语音窗口：pad 只加在喂模型的音频上。
+      expect(s.rawStartMs, 7680 ~/ 16);
+      expect(s.rawEndMs, 24064 ~/ 16);
       expectSamplesMatch(s, audio, 0);
       // 40000 样本 = 78 个整窗，剩 64 个样本不过 VAD。
       expect(fake.calls, 78);
