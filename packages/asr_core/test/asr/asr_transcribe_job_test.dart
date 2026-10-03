@@ -10,10 +10,17 @@ const String _kModelId = 'test-pack';
 
 /// 合成 PCM 源：每个文件 [durationsMs] 毫秒的静音，按 chunkSeconds 切块。
 class _FakePcm implements AsrPcmSource {
-  _FakePcm(this.durationsMs, {this.probeFails = const <int>{}});
+  _FakePcm(
+    this.durationsMs, {
+    this.probeFails = const <int>{},
+    this.decodedMs = const <String, int>{},
+  });
 
   final Map<String, int> durationsMs;
   final Set<int> probeFails;
+
+  /// 按路径覆盖「实际能解出多少毫秒」：模拟文件后半段损坏/未下载完，流却正常收尾。
+  final Map<String, int> decodedMs;
   final List<({String path, int start})> decodeCalls =
       <({String path, int start})>[];
 
@@ -31,7 +38,9 @@ class _FakePcm implements AsrPcmSource {
     int chunkSeconds = 600,
   }) async* {
     decodeCalls.add((path: audioPath, start: startSample));
-    final int total = durationsMs[audioPath]! * kAsrSampleRate ~/ 1000;
+    final int total = (decodedMs[audioPath] ?? durationsMs[audioPath]!) *
+        kAsrSampleRate ~/
+        1000;
     int pos = startSample;
     while (pos < total) {
       final int n = (chunkSeconds * kAsrSampleRate).clamp(0, total - pos);
@@ -339,6 +348,161 @@ void main() {
         (events.last as AsrTranscribeFinishedEvent).result;
     expect(r.fileDurationsMs, <int>[6000, 4000]);
     expect(r.totalMs, 10000);
+  });
+
+  test('解码流正常收尾但远短于探测时长：整本失败，不标 finished', () async {
+    final AsrTranscribeJob job = AsrTranscribeJob(
+      jobDir: tmp,
+      audioPaths: <String>['a.m4b'],
+      modelId: _kModelId,
+      pcm: _FakePcm(
+        <String, int>{'a.m4b': 60000},
+        decodedMs: <String, int>{'a.m4b': 20000},
+      ),
+      segmenter: _FakeSegmenter(segmentsPerChunk: 1),
+      decoder: _FakeDecoder(),
+      chunkSeconds: 10,
+      progressInterval: Duration.zero,
+    );
+    await expectLater(
+      job.run().toList(),
+      throwsA(isA<AsrPcmDecodeException>().having(
+        (AsrPcmDecodeException e) => e.message,
+        'message',
+        allOf(
+          contains('decoding ended at 20000ms but the file is 60000ms long'),
+          contains(kAsrIncompleteAudioMarker),
+        ),
+      )),
+    );
+    final AsrJobState state = await AsrTranscribeJob.loadState(
+      tmp,
+      <String>['a.m4b'],
+      modelId: _kModelId,
+    );
+    expect(state.finished, isFalse);
+    expect(File('${tmp.path}/${AsrJobFiles.srt}').existsSync(), isFalse);
+  });
+
+  test('解码终点离探测时长在容差内：照常完成', () async {
+    final AsrTranscribeJob job = AsrTranscribeJob(
+      jobDir: tmp,
+      audioPaths: <String>['a.m4b'],
+      modelId: _kModelId,
+      pcm: _FakePcm(
+        <String, int>{'a.m4b': 12000},
+        decodedMs: <String, int>{
+          'a.m4b': 12000 - kAsrFileTruncationToleranceMs
+        },
+      ),
+      segmenter: _FakeSegmenter(segmentsPerChunk: 1),
+      decoder: _FakeDecoder(),
+      chunkSeconds: 10,
+      progressInterval: Duration.zero,
+    );
+    final List<AsrTranscribeEvent> events = await job.run().toList();
+    expect(events.last, isA<AsrTranscribeFinishedEvent>());
+  });
+
+  test('isAsrIncompleteAudioFailure 认过了 isolate 边界的文本', () {
+    const AsrPcmDecodeException e = AsrPcmDecodeException(
+      'a.m4b',
+      'decoding ended early; the $kAsrIncompleteAudioMarker',
+    );
+    expect(isAsrIncompleteAudioFailure(e), isTrue);
+    // 后台 isolate 只把 '$error' 转回来，主侧包成 StateError。
+    expect(isAsrIncompleteAudioFailure(StateError('$e')), isTrue);
+    expect(
+      isAsrIncompleteAudioFailure(
+        const AsrPcmDecodeException('a.m4b', 'ffmpeg exit 1'),
+      ),
+      isFalse,
+    );
+  });
+
+  test('checkAsrFileTruncation：时长未知放行，短出容差才抛', () {
+    checkAsrFileTruncation(audioPath: 'a', probedMs: null, decodedEndMs: 0);
+    checkAsrFileTruncation(audioPath: 'a', probedMs: 10000, decodedEndMs: 7000);
+    expect(
+      () => checkAsrFileTruncation(
+        audioPath: 'a',
+        probedMs: 10000,
+        decodedEndMs: 6999,
+      ),
+      throwsA(isA<AsrPcmDecodeException>()),
+    );
+  });
+
+  group('isAsrFinishedJobTruncated（截断对账之前留下的残卷）', () {
+    AsrTranscribedSegment seg(int file, int startMs, int endMs) =>
+        AsrTranscribedSegment(
+          audioFileIndex: file,
+          startMs: startMs,
+          endMs: endMs,
+          tokens: const <String>['あ'],
+          tokenTimesMs: <int>[startMs],
+        );
+
+    test('6 小时的书只转到 4 分半 → 残卷', () {
+      expect(
+        isAsrFinishedJobTruncated(
+          <int?>[22257761],
+          <AsrTranscribedSegment>[seg(0, 259820, 274830)],
+        ),
+        isTrue,
+      );
+    });
+
+    test('片尾 15 分钟没人声的 7 小时书（< 10%）→ 不算残卷', () {
+      expect(
+        isAsrFinishedJobTruncated(
+          <int?>[25800290],
+          <AsrTranscribedSegment>[seg(0, 24870000, 24877588)],
+        ),
+        isFalse,
+      );
+    });
+
+    test('短文件按 120 s 下限；时长未知的文件不判；多文件任一残卷即算', () {
+      expect(
+        isAsrFinishedJobTruncated(
+          <int?>[300000],
+          <AsrTranscribedSegment>[seg(0, 100000, 190000)],
+        ),
+        isFalse,
+      );
+      expect(
+        isAsrFinishedJobTruncated(
+            <int?>[null], const <AsrTranscribedSegment>[]),
+        isFalse,
+      );
+      expect(
+        isAsrFinishedJobTruncated(
+          <int?>[600000, 600000],
+          <AsrTranscribedSegment>[seg(0, 590000, 599000), seg(1, 0, 60000)],
+        ),
+        isTrue,
+      );
+    });
+
+    test('loadStateDetailed 不复用已完成的残卷任务', () async {
+      File('${tmp.path}/${AsrJobFiles.segments}').writeAsStringSync(
+        '{"f":0,"s":259820,"e":274830,"t":["あ"],"m":[259900]}\n',
+      );
+      File('${tmp.path}/${AsrJobFiles.state}').writeAsStringSync(
+        '{"version":${AsrJobState.currentVersion},"audioPaths":["a.m4b"],'
+        '"modelId":"$_kModelId","fileDurationsMs":[22257761],'
+        '"resumeSamples":[-1],"finished":true}',
+      );
+      final ({AsrJobState state, bool fresh}) loaded =
+          await AsrTranscribeJob.loadStateDetailed(
+        tmp,
+        <String>['a.m4b'],
+        modelId: _kModelId,
+      );
+      expect(loaded.fresh, isTrue);
+      expect(loaded.state.finished, isFalse);
+    });
   });
 
   test('state.json 的 modelId 与传入不符视为新任务（不同词表的段落不能混续）', () async {

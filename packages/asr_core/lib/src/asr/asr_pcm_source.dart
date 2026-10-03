@@ -58,6 +58,21 @@ const int kAsrPcmSamplesPerMs = kAsrSampleRate ~/ 1000;
 /// 覆盖容器时间戳量化及重采样舍入的解码尾部余量；多出的真实 PCM 只用于凑足目标块。
 const int kAsrPcmDecodeTailMs = 10;
 
+/// 相邻两块之间容忍的样本级接缝偏差（4 帧 AAC = 4096 样本 ≈ 256 ms）。
+///
+/// 每块是独立的 ffmpeg 进程、按名义毫秒偏移寻址。章节重排/拼接过的 m4b 在拼接点
+/// 常短几百个样本（编码器 padding 被吃掉；实测某卷 2400 s 处短 212 样本 = 13 ms），
+/// 严格接续会让整本转不了。这个量级远小于一个音节，下一块仍按名义偏移寻址、不会累积；
+/// 超过上限（整块缺几秒）仍按解码故障抛出。
+const int kAsrPcmMaxBlockDriftSamples = 4096;
+
+/// 判「0 样本块 = 文件末尾」时允许离探测时长的距离（毫秒）。
+///
+/// `-ss` 落在最后一帧附近时 ffmpeg 会正常产出空块，那是真 EOF；离末尾还远的空块是
+/// 解码故障（音频数据损坏 / 未下载完的文件预分配的全零区 / ffmpeg 内存不足时
+/// 正常退出却写空文件），当 EOF 收尾会把整本静默截成残卷（见 [FfmpegAsrPcmSource.decode]）。
+const int kAsrPcmEofSlackMs = 1000;
+
 /// 每块 ffmpeg 的超时下限（秒）。
 const int kAsrPcmChunkTimeoutFloorSeconds = 60;
 
@@ -170,6 +185,14 @@ List<String> buildAsrPcmChunkArgs({
 /// 毫秒 → ffmpeg 时间串（秒，固定 3 位小数，如 `12.345`）。
 String _formatMs(int ms) => (ms / 1000).toStringAsFixed(3);
 
+/// 毫秒 → 报错信息里给人看的 `H:MM:SS`。
+String _formatClock(int ms) {
+  final int total = ms ~/ 1000;
+  final String mm = (total ~/ 60 % 60).toString().padLeft(2, '0');
+  final String ss = (total % 60).toString().padLeft(2, '0');
+  return '${total ~/ 3600}:$mm:$ss';
+}
+
 /// **纯函数**：构造 ffprobe 时长探测参数（`format.duration` 以 JSON 写 stdout）。
 List<String> buildAsrProbeDurationArgs({required String inputPath}) {
   return <String>[
@@ -205,6 +228,23 @@ int? parseFfprobeDurationMs(String probeStdout) {
   };
   if (seconds == null || !seconds.isFinite || seconds <= 0) return null;
   return (seconds * 1000).round();
+}
+
+/// **纯函数**：从 `ffmpeg -i <file>` 的 stderr 横幅解析 `Duration: HH:MM:SS.xx`（毫秒）。
+///
+/// 没有 ffprobe 时的时长兜底：截断对账以探测时长为前提，ffprobe 缺失时直接返回 null
+/// 会让对账整体静默失效；而 ffmpeg 是解码必需品，能解码就能探出时长。
+/// `Duration: N/A` / 解析不出 / 非正值 → null（不抛）。
+int? parseFfmpegDurationBannerMs(String ffmpegStderr) {
+  final RegExpMatch? m = RegExp(
+    r'Duration:\s*(\d+):(\d{2}):(\d{2}(?:\.\d+)?)',
+  ).firstMatch(ffmpegStderr);
+  if (m == null) return null;
+  final int hours = int.parse(m.group(1)!);
+  final int minutes = int.parse(m.group(2)!);
+  final double seconds = double.parse(m.group(3)!);
+  final int ms = ((hours * 3600 + minutes * 60 + seconds) * 1000).round();
+  return ms > 0 ? ms : null;
 }
 
 /// **纯函数**：在 ISO BMFF（QuickTime/MP4）字节流里找第一个 `mdat` box，返回其
@@ -350,6 +390,10 @@ class FfmpegAsrPcmSource implements AsrPcmSource {
   /// 已探明可用的输出容器；null 表示还没试过（首块按 s16le 试探）。
   AsrPcmContainer? _container;
 
+  /// 本实例探到过的时长（按路径）。转录任务开跑前会经同一实例探一遍，[decode]
+  /// 判「空块是不是文件末尾」时直接复用，不再多起一个进程。
+  final Map<String, int> _probedMs = <String, int>{};
+
   FfmpegBackend get _resolvedBackend => _backend ?? resolveFfmpegBackend();
 
   /// 当前已探明的输出容器（测试断言用；生产代码不需要读）。
@@ -359,6 +403,12 @@ class FfmpegAsrPcmSource implements AsrPcmSource {
   @override
   Future<int?> probeDurationMs(String audioPath) async {
     if (!File(audioPath).existsSync()) return null;
+    final int? ms = await _probe(audioPath);
+    if (ms != null) _probedMs[audioPath] = ms;
+    return ms;
+  }
+
+  Future<int?> _probe(String audioPath) async {
     try {
       final FfmpegRunResult result = await _resolvedBackend.runProbe(
         buildAsrProbeDurationArgs(inputPath: audioPath),
@@ -373,9 +423,29 @@ class FfmpegAsrPcmSource implements AsrPcmSource {
       }
       return parseFfprobeDurationMs(result.output);
     } on ProcessException catch (e) {
-      // ffprobe 不在（桌面未捆绑且 PATH 没有）：探不出，调用方按未知时长处理。
+      // ffprobe 不在（桌面未捆绑且 PATH 没有）：退回 ffmpeg 横幅。只返回 null 会让
+      // [decode] 的 EOF 判据与任务收尾的截断对账一起静默失效。
       asrLog(
         '[asr-pcm] ffprobe unavailable: '
+        '${describeFfmpegProcessException(e)}; '
+        'falling back to the ffmpeg banner',
+      );
+      return _probeViaFfmpegBanner(audioPath);
+    }
+  }
+
+  /// `ffmpeg -hide_banner -i <file>`：没有输出文件，退出码非 0 属正常，
+  /// `Duration:` 横幅在 stderr（即 [FfmpegRunResult.output]）。任何失败 → null。
+  Future<int?> _probeViaFfmpegBanner(String audioPath) async {
+    try {
+      final FfmpegRunResult result = await _resolvedBackend.run(
+        <String>['-hide_banner', '-i', audioPath],
+        const Duration(seconds: 30),
+      );
+      return parseFfmpegDurationBannerMs(result.output);
+    } on ProcessException catch (e) {
+      asrLog(
+        '[asr-pcm] ffmpeg duration fallback failed: '
         '${describeFfmpegProcessException(e)}',
       );
       return null;
@@ -397,6 +467,9 @@ class FfmpegAsrPcmSource implements AsrPcmSource {
     if (!File(audioPath).existsSync()) {
       throw AsrPcmDecodeException(audioPath, 'input file does not exist');
     }
+    // 文件时长：区分「空块 = 真 EOF」与「空块 = 解码故障」。探不出时退化为旧行为。
+    final int? totalMs =
+        _probedMs[audioPath] ?? await probeDurationMs(audioPath);
     final Directory work = await _tempDir.createTemp('fushi_asr_pcm_');
     try {
       final int chunkSamples = chunkSeconds * kAsrSampleRate;
@@ -441,19 +514,50 @@ class FfmpegAsrPcmSource implements AsrPcmSource {
             samples = Float32List.sublistView(samples, 0, chunkSamples);
           }
           // 契约：某块 0 样本即文件末尾（超出 EOF 的 -ss 让 ffmpeg 正常退出、输出为空）。
-          if (samples.isEmpty) break;
-          // 真 EOF 的最后一块可以不足目标长度。若后面仍有音频，则不能把短块之后
-          // 的源音频提前，也不能悄悄补静音掩盖丢失的语音；在 PCM 层报出具体缺口。
-          if (blockStart != expectedStart) {
+          // 但只有离探测时长不远时才是：音频数据损坏、未下载完的文件（预分配的全零区，
+          // 实测某 6 小时 m4b 87.5% 是零，前 4 分半之后一个包都解不出）或 ffmpeg 内存
+          // 不足时，ffmpeg 同样正常退出、输出为空。当 EOF 收尾 = 任务报完成、产物是
+          // 前几分钟的残卷，用户只能看到一个莫名其妙的低匹配率。
+          if (samples.isEmpty) {
+            if (totalMs == null ||
+                blockStart >= (totalMs - kAsrPcmEofSlackMs) * kAsrPcmSamplesPerMs) {
+              break;
+            }
             throw AsrPcmDecodeException(
               audioPath,
-              'ffmpeg produced a short non-final PCM block: '
-              'expected next startSample=$expectedStart, actual $blockStart '
-              '(gap=${blockStart - expectedStart} samples)',
+              'audio stops decoding at '
+              '${_formatClock(expectedStart ~/ kAsrPcmSamplesPerMs)} of '
+              '${_formatClock(totalMs)}: ffmpeg returned no samples for the '
+              'block at ${_formatClock(blockStart ~/ kAsrPcmSamplesPerMs)}; the '
+              '$kAsrIncompleteAudioMarker (e.g. a download that has not '
+              'finished), or ffmpeg ran out of memory',
             );
           }
-          yield AsrPcmChunk(startSample: blockStart, samples: samples);
-          expectedStart = blockStart + samples.length;
+          // 真 EOF 的最后一块可以不足目标长度。若后面仍有音频，则不能把短块之后
+          // 的源音频提前，也不能悄悄补静音掩盖丢失的语音；在 PCM 层报出具体缺口。
+          // 例外是 [kAsrPcmMaxBlockDriftSamples] 以内的接缝偏差：逻辑位置跟随实际
+          // 解码长度（不补静音、不丢样本），下一块仍按名义偏移寻址，不累积。
+          int chunkStart = blockStart;
+          if (blockStart != expectedStart) {
+            final int gap = blockStart - expectedStart;
+            if (gap.abs() > kAsrPcmMaxBlockDriftSamples) {
+              throw AsrPcmDecodeException(
+                audioPath,
+                'ffmpeg produced a short non-final PCM block: '
+                'expected next startSample=$expectedStart, actual $blockStart '
+                '(gap=$gap samples) around '
+                '${_formatClock(expectedStart ~/ kAsrPcmSamplesPerMs)}; the '
+                '$kAsrIncompleteAudioMarker',
+              );
+            }
+            asrLog(
+              '[asr-pcm] block seam drift of $gap samples at '
+              '${blockStart ~/ kAsrPcmSamplesPerMs} ms tolerated',
+            );
+            chunkStart = expectedStart;
+          }
+          yield AsrPcmChunk(startSample: chunkStart, samples: samples);
+          expectedStart = chunkStart + samples.length;
           blockStart += chunkSamples;
         }
       } finally {

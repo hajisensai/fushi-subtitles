@@ -23,6 +23,7 @@ library;
 import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
+import 'dart:math' as math;
 
 import 'package:meta/meta.dart';
 import 'package:fushi_asr_core/src/util/collections.dart';
@@ -32,6 +33,67 @@ import 'package:fushi_asr_core/src/asr/asr_cue_builder.dart';
 import 'package:fushi_asr_core/src/asr/asr_transducer_decoder.dart'
     show AsrBatchFeatures, AsrDecodeStats, AsrEncodedBatch;
 import 'package:fushi_asr_core/src/asr/asr_types.dart';
+
+/// 文件收尾对账的容差：解码终点最多比探测时长短这么多。
+///
+/// PCM 层判空块是否 EOF 的容差是 1 s（`kAsrPcmEofSlackMs`）；这里是整文件级的第二道，
+/// 留 3 倍余量吸收容器时长与解码样本数的取整差。真实的截断事故差的是分钟到小时。
+const int kAsrFileTruncationToleranceMs = 3000;
+
+/// **纯函数**：文件收尾的截断对账。
+///
+/// PCM 解码流「正常结束」≠ 读到了文件末尾：源文件中途损坏、未下载完、拼接坏块都可能让
+/// 流体面收尾。解码终点比探测时长短出 [kAsrFileTruncationToleranceMs] 以上 ⇒ 抛
+/// [AsrPcmDecodeException]，宁可整本失败也不产出 `finished` 的残卷。
+/// [probedMs] 为 null（探不出时长）时无从对账，直接放行。
+void checkAsrFileTruncation({
+  required String audioPath,
+  required int? probedMs,
+  required int decodedEndMs,
+}) {
+  if (probedMs == null) return;
+  if (decodedEndMs >= probedMs - kAsrFileTruncationToleranceMs) return;
+  throw AsrPcmDecodeException(
+    audioPath,
+    'decoding ended at ${decodedEndMs}ms but the file is ${probedMs}ms long '
+    '(${((probedMs - decodedEndMs) / 60000).toStringAsFixed(1)} min missing); '
+    'the $kAsrIncompleteAudioMarker (e.g. a download that has not finished); '
+    'refusing to finish with a partial transcript',
+  );
+}
+
+/// 判「已完成的旧任务是不是残卷」时，最后一段语音离文件末尾允许的最大距离：
+/// `max(120 s, 文件时长的 10%)`。
+///
+/// 只有段落可查（旧任务没记解码终点），而语音段在片尾音乐/静音处会提前结束，所以
+/// 容差要远宽于 [kAsrFileTruncationToleranceMs]；它只为接住「转了前几分钟就报完成」
+/// 那种量级的残卷。
+int asrStaleFinishSlackMs(int fileDurationMs) =>
+    math.max(120000, fileDurationMs ~/ 10);
+
+/// **纯函数**：已标完成的任务里，是否有文件的最后一段语音离文件末尾远得不正常。
+///
+/// 截断对账之前的版本会把解码中途失败（空块被当 EOF）的任务标成 finished；任务 id
+/// 只含文件名与字节数，用户把文件重新下完整后大小不变、仍命中这个残卷缓存。加载时
+/// 用它把这种任务当新任务重跑。探不出时长的文件不参与判定。
+@visibleForTesting
+bool isAsrFinishedJobTruncated(
+  List<int?> fileDurationsMs,
+  List<AsrTranscribedSegment> segments,
+) {
+  final List<int> lastEnd = List<int>.filled(fileDurationsMs.length, 0);
+  for (final AsrTranscribedSegment s in segments) {
+    final int i = s.audioFileIndex;
+    if (i < 0 || i >= lastEnd.length) continue;
+    if (s.endMs > lastEnd[i]) lastEnd[i] = s.endMs;
+  }
+  for (int i = 0; i < fileDurationsMs.length; i++) {
+    final int? duration = fileDurationsMs[i];
+    if (duration == null || duration <= 0) continue;
+    if (duration - lastEnd[i] > asrStaleFinishSlackMs(duration)) return true;
+  }
+  return false;
+}
 
 /// 流式 VAD 切段器（`AsrVadSegmenter` 实现之）。
 abstract interface class AsrSegmenter {
@@ -386,6 +448,14 @@ class AsrTranscribeJob {
       final AsrJobState state = AsrJobState.fromJson(json);
       if (!listEquals(state.audioPaths, audioPaths)) return fresh;
       if (state.modelId != modelId) return fresh;
+      if (state.finished &&
+          isAsrFinishedJobTruncated(
+            state.fileDurationsMs,
+            await loadSegments(jobDir),
+          )) {
+        // 截断对账之前留下的残卷（见 [isAsrFinishedJobTruncated]）：不复用，重跑。
+        return fresh;
+      }
       return (state: state, fresh: false);
     } on FormatException {
       return fresh;
@@ -719,8 +789,16 @@ class AsrTranscribeJob {
         // 文件结束：冲出尾段。
         pending.addAll(await segmenter.flush());
         await drain(all: true);
+        // PCM 流正常收尾 ≠ 读到了文件末尾：标完成前和探测时长对账，宁可整本失败
+        // 也不把残卷标成 finished（见 [checkAsrFileTruncation]）。
+        checkAsrFileTruncation(
+          audioPath: path,
+          probedMs: durations[fileIndex],
+          decodedEndMs: _samplesToMs(lastEndSample),
+        );
         state = _withResume(state, fileIndex, -1);
-        // 探测失败的文件用实际解码到的样本数补时长，让偏移与进度有据可依。
+        // 探测失败的文件用实际解码到的样本数补时长，让偏移与进度有据可依（多文件时
+        // 后一文件的 SRT 偏移就靠它；最后一段语音的结尾会丢掉片尾静音）。
         if (durations[fileIndex] == null) {
           durations[fileIndex] = _samplesToMs(lastEndSample);
           state = state.copyWith(fileDurationsMs: List<int?>.of(durations));
