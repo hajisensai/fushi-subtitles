@@ -38,6 +38,65 @@ void main() {
       expect(cues.single.text, '今日は。');
     });
 
+    test('段首 cue 起点取 VAD 未外扩的语音起点；早于起点的 token 偏移夹到 0', () {
+      final AsrTranscribedSegment seg = AsrTranscribedSegment(
+        audioFileIndex: 0,
+        startMs: 1000,
+        endMs: 4000,
+        rawStartMs: 1500,
+        rawEndMs: 3700,
+        tokens: 'はい。行く。'.split(''),
+        // RNN-T 首 token 常落在外扩 pad 里（比真实开口早）。
+        tokenTimesMs: <int>[1040, 1600, 1800, 2900, 3100, 3300],
+      );
+      final List<AsrCue> cues = builder.build(<AsrTranscribedSegment>[seg]);
+      expect(cues.map((AsrCue c) => c.text), <String>['はい。', '行く。']);
+      expect(cues[0].startMs, 1500);
+      expect(cues[0].tokenOffsetsMs, <int>[0, 100, 300]);
+      // 段内后续句照旧用首 token 减 leadIn；段尾照旧到外扩边界。
+      expect(cues[1].startMs, 2900 - builder.leadInMs);
+      expect(cues[1].endMs, 4000);
+    });
+
+    test('没有 raw 边界（旧检查点）：段首 cue 仍从外扩起点开始', () {
+      final AsrTranscribedSegment seg = _seg(
+        startMs: 1000,
+        endMs: 3000,
+        text: 'はい。',
+        times: <int>[1040, 1600, 1800],
+      );
+      final List<AsrCue> cues = builder.build(<AsrTranscribedSegment>[seg]);
+      expect(cues.single.startMs, 1000);
+      expect(cues.single.tokenOffsetsMs, <int>[40, 600, 800]);
+    });
+
+    test('raw 边界随 segments.jsonl 往返；旧行没有 rs/re 读成 null', () {
+      final AsrTranscribedSegment seg = AsrTranscribedSegment(
+        audioFileIndex: 1,
+        startMs: 1000,
+        endMs: 4000,
+        rawStartMs: 1500,
+        rawEndMs: 3700,
+        tokens: <String>['あ'],
+        tokenTimesMs: <int>[1600],
+      );
+      final AsrTranscribedSegment back =
+          AsrTranscribedSegment.fromJson(seg.toJson());
+      expect(back.rawStartMs, 1500);
+      expect(back.rawEndMs, 3700);
+      final AsrTranscribedSegment legacy = AsrTranscribedSegment.fromJson(
+        <String, Object?>{
+          'f': 0,
+          's': 0,
+          'e': 900,
+          't': <String>['あ'],
+          'm': <int>[100],
+        },
+      );
+      expect(legacy.rawStartMs, isNull);
+      expect(legacy.toJson().containsKey('rs'), isFalse);
+    });
+
     test('句末标点切句，闭合引号并入前句，中间边界用下一句首 token 减 leadIn', () {
       final AsrTranscribedSegment seg = _seg(
         startMs: 0,

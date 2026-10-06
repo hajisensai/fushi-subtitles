@@ -59,7 +59,7 @@ void main() {
 
   AsrTranscriptionService service(_ProbeFactory factory) =>
       AsrTranscriptionService(
-      audioProfile: AsrAudioProfile.cleanSpeech,
+        audioProfile: AsrAudioProfile.cleanSpeech,
         backend: const AsrIsolateBackend(buildFactory: _unusedFactory),
         loader: AsrEngineLoader(factory: factory),
         openStore: (AsrLanguage l) async =>
@@ -216,6 +216,52 @@ void main() {
       expect(
         AsrTranscriptionService.isAsrGeneratedSubtitlePath(srt.path),
         isFalse,
+      );
+    });
+  });
+
+  group('existingState / finishedSrtPath 与任务加载同一个作废判据', () {
+    Future<Directory> writeJob(
+      AsrTranscriptionService svc,
+      List<String> paths, {
+      required String extra,
+    }) async {
+      final Directory dir =
+          await svc.jobDirFor(paths, AsrLanguage.values.first);
+      dir.createSync(recursive: true);
+      File(p.join(dir.path, AsrJobFiles.srt)).writeAsStringSync('');
+      File(p.join(dir.path, AsrJobFiles.state)).writeAsStringSync(
+        '{"version":${AsrJobState.currentVersion},'
+        '"audioPaths":["${paths.single}"],'
+        '"modelId":"${asrModelPackFor(AsrLanguage.values.first).id}",'
+        '"fileDurationsMs":[22257761],"resumeSamples":[-1],"finished":true'
+        '$extra}',
+      );
+      return dir;
+    }
+
+    test('记了短于时长的解码终点 → 不报已完成（重转也不会复用它）', () async {
+      final AsrTranscriptionService svc = service(_ProbeFactory());
+      const List<String> paths = <String>['book.m4b'];
+      await writeJob(svc, paths, extra: ',"decodedEndMs":[274830]');
+      expect(await svc.existingState(paths, AsrLanguage.values.first), isNull);
+      expect(
+        await svc.finishedSrtPath(paths, AsrLanguage.values.first),
+        isNull,
+      );
+    });
+
+    test('旧任务没记解码终点 → 照常报已完成', () async {
+      final AsrTranscriptionService svc = service(_ProbeFactory());
+      const List<String> paths = <String>['book.m4b'];
+      final Directory dir = await writeJob(svc, paths, extra: '');
+      expect(
+        (await svc.existingState(paths, AsrLanguage.values.first))?.finished,
+        isTrue,
+      );
+      expect(
+        await svc.finishedSrtPath(paths, AsrLanguage.values.first),
+        p.join(dir.path, AsrJobFiles.srt),
       );
     });
   });
