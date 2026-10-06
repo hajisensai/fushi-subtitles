@@ -247,6 +247,18 @@ int? parseFfmpegDurationBannerMs(String ffmpegStderr) {
   return ms > 0 ? ms : null;
 }
 
+/// libavformat 按码率**估算**时长时写进日志的那句话（`estimate_timings`）。
+const String kFfmpegDurationEstimatedMarker =
+    'Estimating duration from bitrate';
+
+/// **纯函数**：`ffmpeg -i <file>` 的 stderr 是否表明容器时长只是按码率估出来的。
+///
+/// 没有 Xing/VBRI/Info 头的 VBR MP3 就是这样：ffprobe 拿首帧码率 × 文件大小推时长，
+/// 实测一个 220 s 的文件报 431 s。这种时长不能当「文件应有多长」的证据——拿它对账，
+/// 完好的文件会在真 EOF 处被判成截断、整本转录失败。
+bool isFfmpegDurationEstimated(String ffmpegStderr) =>
+    ffmpegStderr.contains(kFfmpegDurationEstimatedMarker);
+
 /// **纯函数**：在 ISO BMFF（QuickTime/MP4）字节流里找第一个 `mdat` box，返回其
 /// payload 视图（不拷贝）。
 ///
@@ -394,6 +406,13 @@ class FfmpegAsrPcmSource implements AsrPcmSource {
   /// 判「空块是不是文件末尾」时直接复用，不再多起一个进程。
   final Map<String, int> _probedMs = <String, int>{};
 
+  /// 按路径缓存「容器时长是不是按码率估的」（见 [isFfmpegDurationEstimated]）。
+  final Map<String, bool> _durationEstimated = <String, bool>{};
+
+  /// 时长是估算值、且 [decode] 已经在真 EOF 处收尾的文件：实际解出的长度（毫秒）。
+  /// 此后 [probeDurationMs] 报它而不是那个估算值——任务收尾对账、多文件偏移都以它为准。
+  final Map<String, int> _decodedLengthMs = <String, int>{};
+
   FfmpegBackend get _resolvedBackend => _backend ?? resolveFfmpegBackend();
 
   /// 当前已探明的输出容器（测试断言用；生产代码不需要读）。
@@ -403,6 +422,8 @@ class FfmpegAsrPcmSource implements AsrPcmSource {
   @override
   Future<int?> probeDurationMs(String audioPath) async {
     if (!File(audioPath).existsSync()) return null;
+    final int? decoded = _decodedLengthMs[audioPath];
+    if (decoded != null) return decoded;
     final int? ms = await _probe(audioPath);
     if (ms != null) _probedMs[audioPath] = ms;
     return ms;
@@ -442,6 +463,7 @@ class FfmpegAsrPcmSource implements AsrPcmSource {
         <String>['-hide_banner', '-i', audioPath],
         const Duration(seconds: 30),
       );
+      _durationEstimated[audioPath] = isFfmpegDurationEstimated(result.output);
       return parseFfmpegDurationBannerMs(result.output);
     } on ProcessException catch (e) {
       asrLog(
@@ -450,6 +472,28 @@ class FfmpegAsrPcmSource implements AsrPcmSource {
       );
       return null;
     }
+  }
+
+  /// 探测时长是不是按码率估出来的。只在解码比探测时长**提前**结束时才问（正常文件
+  /// 不多起进程）；ffprobe 的 JSON 里没有这条信息，要看 `ffmpeg -i` 的日志。
+  /// 起不了 ffmpeg 时按「可信」处理：宁可响亮失败，也不把真截断静默放过。
+  Future<bool> _isDurationEstimated(String audioPath) async {
+    final bool? cached = _durationEstimated[audioPath];
+    if (cached != null) return cached;
+    bool estimated = false;
+    try {
+      final FfmpegRunResult result = await _resolvedBackend.run(
+        <String>['-hide_banner', '-i', audioPath],
+        const Duration(seconds: 30),
+      );
+      estimated = isFfmpegDurationEstimated(result.output);
+    } on ProcessException catch (e) {
+      asrLog(
+        '[asr-pcm] duration-estimate check failed: '
+        '${describeFfmpegProcessException(e)}',
+      );
+    }
+    return _durationEstimated[audioPath] = estimated;
   }
 
   @override
@@ -476,9 +520,8 @@ class FfmpegAsrPcmSource implements AsrPcmSource {
       // startSample 不是整毫秒时：寻址向下取整到毫秒，多要 1 ms，丢掉头部多出的样本。
       // 块长是整秒（16 的倍数），所以每块的余数相同。
       final int dropLeading = startSample % kAsrPcmSamplesPerMs;
-      final int durationMs = chunkSeconds * 1000 +
-          (dropLeading > 0 ? 1 : 0) +
-          kAsrPcmDecodeTailMs;
+      final int durationMs =
+          chunkSeconds * 1000 + (dropLeading > 0 ? 1 : 0) + kAsrPcmDecodeTailMs;
       // 并行：最多 [parallelism] 块同时在解（每块一个 ffmpeg 进程），按块序出。
       // ffmpeg 解 mp3/aac 是单线程的，30 分钟 6 块串行 940 ms、并行 240 ms
       // （2026-09-07 实测）；消费方每拉一块这里就再补一块，块只在被拉时才前进，
@@ -518,9 +561,28 @@ class FfmpegAsrPcmSource implements AsrPcmSource {
           // 实测某 6 小时 m4b 87.5% 是零，前 4 分半之后一个包都解不出）或 ffmpeg 内存
           // 不足时，ffmpeg 同样正常退出、输出为空。当 EOF 收尾 = 任务报完成、产物是
           // 前几分钟的残卷，用户只能看到一个莫名其妙的低匹配率。
+          //
+          // 例外是时长本身靠不住：没有 Xing/VBRI 头的 VBR MP3，时长按码率估，常比
+          // 实际长出几成。那时「提前」的空块就是真 EOF，记下实际长度后正常收尾。
           if (samples.isEmpty) {
+            final bool endsEarly = totalMs != null &&
+                expectedStart <
+                    (totalMs - kAsrPcmEofSlackMs) * kAsrPcmSamplesPerMs;
+            if (endsEarly && await _isDurationEstimated(audioPath)) {
+              // 估算时长不算证据：实际解出的长度才是这个文件的长度。记下来，任务
+              // 收尾对账（经 [probeDurationMs]）与多文件偏移都改用它。
+              final int decodedMs = expectedStart ~/ kAsrPcmSamplesPerMs;
+              asrLog(
+                '[asr-pcm] "$audioPath": container duration ${totalMs}ms is a '
+                'bitrate estimate; stream really ends at ${decodedMs}ms',
+              );
+              _decodedLengthMs[audioPath] = decodedMs;
+              _probedMs[audioPath] = decodedMs;
+              break;
+            }
             if (totalMs == null ||
-                blockStart >= (totalMs - kAsrPcmEofSlackMs) * kAsrPcmSamplesPerMs) {
+                blockStart >=
+                    (totalMs - kAsrPcmEofSlackMs) * kAsrPcmSamplesPerMs) {
               break;
             }
             throw AsrPcmDecodeException(

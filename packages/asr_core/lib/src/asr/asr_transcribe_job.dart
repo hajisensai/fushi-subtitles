@@ -23,7 +23,6 @@ library;
 import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
-import 'dart:math' as math;
 
 import 'package:meta/meta.dart';
 import 'package:fushi_asr_core/src/util/collections.dart';
@@ -40,57 +39,61 @@ import 'package:fushi_asr_core/src/asr/asr_types.dart';
 /// 留 3 倍余量吸收容器时长与解码样本数的取整差。真实的截断事故差的是分钟到小时。
 const int kAsrFileTruncationToleranceMs = 3000;
 
+/// **纯函数**：解码终点是否比文件时长短出 [kAsrFileTruncationToleranceMs] 以上。
+///
+/// 截断的唯一判据：任务收尾对账（[checkAsrFileTruncation]）与加载时作废已完成任务
+/// （[isAsrFinishedJobTruncated]）都用它，两处永远同一口径。任一值为 null（时长探不出 /
+/// 旧任务没记解码终点）时无从判断，返回 false。
+bool isAsrDecodeTruncated({
+  required int? fileDurationMs,
+  required int? decodedEndMs,
+}) {
+  if (fileDurationMs == null || decodedEndMs == null) return false;
+  return decodedEndMs < fileDurationMs - kAsrFileTruncationToleranceMs;
+}
+
 /// **纯函数**：文件收尾的截断对账。
 ///
 /// PCM 解码流「正常结束」≠ 读到了文件末尾：源文件中途损坏、未下载完、拼接坏块都可能让
-/// 流体面收尾。解码终点比探测时长短出 [kAsrFileTruncationToleranceMs] 以上 ⇒ 抛
-/// [AsrPcmDecodeException]，宁可整本失败也不产出 `finished` 的残卷。
-/// [probedMs] 为 null（探不出时长）时无从对账，直接放行。
+/// 流体面收尾。[isAsrDecodeTruncated] 成立 ⇒ 抛 [AsrPcmDecodeException]，宁可整本失败
+/// 也不产出 `finished` 的残卷。[probedMs] 为 null（探不出时长）时无从对账，直接放行。
+///
+/// [probedMs] 必须是**可信**的时长：按码率估出来的时长（无 Xing 头的 VBR MP3）由
+/// PCM 源在真 EOF 处改报实际长度（见 `FfmpegAsrPcmSource.probeDurationMs`），
+/// 任务在对账前会重新问一次，不拿估算值冤枉完好的文件。
 void checkAsrFileTruncation({
   required String audioPath,
   required int? probedMs,
   required int decodedEndMs,
 }) {
-  if (probedMs == null) return;
-  if (decodedEndMs >= probedMs - kAsrFileTruncationToleranceMs) return;
+  if (!isAsrDecodeTruncated(
+    fileDurationMs: probedMs,
+    decodedEndMs: decodedEndMs,
+  )) {
+    return;
+  }
   throw AsrPcmDecodeException(
     audioPath,
     'decoding ended at ${decodedEndMs}ms but the file is ${probedMs}ms long '
-    '(${((probedMs - decodedEndMs) / 60000).toStringAsFixed(1)} min missing); '
+    '(${((probedMs! - decodedEndMs) / 60000).toStringAsFixed(1)} min missing); '
     'the $kAsrIncompleteAudioMarker (e.g. a download that has not finished); '
     'refusing to finish with a partial transcript',
   );
 }
 
-/// 判「已完成的旧任务是不是残卷」时，最后一段语音离文件末尾允许的最大距离：
-/// `max(120 s, 文件时长的 10%)`。
+/// **纯函数**：已标完成的任务里，是否有文件的解码终点离文件末尾短出容差。
 ///
-/// 只有段落可查（旧任务没记解码终点），而语音段在片尾音乐/静音处会提前结束，所以
-/// 容差要远宽于 [kAsrFileTruncationToleranceMs]；它只为接住「转了前几分钟就报完成」
-/// 那种量级的残卷。
-int asrStaleFinishSlackMs(int fileDurationMs) =>
-    math.max(120000, fileDurationMs ~/ 10);
-
-/// **纯函数**：已标完成的任务里，是否有文件的最后一段语音离文件末尾远得不正常。
-///
-/// 截断对账之前的版本会把解码中途失败（空块被当 EOF）的任务标成 finished；任务 id
-/// 只含文件名与字节数，用户把文件重新下完整后大小不变、仍命中这个残卷缓存。加载时
-/// 用它把这种任务当新任务重跑。探不出时长的文件不参与判定。
-@visibleForTesting
-bool isAsrFinishedJobTruncated(
-  List<int?> fileDurationsMs,
-  List<AsrTranscribedSegment> segments,
-) {
-  final List<int> lastEnd = List<int>.filled(fileDurationsMs.length, 0);
-  for (final AsrTranscribedSegment s in segments) {
-    final int i = s.audioFileIndex;
-    if (i < 0 || i >= lastEnd.length) continue;
-    if (s.endMs > lastEnd[i]) lastEnd[i] = s.endMs;
-  }
-  for (int i = 0; i < fileDurationsMs.length; i++) {
-    final int? duration = fileDurationsMs[i];
-    if (duration == null || duration <= 0) continue;
-    if (duration - lastEnd[i] > asrStaleFinishSlackMs(duration)) return true;
+/// 只认任务完成时落盘的解码终点（[AsrJobState.decodedEndMs]），与收尾对账同一判据
+/// （[isAsrDecodeTruncated]）。没记解码终点的旧任务一律**不**作废：从语音段末尾去猜
+/// 会把片尾长音乐 / 纯音乐轨的完好任务当残卷，每次加载都从头重转。
+bool isAsrFinishedJobTruncated(AsrJobState state) {
+  for (int i = 0; i < state.audioPaths.length; i++) {
+    if (isAsrDecodeTruncated(
+      fileDurationMs: state.fileDurationsMs[i],
+      decodedEndMs: state.decodedEndMsAt(i),
+    )) {
+      return true;
+    }
   }
   return false;
 }
@@ -257,6 +260,7 @@ class AsrJobState {
     required this.fileDurationsMs,
     required this.resumeSamples,
     required this.finished,
+    this.decodedEndMs = const <int?>[],
   });
 
   factory AsrJobState.fresh(
@@ -278,6 +282,9 @@ class AsrJobState {
         (json['fileDurationsMs'] as List<Object?>?) ?? const <Object?>[];
     final List<Object?> resumes =
         (json['resumeSamples'] as List<Object?>?) ?? const <Object?>[];
+    // 截断对账之前写的 state 没有这个键：全部 null，加载时不据此作废。
+    final List<Object?> decoded =
+        (json['decodedEndMs'] as List<Object?>?) ?? const <Object?>[];
     return AsrJobState(
       audioPaths: List<String>.unmodifiable(paths),
       modelId: (json['modelId'] as String?) ?? '',
@@ -291,6 +298,10 @@ class AsrJobState {
         (int i) => i < resumes.length ? (resumes[i] as num).toInt() : 0,
       ),
       finished: json['finished'] == true,
+      decodedEndMs: List<int?>.generate(
+        paths.length,
+        (int i) => i < decoded.length ? (decoded[i] as num?)?.toInt() : null,
+      ),
     );
   }
 
@@ -304,6 +315,13 @@ class AsrJobState {
   /// 每个文件的恢复点（样本）。等于文件总样本数（或 -1）表示该文件已完成。
   final List<int> resumeSamples;
   final bool finished;
+
+  /// 每个文件处理完时实际解码到的终点（毫秒）；未处理完 / 旧任务为 null。
+  /// 只经 [decodedEndMsAt] 读（宿主直接构造的 state 可能给空列表）。
+  final List<int?> decodedEndMs;
+
+  int? decodedEndMsAt(int i) =>
+      i < decodedEndMs.length ? decodedEndMs[i] : null;
 
   /// 文件是否已处理完（resumeSample 用 -1 标记）。
   bool isFileDone(int i) => resumeSamples[i] < 0;
@@ -324,12 +342,14 @@ class AsrJobState {
         'fileDurationsMs': fileDurationsMs,
         'resumeSamples': resumeSamples,
         'finished': finished,
+        'decodedEndMs': List<int?>.generate(audioPaths.length, decodedEndMsAt),
       };
 
   AsrJobState copyWith({
     List<int?>? fileDurationsMs,
     List<int>? resumeSamples,
     bool? finished,
+    List<int?>? decodedEndMs,
   }) {
     return AsrJobState(
       audioPaths: audioPaths,
@@ -337,6 +357,7 @@ class AsrJobState {
       fileDurationsMs: fileDurationsMs ?? this.fileDurationsMs,
       resumeSamples: resumeSamples ?? this.resumeSamples,
       finished: finished ?? this.finished,
+      decodedEndMs: decodedEndMs ?? this.decodedEndMs,
     );
   }
 }
@@ -448,12 +469,10 @@ class AsrTranscribeJob {
       final AsrJobState state = AsrJobState.fromJson(json);
       if (!listEquals(state.audioPaths, audioPaths)) return fresh;
       if (state.modelId != modelId) return fresh;
-      if (state.finished &&
-          isAsrFinishedJobTruncated(
-            state.fileDurationsMs,
-            await loadSegments(jobDir),
-          )) {
-        // 截断对账之前留下的残卷（见 [isAsrFinishedJobTruncated]）：不复用，重跑。
+      if (state.finished && isAsrFinishedJobTruncated(state)) {
+        // 记了解码终点却短于文件时长的「已完成」任务（见 [isAsrFinishedJobTruncated]）：
+        // 不复用，重跑。[AsrTranscriptionService.existingState] 也经这里，面板与重转
+        // 看到的是同一个结论。
         return fresh;
       }
       return (state: state, fresh: false);
@@ -494,7 +513,6 @@ class AsrTranscribeJob {
     }
     return out;
   }
-
 
   /// 运行（或从检查点继续）。流以 [AsrTranscribeFinishedEvent] 或
   /// [AsrTranscribePausedEvent] 结束；异常直接抛给监听者（已落盘的进度不丢）。
@@ -791,12 +809,31 @@ class AsrTranscribeJob {
         await drain(all: true);
         // PCM 流正常收尾 ≠ 读到了文件末尾：标完成前和探测时长对账，宁可整本失败
         // 也不把残卷标成 finished（见 [checkAsrFileTruncation]）。
+        final int decodedEndMs = _samplesToMs(lastEndSample);
+        if (isAsrDecodeTruncated(
+          fileDurationMs: durations[fileIndex],
+          decodedEndMs: decodedEndMs,
+        )) {
+          // 开跑前探到的可能只是按码率估的时长：PCM 源解到真 EOF 后会改报实际长度。
+          // 对账前再问一次，用它（并写回 state，SRT 偏移与之后的作废判据都按它算）。
+          final int? again = await pcm.probeDurationMs(path);
+          if (again != null && again != durations[fileIndex]) {
+            durations[fileIndex] = again;
+            state = state.copyWith(fileDurationsMs: List<int?>.of(durations));
+          }
+        }
         checkAsrFileTruncation(
           audioPath: path,
           probedMs: durations[fileIndex],
-          decodedEndMs: _samplesToMs(lastEndSample),
+          decodedEndMs: decodedEndMs,
         );
         state = _withResume(state, fileIndex, -1);
+        state = state.copyWith(
+          decodedEndMs: List<int?>.generate(
+            audioPaths.length,
+            (int i) => i == fileIndex ? decodedEndMs : state.decodedEndMsAt(i),
+          ),
+        );
         // 探测失败的文件用实际解码到的样本数补时长，让偏移与进度有据可依（多文件时
         // 后一文件的 SRT 偏移就靠它；最后一段语音的结尾会丢掉片尾静音）。
         if (durations[fileIndex] == null) {

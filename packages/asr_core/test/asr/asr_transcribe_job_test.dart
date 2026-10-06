@@ -14,6 +14,7 @@ class _FakePcm implements AsrPcmSource {
     this.durationsMs, {
     this.probeFails = const <int>{},
     this.decodedMs = const <String, int>{},
+    this.durationAfterDecodeMs = const <String, int>{},
   });
 
   final Map<String, int> durationsMs;
@@ -21,11 +22,20 @@ class _FakePcm implements AsrPcmSource {
 
   /// 按路径覆盖「实际能解出多少毫秒」：模拟文件后半段损坏/未下载完，流却正常收尾。
   final Map<String, int> decodedMs;
+
+  /// 按路径：解码跑完之后 [probeDurationMs] 改报的值。模拟
+  /// `FfmpegAsrPcmSource` 在「时长只是码率估算」的文件解到真 EOF 后改报实际长度。
+  final Map<String, int> durationAfterDecodeMs;
+  final Set<String> _decoded = <String>{};
   final List<({String path, int start})> decodeCalls =
       <({String path, int start})>[];
 
   @override
   Future<int?> probeDurationMs(String audioPath) async {
+    if (_decoded.contains(audioPath) &&
+        durationAfterDecodeMs.containsKey(audioPath)) {
+      return durationAfterDecodeMs[audioPath];
+    }
     final int idx = durationsMs.keys.toList().indexOf(audioPath);
     if (probeFails.contains(idx)) return null;
     return durationsMs[audioPath];
@@ -47,6 +57,7 @@ class _FakePcm implements AsrPcmSource {
       yield AsrPcmChunk(startSample: pos, samples: Float32List(n));
       pos += n;
     }
+    _decoded.add(audioPath);
   }
 }
 
@@ -433,59 +444,132 @@ void main() {
     );
   });
 
-  group('isAsrFinishedJobTruncated（截断对账之前留下的残卷）', () {
-    AsrTranscribedSegment seg(int file, int startMs, int endMs) =>
-        AsrTranscribedSegment(
-          audioFileIndex: file,
-          startMs: startMs,
-          endMs: endMs,
-          tokens: const <String>['あ'],
-          tokenTimesMs: <int>[startMs],
+  test('时长是码率估算（VBR 无 Xing 头）：PCM 源改报实际长度，照常完成并写回', () async {
+    // 探测报 431 s，实际只有 220 s：完好的文件，不能因为估算值整本失败。
+    final _FakePcm pcm = _FakePcm(
+      <String, int>{'a.mp3': 431330},
+      decodedMs: <String, int>{'a.mp3': 220000},
+      durationAfterDecodeMs: <String, int>{'a.mp3': 220000},
+    );
+    final AsrTranscribeJob job = AsrTranscribeJob(
+      jobDir: tmp,
+      audioPaths: <String>['a.mp3'],
+      modelId: _kModelId,
+      pcm: pcm,
+      segmenter: _FakeSegmenter(segmentsPerChunk: 1),
+      decoder: _FakeDecoder(),
+      chunkSeconds: 600,
+      progressInterval: Duration.zero,
+    );
+    final List<AsrTranscribeEvent> events = await job.run().toList();
+    expect(events.last, isA<AsrTranscribeFinishedEvent>());
+    final AsrJobState state = await AsrTranscribeJob.loadState(
+      tmp,
+      <String>['a.mp3'],
+      modelId: _kModelId,
+    );
+    expect(state.finished, isTrue);
+    expect(state.fileDurationsMs, <int?>[220000]);
+    expect(state.decodedEndMs, <int?>[220000]);
+  });
+
+  test('完成时把每个文件的解码终点写进 state', () async {
+    final AsrTranscribeJob job = AsrTranscribeJob(
+      jobDir: tmp,
+      audioPaths: <String>['a.mp3', 'b.mp3'],
+      modelId: _kModelId,
+      pcm: _FakePcm(
+        <String, int>{'a.mp3': 12000, 'b.mp3': 9000},
+        decodedMs: <String, int>{'b.mp3': 8000},
+      ),
+      segmenter: _FakeSegmenter(segmentsPerChunk: 1),
+      decoder: _FakeDecoder(),
+      chunkSeconds: 5,
+      progressInterval: Duration.zero,
+    );
+    await job.run().toList();
+    final AsrJobState state = await AsrTranscribeJob.loadState(
+      tmp,
+      <String>['a.mp3', 'b.mp3'],
+      modelId: _kModelId,
+    );
+    expect(state.decodedEndMs, <int?>[12000, 8000]);
+  });
+
+  group('isAsrFinishedJobTruncated（按落盘的解码终点判，与收尾对账同一判据）', () {
+    AsrJobState finished(List<int?> durations, List<int?> decodedEnds) =>
+        AsrJobState(
+          audioPaths: List<String>.generate(durations.length, (int i) => '$i'),
+          modelId: _kModelId,
+          fileDurationsMs: durations,
+          resumeSamples: List<int>.filled(durations.length, -1),
+          finished: true,
+          decodedEndMs: decodedEnds,
         );
 
-    test('6 小时的书只转到 4 分半 → 残卷', () {
+    test('解码终点比时长短出容差 → 残卷；容差内 → 不是', () {
+      expect(
+        isAsrFinishedJobTruncated(finished(<int?>[22257761], <int?>[274830])),
+        isTrue,
+      );
+      expect(
+        isAsrFinishedJobTruncated(finished(
+          <int?>[60000],
+          <int?>[60000 - kAsrFileTruncationToleranceMs],
+        )),
+        isFalse,
+      );
+    });
+
+    test('没记解码终点（旧任务）/ 时长未知 → 不作废', () {
+      expect(
+        isAsrFinishedJobTruncated(finished(<int?>[22257761], <int?>[null])),
+        isFalse,
+      );
+      expect(
+        isAsrFinishedJobTruncated(finished(<int?>[22257761], const <int?>[])),
+        isFalse,
+      );
+      expect(
+        isAsrFinishedJobTruncated(finished(<int?>[null], <int?>[1000])),
+        isFalse,
+      );
+    });
+
+    test('多文件任一残卷即算', () {
       expect(
         isAsrFinishedJobTruncated(
-          <int?>[22257761],
-          <AsrTranscribedSegment>[seg(0, 259820, 274830)],
+          finished(<int?>[600000, 600000], <int?>[600000, 60000]),
         ),
         isTrue,
       );
     });
 
-    test('片尾 15 分钟没人声的 7 小时书（< 10%）→ 不算残卷', () {
-      expect(
-        isAsrFinishedJobTruncated(
-          <int?>[25800290],
-          <AsrTranscribedSegment>[seg(0, 24870000, 24877588)],
-        ),
-        isFalse,
-      );
+    test('判据与 checkAsrFileTruncation 同口径', () {
+      for (final (int dur, int end) in <(int, int)>[
+        (10000, 7000),
+        (10000, 6999),
+        (300000, 1000),
+      ]) {
+        bool threw = false;
+        try {
+          checkAsrFileTruncation(
+            audioPath: 'a',
+            probedMs: dur,
+            decodedEndMs: end,
+          );
+        } on AsrPcmDecodeException {
+          threw = true;
+        }
+        expect(
+          isAsrFinishedJobTruncated(finished(<int?>[dur], <int?>[end])),
+          threw,
+          reason: '($dur, $end)',
+        );
+      }
     });
 
-    test('短文件按 120 s 下限；时长未知的文件不判；多文件任一残卷即算', () {
-      expect(
-        isAsrFinishedJobTruncated(
-          <int?>[300000],
-          <AsrTranscribedSegment>[seg(0, 100000, 190000)],
-        ),
-        isFalse,
-      );
-      expect(
-        isAsrFinishedJobTruncated(
-            <int?>[null], const <AsrTranscribedSegment>[]),
-        isFalse,
-      );
-      expect(
-        isAsrFinishedJobTruncated(
-          <int?>[600000, 600000],
-          <AsrTranscribedSegment>[seg(0, 590000, 599000), seg(1, 0, 60000)],
-        ),
-        isTrue,
-      );
-    });
-
-    test('loadStateDetailed 不复用已完成的残卷任务', () async {
+    test('旧 state（没有 decodedEndMs）即使语音只到开头几分钟也照常复用', () async {
       File('${tmp.path}/${AsrJobFiles.segments}').writeAsStringSync(
         '{"f":0,"s":259820,"e":274830,"t":["あ"],"m":[259900]}\n',
       );
@@ -500,8 +584,47 @@ void main() {
         <String>['a.m4b'],
         modelId: _kModelId,
       );
+      expect(loaded.fresh, isFalse);
+      expect(loaded.state.finished, isTrue);
+    });
+
+    test('记了解码终点且短于时长的已完成任务：不复用', () async {
+      File('${tmp.path}/${AsrJobFiles.state}').writeAsStringSync(
+        '{"version":${AsrJobState.currentVersion},"audioPaths":["a.m4b"],'
+        '"modelId":"$_kModelId","fileDurationsMs":[22257761],'
+        '"resumeSamples":[-1],"finished":true,"decodedEndMs":[274830]}',
+      );
+      final ({AsrJobState state, bool fresh}) loaded =
+          await AsrTranscribeJob.loadStateDetailed(
+        tmp,
+        <String>['a.m4b'],
+        modelId: _kModelId,
+      );
       expect(loaded.fresh, isTrue);
       expect(loaded.state.finished, isFalse);
+    });
+
+    test('片尾长音乐的完好任务：真跑完后再加载照常复用（不从头重转）', () async {
+      // 300 s 的文件，唯一一段语音在开头 1 s：按「最后语音离末尾」去猜会判成残卷。
+      final AsrTranscribeJob job = AsrTranscribeJob(
+        jobDir: tmp,
+        audioPaths: <String>['a.mp3'],
+        modelId: _kModelId,
+        pcm: _FakePcm(<String, int>{'a.mp3': 300000}),
+        segmenter: _FakeSegmenter(segmentsPerChunk: 1),
+        decoder: _FakeDecoder(),
+        chunkSeconds: 600,
+        progressInterval: Duration.zero,
+      );
+      await job.run().toList();
+      final ({AsrJobState state, bool fresh}) loaded =
+          await AsrTranscribeJob.loadStateDetailed(
+        tmp,
+        <String>['a.mp3'],
+        modelId: _kModelId,
+      );
+      expect(loaded.fresh, isFalse);
+      expect(loaded.state.finished, isTrue);
     });
   });
 
