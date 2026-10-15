@@ -312,7 +312,12 @@ class _ModelsPullCommand extends Command<int> {
     argParser
       ..addOption('language', abbr: 'l', help: '语言标签')
       ..addOption('variant',
-          allowed: <String>['fp32', 'int8'], defaultsTo: 'int8', help: '编码器变体');
+          allowed: <String>['fp32', 'int8'], defaultsTo: 'int8', help: '编码器变体')
+      ..addFlag('clean-speech',
+          help: '下有声书 / 口述用的包（与 transcribe --clean-speech 对应）。默认下'
+              '混音素材（动画/影视）用的包——同一语言两者可能不同（日语：视频用 '
+              'Parakeet，有声书用 ReazonSpeech）。',
+          negatable: false);
   }
 
   @override
@@ -340,7 +345,12 @@ class _ModelsPullCommand extends Command<int> {
         (argResults!['variant'] as String) == 'fp32'
             ? AsrEncoderVariant.fp32
             : AsrEncoderVariant.int8;
-    final AsrModelStore store = await AsrModelStore.open(language);
+    final AsrModelStore store = await AsrModelStore.open(
+      language,
+      profile: argResults!['clean-speech'] as bool
+          ? AsrAudioProfile.cleanSpeech
+          : AsrAudioProfile.mixedAudio,
+    );
     await for (final ModelDownloadEvent e in store.download(variant)) {
       final String pct = e.totalBytes == 0
           ? '--'

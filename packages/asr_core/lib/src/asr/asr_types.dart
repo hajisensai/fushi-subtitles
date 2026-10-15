@@ -61,6 +61,12 @@ abstract final class AsrModelIo {
   /// CTC（Omnilingual）：`x[N, num_samples]` f32 → `logits[N, num_frames, V]`。
   static const String ctcInputX = 'x';
   static const String ctcOutputLogits = 'logits';
+
+  /// NeMo CTC（Parakeet，sherpa-onnx / onnx-asr 导出）：
+  /// `audio_signal[N, 80, T]` f32 + `length[N]` i64 → `logprobs[N, T/8, V]`。
+  static const String nemoInputAudioSignal = 'audio_signal';
+  static const String nemoInputLength = 'length';
+  static const String nemoOutputLogprobs = 'logprobs';
 }
 
 /// 词表（`tokens.txt`）。
@@ -236,10 +242,22 @@ class AsrSpeechSegment {
     required this.samples,
     this.rawStartMs,
     this.rawEndMs,
+    this.coreStartSample,
+    this.coreEndSample,
   });
 
   final int startSample;
   final Float32List samples;
+
+  /// 滑窗切段（`AsrSlidingWindowSegmenter`）的**中心区**（样本，相对文件）：
+  /// 相邻窗口重叠，每个窗口只认落在自己中心区里的 token，中心区首尾相接、互不
+  /// 重叠，拼起来就是整条无缝时间轴（[AsrTranscribedSegment.fromDecoded] 按它
+  /// 过滤）。VAD 切段为 null——整段都算数。
+  final int? coreStartSample;
+  final int? coreEndSample;
+
+  /// 是否是滑窗切出的窗口（带中心区）。
+  bool get isWindow => coreStartSample != null && coreEndSample != null;
 
   /// VAD **未外扩**的语音窗口（毫秒，相对文件）。[startSample] 是外扩 pad 之后的起点：
   /// pad 是喂模型防首字被吃的，时间轴不该跟着提前——直接拿它当 cue 起点，字幕比人声
@@ -302,6 +320,7 @@ class AsrTranscribedSegment {
     required this.tokenTimesMs,
     this.rawStartMs,
     this.rawEndMs,
+    this.continuous = false,
   }) : assert(tokens.length == tokenTimesMs.length);
 
   factory AsrTranscribedSegment.fromDecoded({
@@ -309,6 +328,29 @@ class AsrTranscribedSegment {
     required AsrSpeechSegment speech,
     required AsrDecodedSegment decoded,
   }) {
+    if (speech.isWindow) {
+      // 滑窗：只留中心区里的 token，段界 = 中心区。重叠区一分为二，各归离它
+      // 更远离窗口边缘的那个窗口——边缘的帧上下文残缺，识别最不可靠。
+      final int coreStartMs = speech.coreStartSample! * 1000 ~/ kAsrSampleRate;
+      final int coreEndMs = speech.coreEndSample! * 1000 ~/ kAsrSampleRate;
+      final List<String> tokens = <String>[];
+      final List<int> times = <int>[];
+      for (int i = 0; i < decoded.tokens.length; i++) {
+        final int t = speech.startMs + decoded.tokenOffsetsMs[i];
+        if (t >= coreStartMs && t < coreEndMs) {
+          tokens.add(decoded.tokens[i]);
+          times.add(t);
+        }
+      }
+      return AsrTranscribedSegment(
+        audioFileIndex: audioFileIndex,
+        startMs: coreStartMs,
+        endMs: coreEndMs,
+        tokens: List<String>.unmodifiable(tokens),
+        tokenTimesMs: List<int>.unmodifiable(times),
+        continuous: true,
+      );
+    }
     return AsrTranscribedSegment(
       audioFileIndex: audioFileIndex,
       startMs: speech.startMs,
@@ -335,6 +377,7 @@ class AsrTranscribedSegment {
       ),
       rawStartMs: (json['rs'] as num?)?.toInt(),
       rawEndMs: (json['re'] as num?)?.toInt(),
+      continuous: json['c'] == true,
       // 旧检查点可能还带 `me` / `eb`（已删除的声学调轴产物）：只读自己认的键，
       // 多出来的一律忽略，旧任务照样能恢复。
     );
@@ -356,6 +399,11 @@ class AsrTranscribedSegment {
   final int? rawStartMs;
   final int? rawEndMs;
 
+  /// 滑窗中心区产物：[startMs]/[endMs] 是中心区边界而不是语音边界，与同文件
+  /// 前后段首尾相接。建 cue 前要先拼回整条 token 流、按静音重切
+  /// （`AsrCueBuilder` 负责），否则 cue 会被 12 s 一刀的窗口网格切断。
+  final bool continuous;
+
   String get text => tokens.join();
 
   Map<String, Object?> toJson() => <String, Object?>{
@@ -366,6 +414,7 @@ class AsrTranscribedSegment {
         'm': tokenTimesMs,
         if (rawStartMs != null) 'rs': rawStartMs,
         if (rawEndMs != null) 're': rawEndMs,
+        if (continuous) 'c': true,
       };
 }
 

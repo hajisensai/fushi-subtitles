@@ -38,7 +38,6 @@ import 'package:fushi_asr_core/src/asr/asr_transcription_service.dart';
 import 'package:fushi_asr_core/src/asr/asr_transducer_decoder.dart';
 import 'package:fushi_asr_core/src/asr/asr_types.dart';
 import 'package:fushi_asr_core/src/util/log.dart';
-import 'package:fushi_asr_core/src/asr/asr_vad.dart';
 import 'package:fushi_asr_core/src/onnx/onnx_inference.dart';
 
 /// 跨 isolate 的任务说明：全是路径 / 枚举 / 数值，不带闭包与会话。
@@ -395,7 +394,7 @@ Future<void> _isolateMain(_IsolateArgs args) async {
   try {
     final AsrModelStore store = AsrModelStore(
       Directory(spec.storeDirPath),
-      asrModelPackFor(spec.language),
+      asrModelPackFor(spec.language, profile: spec.audioProfile),
     );
     final AsrEngineLoader loader = AsrEngineLoader(
       factory: args.backend.buildFactory(),
@@ -420,25 +419,15 @@ Future<void> _isolateMain(_IsolateArgs args) async {
       ),
     );
     final AsrSegmentDecoder decoder = sessions.newDecoder()..warmUp();
-    final int maxSegmentMs = sessions.maxSegmentMs;
     final AsrTranscribeJob j = AsrTranscribeJob(
       jobDir: Directory(spec.jobDirPath),
       audioPaths: spec.audioPaths,
       modelId: store.pack.id,
       pcm: pcm,
-      segmenter: switch (spec.audioProfile) {
-          // 干净朗读：语音与静默双模态可分，纯 Dart 能量门限够用且免掉每窗口
-          // 一次 ONNX 前向（有声书上实测占整条流水线七成）。
-          AsrAudioProfile.cleanSpeech => AsrVadSegmenter(
-              scorer: EnergyVadScorer(),
-              maxSegmentMs: maxSegmentMs,
-            ),
-          // 混音素材：能量门限的前提不成立，只能用神经网络 VAD。
-          AsrAudioProfile.mixedAudio => AsrVadSegmenter(
-              session: sessions.vad,
-              maxSegmentMs: maxSegmentMs,
-            ),
-        },
+      segmenter: buildAsrSegmenter(
+        profile: spec.audioProfile,
+        sessions: sessions,
+      ),
       decoder: decoder,
       batchSize: spec.batchSize ??
           AsrTranscriptionService.defaultBatchSizeFor(

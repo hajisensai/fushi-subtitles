@@ -172,7 +172,7 @@ class AsrCueBuilder {
     List<int> fileOffsetsMs = const <int>[],
   }) {
     final List<AsrTranscribedSegment> ordered =
-        List<AsrTranscribedSegment>.of(segments)
+        List<AsrTranscribedSegment>.of(resplitContinuousSegments(segments))
           ..sort((AsrTranscribedSegment a, AsrTranscribedSegment b) {
             final int byFile = a.audioFileIndex.compareTo(b.audioFileIndex);
             return byFile != 0 ? byFile : a.startMs.compareTo(b.startMs);
@@ -198,6 +198,99 @@ class AsrCueBuilder {
           tokenOffsetsMs: prev.tokenOffsetsMs,
         );
       }
+    }
+    return out;
+  }
+
+  /// 滑窗产物（[AsrTranscribedSegment.continuous]）没有语音边界——段界是 12 s
+  /// 一格的窗口网格。把同文件首尾相接的这类段拼回一条 token 流，在 token 起点
+  /// 间隔超过 [silenceSplitMs] 处切成「伪语音段」，再交给常规的逐段建 cue：
+  ///
+  /// - 起点 = 首 token − [speechLeadMs]（CTC 尖峰落在发音起点附近，留一点开口），
+  ///   终点 = 末 token + [speechTailMs]（尖峰只标起点，尾音还要一段）；
+  /// - 都夹在拼接段的总边界内，且不越过下一个伪语音段的起点；
+  /// - 起点同时写进 `rawStartMs`，段首 cue 从这里开始，而不是从窗口网格开始。
+  ///
+  /// 其余段原样返回。默认值与 2026-10-15 的 Python 对照实现一致（静音 600 ms
+  /// ≈ 尖峰起点间隔 680 ms、首 −120 ms、尾 +400 ms），该实现在 8 集动画上的时间
+  /// 轴重合度与 VAD 管线持平（IoU 0.69）。
+  static List<AsrTranscribedSegment> resplitContinuousSegments(
+    List<AsrTranscribedSegment> segments, {
+    int silenceSplitMs = 680,
+    int speechLeadMs = 120,
+    int speechTailMs = 400,
+  }) {
+    if (!segments.any((AsrTranscribedSegment s) => s.continuous)) {
+      return segments;
+    }
+    final List<AsrTranscribedSegment> sorted =
+        List<AsrTranscribedSegment>.of(segments)
+          ..sort((AsrTranscribedSegment a, AsrTranscribedSegment b) {
+            final int byFile = a.audioFileIndex.compareTo(b.audioFileIndex);
+            return byFile != 0 ? byFile : a.startMs.compareTo(b.startMs);
+          });
+    final List<AsrTranscribedSegment> out = <AsrTranscribedSegment>[];
+    int i = 0;
+    while (i < sorted.length) {
+      final AsrTranscribedSegment first = sorted[i];
+      if (!first.continuous) {
+        out.add(first);
+        i++;
+        continue;
+      }
+      // 收一串同文件、首尾相接的滑窗段。
+      final List<String> tokens = <String>[...first.tokens];
+      final List<int> times = <int>[...first.tokenTimesMs];
+      int runEnd = first.endMs;
+      int j = i + 1;
+      while (j < sorted.length &&
+          sorted[j].continuous &&
+          sorted[j].audioFileIndex == first.audioFileIndex &&
+          sorted[j].startMs == runEnd) {
+        tokens.addAll(sorted[j].tokens);
+        times.addAll(sorted[j].tokenTimesMs);
+        runEnd = sorted[j].endMs;
+        j++;
+      }
+      final int runStart = first.startMs;
+      // 按静音切成伪语音段：[from, to) 是 token 下标区间。
+      final List<(int, int)> groups = <(int, int)>[];
+      int from = 0;
+      for (int k = 1; k <= tokens.length; k++) {
+        if (k == tokens.length || times[k] - times[k - 1] > silenceSplitMs) {
+          if (k > from) groups.add((from, k));
+          from = k;
+        }
+      }
+      for (int g = 0; g < groups.length; g++) {
+        final (int a, int b) = groups[g];
+        final int nextStart = g + 1 < groups.length
+            ? times[groups[g + 1].$1] - speechLeadMs
+            : runEnd;
+        int start = times[a] - speechLeadMs;
+        if (start < runStart) start = runStart;
+        if (out.isNotEmpty &&
+            out.last.audioFileIndex == first.audioFileIndex &&
+            start < out.last.endMs) {
+          start = out.last.endMs;
+        }
+        int end = times[b - 1] + speechTailMs;
+        if (end > nextStart) end = nextStart;
+        if (end > runEnd) end = runEnd;
+        if (end <= start) end = start + kAsrEncoderFrameMs;
+        out.add(
+          AsrTranscribedSegment(
+            audioFileIndex: first.audioFileIndex,
+            startMs: start,
+            endMs: end,
+            rawStartMs: start,
+            rawEndMs: end,
+            tokens: List<String>.unmodifiable(tokens.sublist(a, b)),
+            tokenTimesMs: List<int>.unmodifiable(times.sublist(a, b)),
+          ),
+        );
+      }
+      i = j;
     }
     return out;
   }

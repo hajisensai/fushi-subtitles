@@ -62,8 +62,8 @@ void main() {
         audioProfile: AsrAudioProfile.cleanSpeech,
         backend: const AsrIsolateBackend(buildFactory: _unusedFactory),
         loader: AsrEngineLoader(factory: factory),
-        openStore: (AsrLanguage l) async =>
-            AsrModelStore(tmp, asrModelPackFor(l)),
+        openStore: (AsrLanguage l, AsrAudioProfile p) async =>
+            AsrModelStore(tmp, asrModelPackFor(l, profile: p)),
         jobsRoot: () async => tmp,
         runInIsolate: false,
       );
@@ -184,6 +184,35 @@ void main() {
           AsrLanguage.japanese,
         ),
         missing,
+      );
+    });
+
+    test('素材进哈希：视频与有声书不共用缓存；有声书与老 id 相同（进行中任务不失联）',
+        () {
+      final File a = write('a', 'x.mkv', 100);
+      final String legacy = AsrTranscriptionService.jobIdFor(
+        <String>[a.path],
+        AsrLanguage.japanese,
+      );
+      final String clean = AsrTranscriptionService.jobIdFor(
+        <String>[a.path],
+        AsrLanguage.japanese,
+        profile: AsrAudioProfile.cleanSpeech,
+      );
+      final String mixed = AsrTranscriptionService.jobIdFor(
+        <String>[a.path],
+        AsrLanguage.japanese,
+        profile: AsrAudioProfile.mixedAudio,
+      );
+      expect(clean, legacy);
+      expect(mixed, isNot(clean));
+      // 没有专用包的语言，换素材也必须换 id（同一个包、切段方式不同）。
+      expect(
+        AsrTranscriptionService.jobIdFor(<String>[a.path], AsrLanguage.english,
+            profile: AsrAudioProfile.mixedAudio),
+        isNot(AsrTranscriptionService.jobIdFor(
+            <String>[a.path], AsrLanguage.english,
+            profile: AsrAudioProfile.cleanSpeech)),
       );
     });
   });

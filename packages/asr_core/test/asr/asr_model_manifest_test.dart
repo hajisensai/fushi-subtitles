@@ -1,3 +1,4 @@
+import 'dart:convert';
 import 'dart:io';
 
 import 'package:test/test.dart';
@@ -20,16 +21,29 @@ const String _kVadUrl =
 
 void main() {
   group('模型包总表', () {
-    test('每种语言恰有一个包服务；transducer 包与枚举同序；id 互不相同且冻结', () {
+    test('每种语言恰有一个通用包；transducer 包与枚举同序；id 互不相同且冻结', () {
       // 17 种界面语言一个不少（`FushiLocalisations.localeNames` 的每一项都有
       // 对应的口语模型）。
       expect(AsrLanguage.values, hasLength(17));
       for (final AsrLanguage language in AsrLanguage.values) {
         expect(
-          kAsrModelPacks.where((AsrModelPack p) => p.languages.contains(language)),
+          kAsrModelPacks.where(
+            (AsrModelPack p) =>
+                p.languages.contains(language) && p.servesProfile(null),
+          ),
           hasLength(1),
-          reason: language.tag,
+          reason: '${language.tag}：不带素材的老调用方必须恰好落到一个通用包',
         );
+        for (final AsrAudioProfile profile in AsrAudioProfile.values) {
+          expect(
+            kAsrModelPacks.any(
+              (AsrModelPack p) =>
+                  p.languages.contains(language) && p.servesProfile(profile),
+            ),
+            isTrue,
+            reason: '${language.tag} 在 ${profile.name} 上没有包',
+          );
+        }
       }
       final List<AsrModelPack> transducers = kAsrModelPacks
           .where((AsrModelPack p) => p.architecture == AsrModelArchitecture.transducer)
@@ -45,6 +59,7 @@ void main() {
       // id 是磁盘目录名与任务目录哈希的一部分：改了等于让用户已下载的模型与
       // 进行中的任务全部失联，这里钉死。
       expect(kAsrModelPacks.map((AsrModelPack p) => p.id), <String>[
+        'parakeet-tdt-ctc-0.6b-ja',
         'reazonspeech-k2-v2',
         'zipformer-en-libriheavy-punct-case',
         'x-asr-zipformer-zh-en-punct-2026-06-03',
@@ -59,6 +74,44 @@ void main() {
       expect(kAsrEnglishPack.language, AsrLanguage.english);
     });
 
+    test('按素材选包：日语视频走 Parakeet，有声书与老调用方仍是 ReazonSpeech', () {
+      expect(
+        asrModelPackFor(AsrLanguage.japanese,
+            profile: AsrAudioProfile.mixedAudio),
+        same(kAsrParakeetJapanesePack),
+      );
+      expect(
+        asrModelPackFor(AsrLanguage.japanese,
+            profile: AsrAudioProfile.cleanSpeech),
+        same(kAsrJapanesePack),
+      );
+      // 其它语言没有专用包：两种素材都是同一个通用包。
+      for (final AsrAudioProfile profile in AsrAudioProfile.values) {
+        expect(asrModelPackFor(AsrLanguage.english, profile: profile),
+            same(kAsrEnglishPack));
+      }
+      expect(kAsrParakeetJapanesePack.architecture,
+          AsrModelArchitecture.nemoCtc);
+      expect(kAsrParakeetJapanesePack.servesProfile(null), isFalse);
+    });
+
+    test('audioProfiles JSON 往返；通用包不写这个字段；写空数组报错', () {
+      final Object json = kAsrParakeetJapanesePack.toJson();
+      expect((json as Map<String, Object?>)['audioProfiles'],
+          <String>['mixedAudio']);
+      final AsrModelPack back =
+          AsrModelPack.fromJson(jsonDecode(jsonEncode(json)) as Object);
+      expect(back.audioProfiles, <AsrAudioProfile>[AsrAudioProfile.mixedAudio]);
+      expect(
+        (kAsrJapanesePack.toJson() as Map<String, Object?>)
+            .containsKey('audioProfiles'),
+        isFalse,
+      );
+      final Map<String, Object?> bad =
+          Map<String, Object?>.of(json)..['audioProfiles'] = <String>[];
+      expect(() => AsrModelPack.fromJson(bad), throwsFormatException);
+    });
+
     test('asrModelPackFor 每种语言都能取到自己的包', () {
       expect(asrModelPackFor(AsrLanguage.japanese), same(kAsrJapanesePack));
       expect(asrModelPackFor(AsrLanguage.english), same(kAsrEnglishPack));
@@ -69,13 +122,14 @@ void main() {
       }
     });
 
-    test('模型包契约参数：粤语 ctx=1、中文 int32、Omnilingual blank=<s> + 显存门槛', () {
+    test('模型包契约参数：粤语 ctx=1、中文 int32、Omnilingual blank=<s> + 显存门槛、'
+        'Parakeet nemoCtc + 显存门槛', () {
       expect(kAsrCantonesePack.decoderContextSize, 1);
       expect(kAsrMandarinPack.indexType, AsrIndexType.int32);
       for (final AsrModelPack p in kAsrModelPacks) {
         if (p != kAsrCantonesePack) expect(p.decoderContextSize, 2, reason: p.id);
         if (p != kAsrMandarinPack) expect(p.indexType, AsrIndexType.int64, reason: p.id);
-        if (p != kAsrOmnilingualPack) {
+        if (p != kAsrOmnilingualPack && p != kAsrParakeetJapanesePack) {
           expect(p.architecture, AsrModelArchitecture.transducer, reason: p.id);
           expect(p.blankToken, '<blk>', reason: p.id);
           expect(p.fp32GpuMinBudgetBytes, isNull, reason: p.id);
@@ -85,6 +139,11 @@ void main() {
       expect(kAsrOmnilingualPack.blankToken, '<s>');
       expect(kAsrOmnilingualPack.fp32GpuMinBudgetBytes, 8 * 1024 * 1024 * 1024);
       expect(kAsrOmnilingualPack.languages, hasLength(9));
+      expect(kAsrParakeetJapanesePack.architecture, AsrModelArchitecture.nemoCtc);
+      // sherpa-onnx 导出的 NeMo 词表把 blank 放在末位（3072），名字仍是 <blk>。
+      expect(kAsrParakeetJapanesePack.blankToken, '<blk>');
+      expect(kAsrParakeetJapanesePack.fp32GpuMinBudgetBytes,
+          4 * 1024 * 1024 * 1024);
     });
 
     test('AsrLanguage.fromTag 往返；未知标签返回 null', () {
@@ -114,7 +173,9 @@ void main() {
               AsrModelRole.tokens,
               AsrModelRole.vad,
             },
-            AsrModelArchitecture.ctc => <AsrModelRole>{
+            AsrModelArchitecture.ctc ||
+            AsrModelArchitecture.nemoCtc =>
+              <AsrModelRole>{
               AsrModelRole.ctcModelFp32,
               AsrModelRole.ctcWeightsFp32,
               AsrModelRole.ctcModelInt8,
@@ -163,7 +224,9 @@ void main() {
                 AsrModelRole.tokens,
                 AsrModelRole.vad,
               },
-              AsrModelArchitecture.ctc => <AsrModelRole>{
+              AsrModelArchitecture.ctc ||
+              AsrModelArchitecture.nemoCtc =>
+                <AsrModelRole>{
                 fp32 ? AsrModelRole.ctcModelFp32 : AsrModelRole.ctcModelInt8,
                 if (fp32) AsrModelRole.ctcWeightsFp32,
                 AsrModelRole.tokens,
@@ -178,7 +241,7 @@ void main() {
               switch (pack.architecture) {
                 AsrModelArchitecture.transducer =>
                   fp32 ? AsrModelRole.encoderFp32 : AsrModelRole.encoderInt8,
-                AsrModelArchitecture.ctc =>
+                AsrModelArchitecture.ctc || AsrModelArchitecture.nemoCtc =>
                   fp32 ? AsrModelRole.ctcModelFp32 : AsrModelRole.ctcModelInt8,
               },
             );

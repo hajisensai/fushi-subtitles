@@ -127,6 +127,7 @@ class FfiOnnxSessionFactory implements OnnxSessionFactory {
       create: (List<OnnxExecutionProvider> effective) async => _create(
         bytes,
         effective,
+        modelDir: file.parent.path,
         intraOpNumThreads: intraOpNumThreads,
         freeDimensionOverrides: freeDimensionOverrides,
         coreMlCache: coreMlCache,
@@ -137,6 +138,7 @@ class FfiOnnxSessionFactory implements OnnxSessionFactory {
   OnnxSession _create(
     Uint8List bytes,
     List<OnnxExecutionProvider> providers, {
+    required String modelDir,
     int? intraOpNumThreads,
     Map<String, int>? freeDimensionOverrides,
     String? coreMlCache,
@@ -164,7 +166,15 @@ class FfiOnnxSessionFactory implements OnnxSessionFactory {
           provider: preferred,
           callerThreads: intraOpNumThreads);
       intraOpNumThreads = tuning.threads;
-      for (final entry in tuning.entries.entries) {
+      // 会话是从内存字节建的（见 [createSession]），ORT 不知道模型在哪个目录，
+      // 带外置权重（`model.onnx` + `model.onnx_data` / `model.weights`）的图会在
+      // 初始化时报 `model_path must not be empty`。显式告诉它去模型同级目录找；
+      // 没有外置权重的图不读这一项。ORT ≥ 1.18 认这个键（本包要求 1.22）。
+      final Map<String, String> configEntries = <String, String>{
+        ...tuning.entries,
+        'session.model_external_initializers_file_folder_path': modelDir,
+      };
+      for (final entry in configEntries.entries) {
         using((arena) {
           checkOrtStatus(
               api,

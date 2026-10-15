@@ -9,6 +9,7 @@ import 'dart:developer' as developer;
 import 'dart:io';
 
 import 'package:fushi_asr_core/src/asr/asr_ctc_decoder.dart';
+import 'package:fushi_asr_core/src/asr/asr_nemo_ctc_decoder.dart';
 import 'package:fushi_asr_core/src/asr/asr_encoder_buckets.dart';
 import 'package:fushi_asr_core/src/asr/asr_fp16_graph.dart';
 import 'package:fushi_asr_core/src/asr/asr_greedy_graph.dart';
@@ -216,7 +217,7 @@ class AsrEngineSessions {
     this.indexType = AsrIndexType.int64,
     this.encoderFp16 = false,
   }) : assert(
-         architecture == AsrModelArchitecture.ctc ||
+         asrIsCtcArchitecture(architecture) ||
              (decoder != null && joiner != null),
          'transducer 需要 decoder / joiner 会话',
        );
@@ -257,6 +258,10 @@ class AsrEngineSessions {
       model: encoder,
       tokens: tokens,
       staticSessions: staticEncoders,
+    ),
+    AsrModelArchitecture.nemoCtc => AsrNemoCtcDecoder(
+      model: encoder,
+      tokens: tokens,
     ),
   };
 
@@ -388,7 +393,7 @@ class AsrEngineLoader {
     const List<OnnxExecutionProvider> cpu = <OnnxExecutionProvider>[
       OnnxExecutionProvider.cpu,
     ];
-    if (store.pack.architecture == AsrModelArchitecture.ctc) {
+    if (asrIsCtcArchitecture(store.pack.architecture)) {
       return _loadCtc(
         store: store,
         variant: variant,
@@ -606,7 +611,10 @@ class AsrEngineLoader {
       );
       final OnnxExecutionProvider effective = modelResolution.effective;
       AsrStaticEncoderPool? staticSessions;
+      // 静态桶按 Omnilingual 的维名（N / num_samples）钉形状；NeMo CTC 吃特征、
+      // 维名不同，且滑窗输入本就恒长，不建桶。
       if (useStaticEncoderBuckets &&
+          store.pack.architecture == AsrModelArchitecture.ctc &&
           kAsrStaticBucketProviders.contains(effective)) {
         final int? budget = await _factory.deviceMemoryBudgetBytes();
         final List<AsrEncoderBucket> buckets =
@@ -632,13 +640,13 @@ class AsrEngineLoader {
         }
       }
       developer.log(
-        'ASR CTC engine loaded (${variant.name}'
+        'ASR ${store.pack.architecture.name} engine loaded (${variant.name}'
         '${openedEncoder.fp16 ? ', fp16' : ''}): $modelResolution '
         'staticBuckets=${staticSessions != null}',
         name: kAsrLogName,
       );
       return AsrEngineSessions(
-        architecture: AsrModelArchitecture.ctc,
+        architecture: store.pack.architecture,
         encoderFp16: openedEncoder.fp16,
         encoder: model,
         vad: vad,
