@@ -21,6 +21,7 @@ import 'package:fushi_asr_core/src/asr/asr_engine.dart';
 import 'package:fushi_asr_core/src/asr/asr_model_manifest.dart';
 import 'package:fushi_asr_core/src/asr/asr_model_store.dart';
 import 'package:fushi_asr_core/src/asr/asr_pcm_source.dart';
+import 'package:fushi_asr_core/src/asr/asr_sliding_window.dart';
 import 'package:fushi_asr_core/src/asr/asr_transcribe_isolate.dart';
 import 'package:fushi_asr_core/src/asr/asr_transcribe_job.dart';
 import 'package:fushi_asr_core/src/asr/asr_transducer_decoder.dart';
@@ -30,38 +31,30 @@ import 'package:fushi_asr_core/src/onnx/model_file_downloader.dart';
 import 'package:fushi_asr_core/src/onnx/onnx_inference.dart';
 import 'package:fushi_asr_core/src/util/asr_paths.dart';
 
-/// 素材的声学属性：调用方对**自己的输入**作出的断言。
+/// 按素材与模型架构选切段器——服务的进程内路径与后台 isolate 共用这一处。
 ///
-/// 这里刻意不是「选哪个 VAD 实现」——调用方不知道该选哪个，但它一定知道自己在
-/// 转什么。实现映射只发生在一处（切段器的构造点）。
-///
-/// **没有默认值是有意的。** 能量门限是一个带前提的性能优化，前提是「语音与背景
-/// 在能量上双模态可分」。这个前提以前是隐含的、没人检查的默认值，于是失效时
-/// 静默给出自信的错误答案：2026-09-10 在一集 Re:Zero（内封英文字幕作真值）上
-/// 实测，能量门限把 **89.3% 的片长**（219 段 / 1428.1 s）送进 ASR，其中
-/// **34.6%（493.7 s）落在任何对白之外**，**31 段（14.2%）整段没有一句对白**
-/// ——每一段都是一次幻听机会，而幻听出的 cue 会直接进字幕。让每个调用方显式
-/// 签字，才是这个前提唯一可靠的检查方式。
-enum AsrAudioProfile {
-  /// 干净朗读：语音与静默的能量差 30 dB 以上，构成清晰的双模态分布。
-  /// 有声书、录音棚 TTS、口述录音。
-  ///
-  /// 这是一个**断言**，不是偏好。选错的代价见 [mixedAudio]。
-  cleanSpeech,
-
-  /// 混音素材：动画、影视、任何带持续 BGM 或环境声的音源。
-  ///
-  /// 这类素材上能量门限不是「差一点」，是前提不成立，**调参数救不回来**：
-  /// 上述那一集的失败段实测电平分布 p10 −39.3 / p50 −27.3 / p90 −21.8 dBFS，
-  /// 整段挤在 17.5 dB 的窄带里，根本没有可供门限落脚的空谷；去掉
-  /// [EnergyVadScorer.maxThresholdDb] 的夹紧仍有 158/312 帧判语音，要压到
-  /// Silero 那 6/312 帧得把门限推到 −14.9 dBFS（≈本段峰值），代价是全片正常
-  /// 对白大面积漏掉。
-  ///
-  /// 代价已经付过：`silero_vad.onnx` 是每个语言包的必下文件，会话在引擎装载时
-  /// 无条件打开（跑能量门限时它也开着），零新依赖、零额外下载。
-  mixedAudio,
-}
+/// - 干净朗读：语音与静默双模态可分，纯 Dart 能量门限够用且免掉每窗口一次
+///   ONNX 前向（有声书上实测占整条流水线七成）。
+/// - 混音素材：能量门限的前提不成立；CTC（[AsrModelArchitecture.nemoCtc]）走
+///   滑窗、根本不切 VAD（silero 在 BGM 下大面积漏对白，见
+///   `asr_sliding_window.dart`），其余架构用神经网络 VAD。
+AsrSegmenter buildAsrSegmenter({
+  required AsrAudioProfile profile,
+  required AsrEngineSessions sessions,
+}) =>
+    switch (profile) {
+      AsrAudioProfile.cleanSpeech => AsrVadSegmenter(
+          scorer: EnergyVadScorer(),
+          maxSegmentMs: sessions.maxSegmentMs,
+        ),
+      AsrAudioProfile.mixedAudio =>
+        sessions.architecture == AsrModelArchitecture.nemoCtc
+            ? AsrSlidingWindowSegmenter()
+            : AsrVadSegmenter(
+                session: sessions.vad,
+                maxSegmentMs: sessions.maxSegmentMs,
+              ),
+    };
 
 /// 开跑前的计划：哪个语言包、会用哪个编码器变体、期望落到哪个 EP、模型是否就绪。
 @immutable
@@ -179,7 +172,10 @@ class AsrTranscriptionService {
     required AsrIsolateBackend backend,
     AsrEngineLoader? loader,
     AsrPcmSource? pcm,
-    Future<AsrModelStore> Function(AsrLanguage language)? openStore,
+    Future<AsrModelStore> Function(
+      AsrLanguage language,
+      AsrAudioProfile profile,
+    )? openStore,
     Future<Directory> Function()? jobsRoot,
     this.batchSize,
     this.chunkSeconds = 300,
@@ -193,7 +189,9 @@ class AsrTranscriptionService {
   })  : _backend = backend,
         _injectedLoader = loader,
         _pcm = pcm ?? FfmpegAsrPcmSource(),
-        _openStore = openStore ?? AsrModelStore.open,
+        _openStore = openStore ??
+            ((AsrLanguage language, AsrAudioProfile profile) =>
+                AsrModelStore.open(language, profile: profile)),
         _jobsRoot = jobsRoot ?? _defaultJobsRoot;
 
   final AsrIsolateBackend _backend;
@@ -212,7 +210,12 @@ class AsrTranscriptionService {
       _injectedLoader ??
       (_lazyLoader ??= AsrEngineLoader(factory: _backend.buildFactory()));
   final AsrPcmSource _pcm;
-  final Future<AsrModelStore> Function(AsrLanguage language) _openStore;
+  /// 按语言 **与素材** 打开模型目录：同一语言在视频与有声书上可以是两个包
+  /// （`AsrModelPack.audioProfiles`），宿主注入的实现必须按素材选包。
+  final Future<AsrModelStore> Function(
+    AsrLanguage language,
+    AsrAudioProfile profile,
+  ) _openStore;
   final Future<Directory> Function() _jobsRoot;
 
   /// 一次 encoder 前向的段数（动态 shape 路径）；null 时按编码器实际落到的 EP 取
@@ -257,7 +260,7 @@ class AsrTranscriptionService {
   }
 
   Future<AsrModelStore> modelStore(AsrLanguage language) =>
-      _openStore(language);
+      _openStore(language, audioProfile);
 
   /// 计算计划：探测 EP → 推荐变体 → 查该语言包的模型状态。
   Future<AsrTranscribePlan> plan({
@@ -282,7 +285,7 @@ class AsrTranscriptionService {
       }
     }
     final AsrPlatform platform = currentAsrPlatform();
-    final AsrModelPack pack = asrModelPackFor(language);
+    final AsrModelPack pack = asrModelPackFor(language, profile: audioProfile);
     // 有显存门槛的包（Omnilingual 1B）才去查预算；查失败按未知处理 → int8。
     int? budgetBytes;
     if (pack.fp32GpuMinBudgetBytes != null && available.isNotEmpty) {
@@ -309,7 +312,7 @@ class AsrTranscriptionService {
       preference: preference,
       variant: variant,
     ).first;
-    final AsrModelStore store = await _openStore(language);
+    final AsrModelStore store = await _openStore(language, audioProfile);
     return AsrTranscribePlan(
       language: language,
       variant: variant,
@@ -325,7 +328,7 @@ class AsrTranscriptionService {
     required AsrLanguage language,
     required AsrEncoderVariant variant,
   }) async* {
-    final AsrModelStore store = await _openStore(language);
+    final AsrModelStore store = await _openStore(language, audioProfile);
     yield* store.download(variant);
   }
 
@@ -335,12 +338,21 @@ class AsrTranscriptionService {
     AsrLanguage language,
   ) async {
     final Directory root = await _jobsRoot();
-    final String id = jobIdFor(audioPaths, language);
+    final String id = jobIdFor(audioPaths, language, profile: audioProfile);
     return Directory(p.join(root.path, id));
   }
 
-  /// 纯函数：由文件名、字节数与模型包 id 派生稳定 id（文件不存在按 0 字节计）。
-  static String jobIdFor(List<String> audioPaths, AsrLanguage language) {
+  /// 纯函数：由文件名、字节数、模型包 id 与素材派生稳定 id（文件不存在按 0 字节计）。
+  ///
+  /// 素材进哈希：同一个文件按有声书转过、再按视频转，切段方式不同，结果不能
+  /// 共用缓存（2026-10-15 实测 CLI 换 `--clean-speech` 后原样拿回上一次的 SRT）。
+  /// 只在 [AsrAudioProfile.mixedAudio] 时写这一行——[AsrAudioProfile.cleanSpeech]
+  /// 是 app 一直在用的那种，哈希保持原样，进行中的有声书任务不会失联。
+  static String jobIdFor(
+    List<String> audioPaths,
+    AsrLanguage language, {
+    AsrAudioProfile? profile,
+  }) {
     final StringBuffer sb = StringBuffer();
     for (final String path in audioPaths) {
       final File f = File(path);
@@ -353,8 +365,11 @@ class AsrTranscriptionService {
     }
     sb
       ..write('model=')
-      ..write(asrModelPackFor(language).id)
+      ..write(asrModelPackFor(language, profile: profile).id)
       ..write('\n');
+    if (profile == AsrAudioProfile.mixedAudio) {
+      sb.write('profile=mixedAudio\n');
+    }
     return sha1.convert(utf8.encode(sb.toString())).toString();
   }
 
@@ -369,7 +384,7 @@ class AsrTranscriptionService {
         await AsrTranscribeJob.loadStateDetailed(
       dir,
       audioPaths,
-      modelId: asrModelPackFor(language).id,
+      modelId: asrModelPackFor(language, profile: audioProfile).id,
     );
     return loaded.fresh ? null : loaded.state;
   }
@@ -462,7 +477,7 @@ class AsrTranscriptionService {
     required AsrEncoderVariant variant,
     required AsrAccelerationPreference preference,
   }) async {
-    final AsrModelStore store = await _openStore(language);
+    final AsrModelStore store = await _openStore(language, audioProfile);
     final Directory jobDir = await jobDirFor(audioPaths, language);
     // 素材总时长（探测失败的文件按未知处理）：决定装载时预热几个静态桶。
     final int? materialMs = await _probeMaterialMs(audioPaths);
@@ -503,25 +518,15 @@ class AsrTranscriptionService {
     );
     try {
       final AsrSegmentDecoder decoder = sessions.newDecoder()..warmUp();
-      final int maxSegmentMs = sessions.maxSegmentMs;
       final AsrTranscribeJob job = AsrTranscribeJob(
         jobDir: jobDir,
         audioPaths: audioPaths,
         modelId: store.pack.id,
         pcm: _pcm,
-        segmenter: switch (audioProfile) {
-          // 干净朗读：语音与静默双模态可分，纯 Dart 能量门限够用且免掉每窗口
-          // 一次 ONNX 前向（有声书上实测占整条流水线七成）。
-          AsrAudioProfile.cleanSpeech => AsrVadSegmenter(
-              scorer: EnergyVadScorer(),
-              maxSegmentMs: maxSegmentMs,
-            ),
-          // 混音素材：能量门限的前提不成立，只能用神经网络 VAD。
-          AsrAudioProfile.mixedAudio => AsrVadSegmenter(
-              session: sessions.vad,
-              maxSegmentMs: maxSegmentMs,
-            ),
-        },
+        segmenter: buildAsrSegmenter(
+          profile: audioProfile,
+          sessions: sessions,
+        ),
         decoder: decoder,
         batchSize: batchSize ??
             defaultBatchSizeFor(sessions.encoderResolution.effective),

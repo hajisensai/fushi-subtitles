@@ -67,8 +67,11 @@ class AsrModelStore {
   /// 模型目录：`<appSupport>/asr_models/<pack.id>`（日语 `reazonspeech-k2-v2`）——
   /// 与漫画 OCR 的 `<appSupport>/ocr_models/manga` 同级同构，经 [asrSupportRootDirectory] 数据根
   /// 单一入口，不硬编码平台路径。一语言一目录：删包即清空，互不牵连。
-  static Future<AsrModelStore> open(AsrLanguage language) async {
-    return openPack(asrModelPackFor(language));
+  static Future<AsrModelStore> open(
+    AsrLanguage language, {
+    AsrAudioProfile? profile,
+  }) async {
+    return openPack(asrModelPackFor(language, profile: profile));
   }
 
   /// Open a shared model by identity, including the second-pass aligner.

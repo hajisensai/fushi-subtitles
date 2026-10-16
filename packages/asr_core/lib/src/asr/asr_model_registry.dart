@@ -54,9 +54,17 @@ class AsrModelRegistry {
   ///
   /// 多个包声明同一语言时取**最先**的——[mergedWith] 把用户包排在内置包前面，
   /// 所以「用户为 ja 提供自己的包」这件事自然成立，不需要额外的优先级字段。
-  AsrModelPack? packForLanguage(AsrLanguage language) {
+  ///
+  /// [profile]：要转的素材。只在声明适用该素材的包里选（[AsrModelPack.servesProfile]）；
+  /// null 只看通用包。专用包排在通用包前面就是「这种素材优先用它」。
+  AsrModelPack? packForLanguage(
+    AsrLanguage language, {
+    AsrAudioProfile? profile,
+  }) {
     for (final AsrModelPack pack in packs) {
-      if (pack.languages.contains(language)) return pack;
+      if (pack.languages.contains(language) && pack.servesProfile(profile)) {
+        return pack;
+      }
     }
     return null;
   }

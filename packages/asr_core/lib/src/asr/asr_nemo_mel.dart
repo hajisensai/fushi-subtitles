@@ -4,14 +4,21 @@
 /// 1. 预加重 0.97（首样本前视为 0），整段之外补零；
 /// 2. 居中 STFT：左右各补 `n_fft/2`，n_fft 512、Hann 400（`np.hanning`，居中
 ///    零填到 512）、hop 160（10 ms）；
-/// 3. 功率谱 × slaney mel 滤波器组（`[257, n_mels]`，随模型包下发的 npy，不在
-///    代码里重算，保证与导出端逐值一致）；
+/// 3. 功率谱 × slaney mel 滤波器组（`[257, n_mels]`）。两个来源：随模型包下发的
+///    npy（[AsrNemoMel.fromNpy]，Kitsune，保证与导出端逐值一致），或代码里按
+///    librosa `filters.mel(norm="slaney")` 现算的 80 维（[AsrNemoMel.slaney80]，
+///    Parakeet——包里不带滤波器组）；
 /// 4. `log(x + 2^-24)`；
 /// 5. 每个 mel 维在**有效帧**上做均值 / 标准差（ddof = 1）归一化，`std + 1e-5`；
 ///    有效帧之外置零。
 ///
 /// 输出布局 `[B, n_mels, T]`（行主序），`T = maxLen / 160 + 1`，有效帧数
-/// `len / 160`——与导出图的 `features` / `lengths` 输入一致。
+/// `len / 160`——与导出图的 `features` / `lengths`（Parakeet 叫 `audio_signal`
+/// / `length`）输入一致。
+///
+/// 2026-10-15 两边各自对拍过：SubThx `mel.rs` 的 numpy 移植（合成滤波器组），与
+/// transformers `ParakeetFeatureExtractor`（slaney80，20 段真实动画对白最大绝对差
+/// 5.6e-5）。
 library;
 
 import 'dart:convert';
@@ -19,8 +26,9 @@ import 'dart:isolate';
 import 'dart:math' as math;
 import 'dart:typed_data';
 
-import 'package:fushi_asr_core/src/asr/asr_fbank.dart' show AsrRealFft;
 import 'package:fushi_asr_core/src/asr/asr_fbank_workers.dart';
+import 'package:fushi_asr_core/src/asr/asr_real_fft.dart';
+import 'package:fushi_asr_core/src/asr/asr_types.dart' show kAsrSampleRate;
 
 /// NeMo log-mel 的固定帧参数。
 abstract final class AsrNemoMelParams {
@@ -51,9 +59,9 @@ class AsrNemoMelBatch {
 
 class AsrNemoMel {
   AsrNemoMel(this.filterbank, this.nMels)
-    : assert(filterbank.length == (AsrNemoMelParams.nFft ~/ 2 + 1) * nMels),
-      _lo = Int32List(nMels),
-      _hi = Int32List(nMels) {
+      : assert(filterbank.length == (AsrNemoMelParams.nFft ~/ 2 + 1) * nMels),
+        _lo = Int32List(nMels),
+        _hi = Int32List(nMels) {
     // 三角滤波器只在少数 bin 上非零：记下每个 mel 维的非零区间，乘法按区间
     // 走（稠密 257×80 每帧两万次乘加，10 h 音频单线程要一分多钟）。
     const int bins = AsrNemoMelParams.nFft ~/ 2 + 1;
@@ -81,6 +89,19 @@ class AsrNemoMel {
     return AsrNemoMel(npy.data, npy.shape[1]);
   }
 
+  /// 代码里现算的 80 维 slaney 滤波器组（librosa `filters.mel(sr=16000,
+  /// n_fft=512, n_mels=80, fmin=0, fmax=8000, htk=False, norm="slaney")`）：
+  /// 模型包不随包下发滤波器组时用它（Parakeet）。
+  static final AsrNemoMel slaney80 = AsrNemoMel(_buildSlaneyFilterbank(80), 80);
+
+  /// 居中 STFT 的总帧数：`1 + L / hop`（批内补齐后的 `T` 也按它算）。
+  static int frameCount(int numSamples) =>
+      numSamples <= 0 ? 0 : 1 + numSamples ~/ AsrNemoMelParams.hop;
+
+  /// 参与归一化、喂给 `lengths` 的有效帧数：`L / hop`。
+  static int validFrameCount(int numSamples) =>
+      numSamples <= 0 ? 0 : numSamples ~/ AsrNemoMelParams.hop;
+
   /// `[257 × nMels]`，行 = FFT bin。
   final Float32List filterbank;
   final int nMels;
@@ -88,6 +109,56 @@ class AsrNemoMel {
   final Int32List _hi;
 
   static final Float64List _window = _buildWindow();
+
+  static double _hzToMel(double f) {
+    const double fSp = 200.0 / 3;
+    const double minLogHz = 1000.0;
+    const double minLogMel = minLogHz / fSp;
+    final double logStep = math.log(6.4) / 27.0;
+    return f >= minLogHz
+        ? minLogMel + math.log(f / minLogHz) / logStep
+        : f / fSp;
+  }
+
+  static double _melToHz(double m) {
+    const double fSp = 200.0 / 3;
+    const double minLogHz = 1000.0;
+    const double minLogMel = minLogHz / fSp;
+    final double logStep = math.log(6.4) / 27.0;
+    return m >= minLogMel
+        ? minLogHz * math.exp(logStep * (m - minLogMel))
+        : fSp * m;
+  }
+
+  /// Slaney 三角滤波 × `2/(f[i+2]−f[i])`，0–8000 Hz，布局同 npy：`[257, nMels]`。
+  static Float32List _buildSlaneyFilterbank(int nMels) {
+    const int bins = AsrNemoMelParams.nFft ~/ 2 + 1;
+    const double fMax = kAsrSampleRate / 2;
+    final Float64List fftFreqs = Float64List(bins);
+    for (int k = 0; k < bins; k++) {
+      fftFreqs[k] = fMax * k / (bins - 1);
+    }
+    final double melMin = _hzToMel(0);
+    final double melMax = _hzToMel(fMax);
+    final Float64List hz = Float64List(nMels + 2);
+    for (int i = 0; i < nMels + 2; i++) {
+      hz[i] = _melToHz(melMin + (melMax - melMin) * i / (nMels + 1));
+    }
+    final Float32List out = Float32List(bins * nMels);
+    for (int m = 0; m < nMels; m++) {
+      final double lo = hz[m];
+      final double mid = hz[m + 1];
+      final double hi = hz[m + 2];
+      final double enorm = 2.0 / (hi - lo);
+      for (int k = 0; k < bins; k++) {
+        final double f = fftFreqs[k];
+        final double lower = (f - lo) / (mid - lo);
+        final double upper = (hi - f) / (hi - mid);
+        out[k * nMels + m] = math.max(0.0, math.min(lower, upper)) * enorm;
+      }
+    }
+    return out;
+  }
 
   static Float64List _buildWindow() {
     const int n = AsrNemoMelParams.nFft;
@@ -103,11 +174,11 @@ class AsrNemoMel {
   /// 一批段 → 特征。[padTo]：把批内最长段向上取整到它的倍数（样本），减少
   /// 不同的编码器输入形状（GPU EP 每个新形状要编译一次）；1 = 精确长度。
   AsrNemoMelBatch batch(List<Float32List> wavs, {int padTo = 1}) => assemble(
-    <Float32List>[for (final Float32List w in wavs) compute(w)],
-    <int>[for (final Float32List w in wavs) w.length],
-    nMels,
-    padTo: padTo,
-  );
+        <Float32List>[for (final Float32List w in wavs) compute(w)],
+        <int>[for (final Float32List w in wavs) w.length],
+        nMels,
+        padTo: padTo,
+      );
 
   /// 把逐段 [compute] 的结果拼成 `[B, nMels, T]`，有效帧之外补零。
   /// [sampleCounts]：各段原始样本数（决定 `T`）。
@@ -220,7 +291,7 @@ class AsrNemoMel {
 /// [TransferableTypedData] 搬运，结果与逐段 [AsrNemoMel.compute] 逐元素相同。
 class AsrNemoMelWorkers {
   AsrNemoMelWorkers(this.mel, {int? workers})
-    : workers = workers ?? defaultAsrFbankWorkerCount();
+      : workers = workers ?? defaultAsrFbankWorkerCount();
 
   final AsrNemoMel mel;
   final int workers;
@@ -258,9 +329,8 @@ class AsrNemoMelWorkers {
     List<Float32List> samples,
     AsrNemoMel mel,
   ) async {
-    final List<int> lengths = samples
-        .map((Float32List s) => s.length)
-        .toList(growable: false);
+    final List<int> lengths =
+        samples.map((Float32List s) => s.length).toList(growable: false);
     final TransferableTypedData packed = TransferableTypedData.fromList(
       samples,
     );

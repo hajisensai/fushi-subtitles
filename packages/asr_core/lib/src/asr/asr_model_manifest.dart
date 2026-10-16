@@ -67,6 +67,39 @@ import 'package:meta/meta.dart';
 import 'package:fushi_asr_core/src/asr/asr_model_registry.dart';
 import 'package:fushi_asr_core/src/onnx/model_file_downloader.dart';
 
+/// 素材的声学属性：调用方对**自己的输入**作出的断言。
+///
+/// 这里刻意不是「选哪个 VAD 实现」——调用方不知道该选哪个，但它一定知道自己在
+/// 转什么。实现映射只发生在一处（切段器的构造点）。
+///
+/// **没有默认值是有意的。** 能量门限是一个带前提的性能优化，前提是「语音与背景
+/// 在能量上双模态可分」。这个前提以前是隐含的、没人检查的默认值，于是失效时
+/// 静默给出自信的错误答案：2026-09-10 在一集 Re:Zero（内封英文字幕作真值）上
+/// 实测，能量门限把 **89.3% 的片长**（219 段 / 1428.1 s）送进 ASR，其中
+/// **34.6%（493.7 s）落在任何对白之外**，**31 段（14.2%）整段没有一句对白**
+/// ——每一段都是一次幻听机会，而幻听出的 cue 会直接进字幕。让每个调用方显式
+/// 签字，才是这个前提唯一可靠的检查方式。
+enum AsrAudioProfile {
+  /// 干净朗读：语音与静默的能量差 30 dB 以上，构成清晰的双模态分布。
+  /// 有声书、录音棚 TTS、口述录音。
+  ///
+  /// 这是一个**断言**，不是偏好。选错的代价见 [mixedAudio]。
+  cleanSpeech,
+
+  /// 混音素材：动画、影视、任何带持续 BGM 或环境声的音源。
+  ///
+  /// 这类素材上能量门限不是「差一点」，是前提不成立，**调参数救不回来**：
+  /// 上述那一集的失败段实测电平分布 p10 −39.3 / p50 −27.3 / p90 −21.8 dBFS，
+  /// 整段挤在 17.5 dB 的窄带里，根本没有可供门限落脚的空谷；去掉
+  /// [EnergyVadScorer.maxThresholdDb] 的夹紧仍有 158/312 帧判语音，要压到
+  /// Silero 那 6/312 帧得把门限推到 −14.9 dBFS（≈本段峰值），代价是全片正常
+  /// 对白大面积漏掉。
+  ///
+  /// 代价已经付过：`silero_vad.onnx` 是每个语言包的必下文件，会话在引擎装载时
+  /// 无条件打开（跑能量门限时它也开着），零新依赖、零额外下载。
+  mixedAudio,
+}
+
 /// 转录语言。持久化用 [AsrLanguage.tag]（BCP-47 主子标签；粤语用 ISO 639-3
 /// `yue` 与普通话 `zh` 区分——它们是两种口语，不是两种书写），不要存枚举下标。
 ///
@@ -178,7 +211,15 @@ enum AsrIndexType { int64, int32 }
 /// - [ctc]：单个编码器直接吐 `logits[N, T, V]`，逐帧 argmax 折叠
 ///   （`asr_ctc_decoder.dart`）。Omnilingual 吃**原始波形** `x[N, num_samples]`，
 ///   没有 fbank。
-enum AsrModelArchitecture { transducer, ctc }
+/// - [nemoCtc]：NeMo FastConformer CTC（Parakeet），吃 NeMo log-mel
+///   `audio_signal[N, 80, T]` + `length[N]`，80 ms/帧（`asr_nemo_ctc_decoder.dart`）。
+///   文件角色与 [ctc] 相同（`ctc*` + tokens + vad），不用 VAD：混音素材上
+///   走滑窗切段（`asr_sliding_window.dart`），见 [AsrModelPack.audioProfiles]。
+enum AsrModelArchitecture { transducer, ctc, nemoCtc }
+
+/// 两种 CTC 架构共用文件角色与「必须显式写 blankToken」的规则。
+bool asrIsCtcArchitecture(AsrModelArchitecture a) =>
+    a == AsrModelArchitecture.ctc || a == AsrModelArchitecture.nemoCtc;
 
 /// CTC 包的输入前端：
 /// - [waveform]：原始波形 `x[N, num_samples]`（逐段归一化），输出 `logits`
@@ -269,9 +310,24 @@ class AsrModelPack {
     this.indexType = AsrIndexType.int64,
     this.blankToken = '<blk>',
     this.fp32GpuMinBudgetBytes,
+    this.audioProfiles = AsrAudioProfile.values,
     this.ctcFrontend = AsrCtcFrontend.waveform,
     this.license,
   });
+
+  /// 本包适用于哪些素材（[AsrAudioProfile]）。默认全部——这是「通用包」。
+  ///
+  /// 只列一部分的是**专用包**：按语言 + 素材选包时（[AsrModelRegistry.packForLanguage]）
+  /// 它只在列出的素材上参选，且不带素材类型的老调用方看不见它。Parakeet 日语
+  /// 只声明 [AsrAudioProfile.mixedAudio]：它在动画上的读音 CER 是 ReazonSpeech 的
+  /// 一半多一点，但没在有声书上验证过（token 时间 80 ms 一档，比 zipformer 粗一倍，
+  /// EPUB 对齐依赖它），有声书照旧落到 ReazonSpeech。
+  final List<AsrAudioProfile> audioProfiles;
+
+  /// 是否在 [profile] 素材上参选；[profile] 为 null（老调用方）时只认通用包。
+  bool servesProfile(AsrAudioProfile? profile) => profile == null
+      ? audioProfiles.length == AsrAudioProfile.values.length
+      : audioProfiles.contains(profile);
 
   /// CTC 包的输入前端（transducer 包忽略）。
   final AsrCtcFrontend ctcFrontend;
@@ -332,8 +388,9 @@ class AsrModelPack {
         fileForRole(AsrModelRole.tokens),
         fileForRole(AsrModelRole.vad),
       ],
-      // ctc：模型（fp32 可能带外置权重）+ tokens / vad。
-      AsrModelArchitecture.ctc => <AsrModelFile>[
+      // ctc / nemoCtc：模型（fp32 可能带外置权重）+ tokens / vad。
+      AsrModelArchitecture.ctc || AsrModelArchitecture.nemoCtc =>
+        <AsrModelFile>[
         fileForRole(asrCtcModelRole(variant)),
         if (variant == AsrEncoderVariant.fp32)
           for (final AsrModelFile f in files)
@@ -363,6 +420,10 @@ class AsrModelPack {
         'blankToken': blankToken,
         if (fp32GpuMinBudgetBytes != null)
           'fp32GpuMinBudgetBytes': fp32GpuMinBudgetBytes,
+        if (audioProfiles.length != AsrAudioProfile.values.length)
+          'audioProfiles': <String>[
+            for (final AsrAudioProfile p in audioProfiles) p.name,
+          ],
         if (ctcFrontend != AsrCtcFrontend.waveform)
           'ctcFrontend': ctcFrontend.name,
         if (license != null) 'license': license,
@@ -392,8 +453,7 @@ class AsrModelPack {
           ? _asEnum(m, 'architecture', AsrModelArchitecture.values,
               (AsrModelArchitecture v) => v.name)
           : AsrModelArchitecture.transducer;
-      if (architecture == AsrModelArchitecture.ctc &&
-          !m.containsKey('blankToken')) {
+      if (asrIsCtcArchitecture(architecture) && !m.containsKey('blankToken')) {
         throw const FormatException(
           'CTC 包必须显式写 blankToken（没有共识默认值，猜错整篇乱码）',
         );
@@ -420,6 +480,7 @@ class AsrModelPack {
         fp32GpuMinBudgetBytes: m['fp32GpuMinBudgetBytes'] == null
             ? null
             : _asInt(m, 'fp32GpuMinBudgetBytes'),
+        audioProfiles: _audioProfilesFromJson(m),
         ctcFrontend: m.containsKey('ctcFrontend')
             ? _asEnum(m, 'ctcFrontend', AsrCtcFrontend.values,
                 (AsrCtcFrontend v) => v.name)
@@ -475,6 +536,20 @@ List<String> _asStringList(Map<String, Object?> m, String key) {
   return <String>[
     for (final Object? e in v)
       if (e is String) e else throw FormatException('$key 的元素必须是字符串'),
+  ];
+}
+
+/// 缺省 = 通用包（全部素材）；写了就必须非空、且每项都认得。
+List<AsrAudioProfile> _audioProfilesFromJson(Map<String, Object?> m) {
+  if (!m.containsKey('audioProfiles')) return AsrAudioProfile.values;
+  final List<String> names = _asStringList(m, 'audioProfiles');
+  if (names.isEmpty) {
+    throw const FormatException('audioProfiles 写了就不能为空（缺省 = 全部素材）');
+  }
+  return <AsrAudioProfile>[
+    for (final String name in names)
+      _asEnum(<String, Object?>{'audioProfiles': name}, 'audioProfiles',
+          AsrAudioProfile.values, (AsrAudioProfile v) => v.name),
   ];
 }
 
@@ -1054,6 +1129,65 @@ const AsrModelPack kAsrOmnilingualPack = AsrModelPack(
   ],
 );
 
+// ── 日语混音素材：NVIDIA Parakeet TDT-CTC 0.6B ja（CTC 分支）───────────────
+//
+// 2026-10-15 在 8 集动画（人工日文字幕作真值）上的读音 CER：本包 + 滑窗 13.6%，
+// ReazonSpeech k2-v2 + 能量门限（原视频路径）20.7%、+ silero 24.1%。
+// fp32 来自 onnx-asr（OpenVoiceOS），int8 来自 sherpa-onnx：两家 IO 一致，但
+// OpenVoiceOS 的 int8 把卷积量化成 int8 权重的 ConvInteger，ONNX Runtime CPU 只有
+// uint8 内核，会话直接建不起来（2026-10-15 实测）；sherpa-onnx 的 int8 是 uint8。
+// 两份都是 CC BY 4.0。URL 钉 revision：expectedBytes 是精确值，上游换文件不能
+// 静默换掉。
+
+const String _kParakeetJaRepo =
+    'OpenVoiceOS/nvidia-parakeet-tdt_ctc-0.6b-ja-onnx';
+const String _kParakeetJaBase =
+    '$_kHf$_kParakeetJaRepo/resolve/4353e7b9e2e9ebdd35e85b8140c7351d03c2219c/';
+const String _kParakeetJaSherpaBase =
+    '${_kHf}csukuangfj/'
+    'sherpa-onnx-nemo-parakeet-tdt_ctc-0.6b-ja-35000-int8/'
+    'resolve/bef18eb066808c90bd0f5df5be685767b0732de8/';
+
+const AsrModelPack kAsrParakeetJapanesePack = AsrModelPack(
+  languages: <AsrLanguage>[AsrLanguage.japanese],
+  id: 'parakeet-tdt-ctc-0.6b-ja',
+  displayName: 'NVIDIA Parakeet TDT-CTC 0.6B ja',
+  sourceUrl: 'https://huggingface.co/nvidia/parakeet-tdt_ctc-0.6b-ja',
+  architecture: AsrModelArchitecture.nemoCtc,
+  blankToken: '<blk>',
+  audioProfiles: <AsrAudioProfile>[AsrAudioProfile.mixedAudio],
+  // fp32 权重 2.5 GB + 15 s 窗口一批的激活。
+  fp32GpuMinBudgetBytes: 4 * 1024 * 1024 * 1024,
+  files: <AsrModelFile>[
+    AsrModelFile(
+      fileName: 'model.onnx',
+      url: '${_kParakeetJaBase}model.onnx',
+      expectedBytes: 953841,
+      role: AsrModelRole.ctcModelFp32,
+    ),
+    AsrModelFile(
+      // 名字由 model.onnx 里的外置数据引用决定，不能改。
+      fileName: 'model.onnx_data',
+      url: '${_kParakeetJaBase}model.onnx_data',
+      expectedBytes: 2484355076,
+      role: AsrModelRole.ctcWeightsFp32,
+    ),
+    AsrModelFile(
+      fileName: 'model.int8.onnx',
+      url: '${_kParakeetJaSherpaBase}model.int8.onnx',
+      expectedBytes: 655542604,
+      role: AsrModelRole.ctcModelInt8,
+    ),
+    AsrModelFile(
+      fileName: 'vocab.txt',
+      url: '${_kParakeetJaBase}vocab.txt',
+      expectedBytes: 28557,
+      role: AsrModelRole.tokens,
+    ),
+    kAsrVadFile,
+  ],
+);
+
 // ── 日语可选：Kitsune 0.1B（FastConformer CTC，SubThx 导出） ───────────────
 //
 // `subthx/kitsune-onnx` 的 ONNX 导出：NeMo 80 维 log-mel 输入，图内 argmax，
@@ -1109,9 +1243,13 @@ const List<AsrModelPack> kAsrOptionalModelPacks = <AsrModelPack>[
   kAsrKitsunePack,
 ];
 
-/// 全部模型包。transducer 包与 [AsrLanguage.values] 前 8 项同序，Omnilingual 包
-/// 兜住其余 9 种。
+/// 全部模型包。按语言 + 素材取「第一个」（[AsrModelRegistry.packForLanguage]），
+/// 所以**专用包排在同语言通用包之前**：Parakeet 日语只在混音素材上参选，排在
+/// ReazonSpeech 前面才能在视频上胜出，有声书则跳过它落到 ReazonSpeech。
+/// 通用的 transducer 包与 [AsrLanguage.values] 前 8 项同序，Omnilingual 包兜住
+/// 其余 9 种。
 const List<AsrModelPack> kAsrModelPacks = <AsrModelPack>[
+  kAsrParakeetJapanesePack,
   kAsrJapanesePack,
   kAsrEnglishPack,
   kAsrMandarinPack,
@@ -1126,10 +1264,14 @@ const List<AsrModelPack> kAsrModelPacks = <AsrModelPack>[
 /// 某语言的模型包。
 ///
 /// 查的是**当前注册表**（[asrModelRegistry]）而不是内置常量表——自带模型包就是
-/// 从这里进来的。没装用户清单时结果与内置表逐字相同（每种内置 [AsrLanguage] 恰
-/// 有一个包服务它，见清单测试）。
-AsrModelPack asrModelPackFor(AsrLanguage language) {
-  final AsrModelPack? pack = asrModelRegistry.packForLanguage(language);
+/// 从这里进来的。没装用户清单时结果与内置表逐字相同（每种内置 [AsrLanguage] 在
+/// 每种素材上恰有一个首选包，见清单测试）。
+///
+/// [profile]：要转的素材。传了就会让给只适用该素材的专用包（Parakeet 日语之于
+/// 视频）；不传只在通用包里选——老调用方的结果逐字不变。
+AsrModelPack asrModelPackFor(AsrLanguage language, {AsrAudioProfile? profile}) {
+  final AsrModelPack? pack =
+      asrModelRegistry.packForLanguage(language, profile: profile);
   if (pack == null) {
     throw StateError(
       '当前模型注册表里没有服务 ${language.tag} 的包；'

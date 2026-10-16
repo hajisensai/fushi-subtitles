@@ -26,6 +26,9 @@ Future<void> main(List<String> args) async {
       final outcome = await runner.run(
           audioPaths: [path],
           language: AsrLanguage.japanese,
+          // ReazonSpeech 基准：干净朗读（有声书 / 测试集）。混音素材上日语会
+          // 选 Parakeet，就不是这个脚本要测的模型了。
+          audioProfile: AsrAudioProfile.cleanSpeech,
           format: SubtitleFormat.json);
       watch.stop();
       if (coreml &&
