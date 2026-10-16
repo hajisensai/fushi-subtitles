@@ -15,7 +15,7 @@
 /// ```
 library;
 
-import 'dart:convert' show utf8;
+import 'dart:convert' show jsonDecode, utf8;
 
 import 'dart:typed_data';
 import 'package:meta/meta.dart';
@@ -61,6 +61,13 @@ abstract final class AsrModelIo {
   /// CTC（Omnilingual）：`x[N, num_samples]` f32 → `logits[N, num_frames, V]`。
   static const String ctcInputX = 'x';
   static const String ctcOutputLogits = 'logits';
+
+  /// CTC（NeMo mel 前端，Kitsune）：`features[N, 80, T]` f32 + `lengths[N]`
+  /// int64 → `ids[N, T/8]` int64（图内 argmax）+ `out_lengths[N]` int64。
+  static const String ctcInputFeatures = 'features';
+  static const String ctcInputLengths = 'lengths';
+  static const String ctcOutputIds = 'ids';
+  static const String ctcOutputLengths = 'out_lengths';
 }
 
 /// 词表（`tokens.txt`）。
@@ -96,7 +103,52 @@ class AsrTokenTable {
   /// [blankToken]：blank 的记号名（sherpa-onnx 导出 `<blk>`；Omnilingual 是
   /// `<s>`，见 `AsrModelPack.blankToken`）。eos 认 `<sos/eos>` 或 `</s>`，
   /// `<pad>`（fairseq2 词表）也算特殊符号。
+  ///
+  /// 也认 HF `tokenizer.json`（Kitsune 等 NeMo 导出；内容以 `{` 开头即判定）：
+  /// `model.vocab`（`{token: id}` 或 `[[token, score], …]`）+ `added_tokens`。
   factory AsrTokenTable.parse(String text, {String blankToken = '<blk>'}) {
+    final Map<int, String> byId = text.trimLeft().startsWith('{')
+        ? _parseHfTokenizer(text)
+        : _parseTokensTxt(text);
+    return AsrTokenTable._fromIds(byId, blankToken);
+  }
+
+  static Map<int, String> _parseHfTokenizer(String text) {
+    final Object? root = jsonDecode(text);
+    if (root is! Map<String, Object?>) {
+      throw const FormatException('tokenizer.json 顶层不是对象');
+    }
+    final Map<int, String> byId = <int, String>{};
+    final Object? model = root['model'];
+    final Object? vocab = model is Map<String, Object?> ? model['vocab'] : null;
+    if (vocab is Map<String, Object?>) {
+      vocab.forEach((String token, Object? id) {
+        if (id is int) byId[id] = token;
+      });
+    } else if (vocab is List) {
+      for (int i = 0; i < vocab.length; i++) {
+        final Object? entry = vocab[i];
+        if (entry is List && entry.isNotEmpty && entry.first is String) {
+          byId[i] = entry.first as String;
+        }
+      }
+    } else {
+      throw const FormatException('tokenizer.json 缺少 model.vocab');
+    }
+    final Object? added = root['added_tokens'];
+    if (added is List) {
+      for (final Object? t in added) {
+        if (t is Map<String, Object?> &&
+            t['id'] is int &&
+            t['content'] is String) {
+          byId[t['id']! as int] = t['content']! as String;
+        }
+      }
+    }
+    return byId;
+  }
+
+  static Map<int, String> _parseTokensTxt(String text) {
     final Map<int, String> byId = <int, String>{};
     for (final String raw in text.split('\n')) {
       final String line =
@@ -109,6 +161,10 @@ class AsrTokenTable {
       if (id == null) continue;
       byId[id] = line.substring(0, sep);
     }
+    return byId;
+  }
+
+  factory AsrTokenTable._fromIds(Map<int, String> byId, String blankToken) {
     int maxId = -1;
     for (final int id in byId.keys) {
       if (id > maxId) maxId = id;

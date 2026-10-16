@@ -31,6 +31,8 @@ library;
 import 'dart:math' as math;
 import 'dart:typed_data';
 
+import 'package:meta/meta.dart';
+
 import 'package:fushi_asr_core/src/asr/asr_types.dart';
 
 class AsrFbank {
@@ -56,7 +58,7 @@ class AsrFbank {
   /// 只依赖常量的预计算表在首次使用时构造一次（povey 窗、mel 权重、FFT 旋转因子）。
   static final Float64List _window = _buildPoveyWindow();
   static final _MelBanks _melBanks = _MelBanks.build();
-  static final _RealFft _fft = _RealFft(paddedLength);
+  static final AsrRealFft _fft = AsrRealFft(paddedLength);
 
   /// `snip_edges=false` 且流已结束（flush）时的帧数，与 kaldi `NumFrames` 一致。
   static int frameCount(int numSamples) {
@@ -193,8 +195,9 @@ class _MelBanks {
 }
 
 /// 基 2 迭代复 FFT（Float64），只暴露实输入 → 功率谱。
-class _RealFft {
-  _RealFft(this.size)
+@internal
+class AsrRealFft {
+  AsrRealFft(this.size)
       : _bitReverse = _buildBitReverse(size),
         _cos = Float64List(size ~/ 2),
         _sin = Float64List(size ~/ 2),

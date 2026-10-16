@@ -62,6 +62,8 @@ class AsrCue {
   int get durationMs => endMs - startMs;
 }
 
+final RegExp _nonSpoken = RegExp(r'[\s\p{P}\p{S}]', unicode: true);
+
 /// 转录段 → cue 的纯函数构造器。
 class AsrCueBuilder {
   const AsrCueBuilder({
@@ -69,7 +71,13 @@ class AsrCueBuilder {
     this.gapSplitMs = 1200,
     this.minCueMs = 300,
     this.maxCueMs = 15000,
+    this.tailPadMs = 80,
   });
+
+  /// 段末 cue 的终点 = VAD 原始收声点 + 此余量（毫秒）。外扩段尾（收声点 + 250 ms
+  /// pad）是喂模型防尾字被吃的，拿它当终点每条字幕都在话说完后多挂 ~250 ms
+  /// （春物 90 min 实测 lag 中位 262 ms → 95 ms）。<0 沿用外扩段尾（旧行为）。
+  final int tailPadMs;
 
   /// 段内切句时，下一句起点在其首 token 之前预留的毫秒数（补偿 RNN-T 发射延迟）。
   final int leadInMs;
@@ -217,14 +225,24 @@ class AsrCueBuilder {
 
       // 段首 cue 从 VAD 未外扩的语音起点开始：外扩 pad 只为喂模型防首字被吃，
       // 拿它当起点字幕会比人声早约半秒。缺 raw（旧检查点）时退回外扩边界。
-      int start =
-          isFirst ? (seg.rawStartMs ?? seg.startMs) : firstTokenMs - leadInMs;
+      int start = isFirst
+          ? (seg.rawStartMs ?? seg.startMs)
+          : firstTokenMs - leadInMs;
       if (cues.isNotEmpty && start < cues.last.endMs) start = cues.last.endMs;
       if (start < seg.startMs) start = seg.startMs;
 
       int end;
       if (isLast) {
-        end = seg.endMs;
+        final int? rawEnd = seg.rawEndMs;
+        if (tailPadMs >= 0 && rawEnd != null) {
+          // 只收尾、不外延：收到收声点 + 余量，但不把短句收得一闪而过
+          // （≤3 字 500 ms、其余 800 ms）；保底本身不越过外扩段尾。
+          final int chars = text.replaceAll(_nonSpoken, '').length;
+          final int keep = start + (chars <= 3 ? 500 : 800);
+          end = math.min(seg.endMs, math.max(rawEnd + tailPadMs, keep));
+        } else {
+          end = seg.endMs;
+        }
       } else {
         final int nextFirstMs = seg.tokenTimesMs[sentences[s + 1].first];
         end = nextFirstMs - leadInMs;
@@ -241,9 +259,7 @@ class AsrCueBuilder {
           endMs: end + offsetMs,
           text: text,
           audioFileIndex: seg.audioFileIndex,
-          tokens: List<String>.unmodifiable(
-            idx.map((int i) => seg.tokens[i]),
-          ),
+          tokens: List<String>.unmodifiable(idx.map((int i) => seg.tokens[i])),
           // 段首 cue 改从 raw 起点开始后，前几个 token 的发射时刻常早于起点（RNN-T
           // 首 token 实测比真实开口早约 0.44 s）：夹到 0，偏移不出现负数且保持单调。
           tokenOffsetsMs: List<int>.unmodifiable(
@@ -364,12 +380,11 @@ String serializeAsrCuesToSrt(List<AsrCue> cues) {
 /// `{"t":[token...],"o":[相对 cue 起点的毫秒...]}`。SRT 是给通用解析器的出境
 /// 格式，token 时间装不进去；导入链路认出转录产物后按行号配回
 /// （`AsrTranscriptionService.attachCueTokenTiming`）。
-String serializeAsrCueTokens(List<AsrCue> cues) => _serializeTokenRows(
-      <(List<String>, List<int>)>[
-        for (final AsrCue cue in cues)
-          if (cue.text.isNotEmpty) (cue.tokens, cue.tokenOffsetsMs),
-      ],
-    );
+String serializeAsrCueTokens(List<AsrCue> cues) =>
+    _serializeTokenRows(<(List<String>, List<int>)>[
+      for (final AsrCue cue in cues)
+        if (cue.text.isNotEmpty) (cue.tokens, cue.tokenOffsetsMs),
+    ]);
 
 /// 与 [serializeAsrCueTokens] 同一格式，但输入是已经和 SRT 行号对齐的
 /// [AsrCueTokenTiming] 列表（转录结果读回后的形态：`TranscribeOutcome.tokenTimings`）。
@@ -402,8 +417,8 @@ List<({List<String> tokens, List<int> offsetsMs})>? parseAsrCueTokens(
     try {
       final Object? decoded = jsonDecode(line);
       if (decoded is! Map<String, Object?>) return null;
-      final List<String> tokens =
-          (decoded['t'] as List<Object?>).cast<String>();
+      final List<String> tokens = (decoded['t'] as List<Object?>)
+          .cast<String>();
       final List<int> offsets = (decoded['o'] as List<Object?>)
           .map((Object? v) => (v as num).toInt())
           .toList(growable: false);
@@ -443,7 +458,7 @@ List<int> asrFileOffsetsFromDurations(List<int> fileDurationsMs) {
 @immutable
 class AsrCueTokenTiming {
   const AsrCueTokenTiming({required this.tokens, required this.offsetsMs})
-      : assert(tokens.length == offsetsMs.length);
+    : assert(tokens.length == offsetsMs.length);
 
   final List<String> tokens;
   final List<int> offsetsMs;

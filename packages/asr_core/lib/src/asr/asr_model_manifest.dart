@@ -180,6 +180,14 @@ enum AsrIndexType { int64, int32 }
 ///   没有 fbank。
 enum AsrModelArchitecture { transducer, ctc }
 
+/// CTC 包的输入前端：
+/// - [waveform]：原始波形 `x[N, num_samples]`（逐段归一化），输出 `logits`
+///   （Omnilingual）；
+/// - [nemoMel80]：NeMo 80 维 log-mel `features[N, 80, T]` + `lengths[N]`，图内
+///   argmax 输出 `ids[N, T/8]` + `out_lengths[N]`（Kitsune / FastConformer CTC，
+///   `asr_nemo_mel.dart`）。mel 滤波器组随包下发（[AsrModelRole.melFilterbank]）。
+enum AsrCtcFrontend { waveform, nemoMel80 }
+
 /// 模型文件角色。transducer 包用前六个，ctc 包用 `ctc*` 三个；tokens / vad 共用。
 enum AsrModelRole {
   encoderFp32,
@@ -194,6 +202,9 @@ enum AsrModelRole {
   /// fp32 CTC 模型的 ONNX 外置权重（`model.weights`，与 `model.onnx` 同目录才能
   /// 建会话；ORT 按 `model.onnx` 所在目录解析相对路径）。
   ctcWeightsFp32,
+
+  /// [AsrCtcFrontend.nemoMel80] 的 mel 滤波器组（numpy `[257, 80]`）。
+  melFilterbank,
   tokens,
   vad,
 }
@@ -258,7 +269,15 @@ class AsrModelPack {
     this.indexType = AsrIndexType.int64,
     this.blankToken = '<blk>',
     this.fp32GpuMinBudgetBytes,
+    this.ctcFrontend = AsrCtcFrontend.waveform,
+    this.license,
   });
+
+  /// CTC 包的输入前端（transducer 包忽略）。
+  final AsrCtcFrontend ctcFrontend;
+
+  /// 非宽松许可时给用户看的许可说明（如 `CC BY-NC 4.0`）；null = 无需额外提示。
+  final String? license;
 
   /// 本包服务的语言（transducer 包一语言一包；Omnilingual 一包多语言）。
   final List<AsrLanguage> languages;
@@ -319,6 +338,8 @@ class AsrModelPack {
         if (variant == AsrEncoderVariant.fp32)
           for (final AsrModelFile f in files)
             if (f.role == AsrModelRole.ctcWeightsFp32) f,
+        for (final AsrModelFile f in files)
+          if (f.role == AsrModelRole.melFilterbank) f,
         fileForRole(AsrModelRole.tokens),
         fileForRole(AsrModelRole.vad),
       ],
@@ -342,6 +363,9 @@ class AsrModelPack {
         'blankToken': blankToken,
         if (fp32GpuMinBudgetBytes != null)
           'fp32GpuMinBudgetBytes': fp32GpuMinBudgetBytes,
+        if (ctcFrontend != AsrCtcFrontend.waveform)
+          'ctcFrontend': ctcFrontend.name,
+        if (license != null) 'license': license,
         'languages': <Object>[
           for (final AsrLanguage l in languages)
             <String, String>{'tag': l.tag, 'nativeName': l.nativeName},
@@ -396,6 +420,11 @@ class AsrModelPack {
         fp32GpuMinBudgetBytes: m['fp32GpuMinBudgetBytes'] == null
             ? null
             : _asInt(m, 'fp32GpuMinBudgetBytes'),
+        ctcFrontend: m.containsKey('ctcFrontend')
+            ? _asEnum(m, 'ctcFrontend', AsrCtcFrontend.values,
+                (AsrCtcFrontend v) => v.name)
+            : AsrCtcFrontend.waveform,
+        license: m['license'] == null ? null : _asString(m, 'license'),
         languages: <AsrLanguage>[
           for (final Object? l in langs) _languageFromJson(l),
         ],
@@ -1024,6 +1053,61 @@ const AsrModelPack kAsrOmnilingualPack = AsrModelPack(
     kAsrVadFile,
   ],
 );
+
+// ── 日语可选：Kitsune 0.1B（FastConformer CTC，SubThx 导出） ───────────────
+//
+// `subthx/kitsune-onnx` 的 ONNX 导出：NeMo 80 维 log-mel 输入，图内 argmax，
+// 子采样 8（80 ms/帧），SentencePiece BPE 3072 + `<blank>`=3072。GPU 用
+// `model.mixed16b.onnx`（已是混合精度，不再做设备端 fp16 派生），CPU 用 int8。
+// 2026-10-15 春物 90 min 同批：Hoshi 覆盖 99.98%（现役 K2 99.75%）、起点 lag
+// p90 110 ms。**许可 CC BY-NC 4.0（非商用）**：不进内置注册表、不随包，只作
+// 用户自选下载（[kAsrOptionalModelPacks]）。
+const String _kKitsuneBase =
+    'https://huggingface.co/subthx/kitsune-onnx/resolve/main/';
+
+const AsrModelPack kAsrKitsunePack = AsrModelPack(
+  languages: <AsrLanguage>[AsrLanguage.japanese],
+  id: 'kitsune-p0.1b',
+  displayName: 'Kitsune 0.1B (CTC)',
+  sourceUrl: 'https://huggingface.co/subthx/kitsune-onnx',
+  architecture: AsrModelArchitecture.ctc,
+  ctcFrontend: AsrCtcFrontend.nemoMel80,
+  blankToken: '<blank>',
+  license: 'CC BY-NC 4.0',
+  files: <AsrModelFile>[
+    AsrModelFile(
+      fileName: 'model.mixed16b.onnx',
+      url: '${_kKitsuneBase}kitsune-p0.1b/model.mixed16b.onnx',
+      expectedBytes: 197240725,
+      role: AsrModelRole.ctcModelFp32,
+    ),
+    AsrModelFile(
+      fileName: 'model.int8.onnx',
+      url: '${_kKitsuneBase}kitsune-p0.1b/model.int8.onnx',
+      expectedBytes: 185487186,
+      role: AsrModelRole.ctcModelInt8,
+    ),
+    AsrModelFile(
+      fileName: 'nemo80_fbanks.npy',
+      url: '${_kKitsuneBase}nemo80_fbanks.npy',
+      expectedBytes: 82368,
+      role: AsrModelRole.melFilterbank,
+    ),
+    AsrModelFile(
+      fileName: 'tokenizer.json',
+      url: '${_kKitsuneBase}kitsune-p0.1b/tokenizer.json',
+      expectedBytes: 395276,
+      role: AsrModelRole.tokens,
+    ),
+    kAsrVadFile,
+  ],
+);
+
+/// 不进默认注册表的可选包（许可或体积原因只给用户自选）；宿主把选中的包经
+/// [AsrModelRegistry.mergedWith] 排到前面即生效。
+const List<AsrModelPack> kAsrOptionalModelPacks = <AsrModelPack>[
+  kAsrKitsunePack,
+];
 
 /// 全部模型包。transducer 包与 [AsrLanguage.values] 前 8 项同序，Omnilingual 包
 /// 兜住其余 9 种。
