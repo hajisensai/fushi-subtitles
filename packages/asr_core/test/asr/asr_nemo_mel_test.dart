@@ -1,402 +1,94 @@
-// NeMo log-mel 与 numpy 参考实现（= transformers ParakeetFeatureExtractor，二者
-// 在真实对白上最大差 5.6e-5）的黄金对拍。期望值由 asr_bench 的
-// `gen_nemo_mel_test.py` 生成：信号是 Dart / numpy 都能逐位复现的两个正弦叠加。
+import 'dart:convert';
 import 'dart:math' as math;
 import 'dart:typed_data';
 
 import 'package:fushi_asr_core/src/asr/asr_nemo_mel.dart';
 import 'package:test/test.dart';
 
-Float32List _signal() {
-  final Float32List x = Float32List(24000);
-  for (int n = 0; n < x.length; n++) {
-    x[n] = 0.3 * math.sin(2 * math.pi * 440 * n / 16000) +
-        0.2 *
-            math.sin(2 * math.pi * 3150 * n / 16000 + 0.7) *
-            (0.5 + 0.5 * math.sin(2 * math.pi * 3 * n / 16000));
+/// 与 Python 参考（SubThx mel.rs 的 numpy 移植）同一个确定性信号。
+Float32List _signal(int n) {
+  final Float32List out = Float32List(n);
+  for (int i = 0; i < n; i++) {
+    out[i] =
+        0.3 * math.sin(2 * math.pi * 440 * i / 16000) +
+        0.1 * math.sin(2 * math.pi * 1234 * i / 16000) * math.cos(i / 700) +
+        0.01 * math.sin(i * i * 1e-5);
   }
-  return x;
+  return out;
 }
 
-const Map<int, List<double>> _golden = <int, List<double>>{
-  0: <double>[
-    8.76446,
-    9.04462,
-    9.53225,
-    9.49767,
-    10.58475,
-    10.72251,
-    10.59217,
-    11.48556,
-    11.93408,
-    12.14106,
-    -12.16422,
-    -12.16389,
-    -12.15820,
-    12.14008,
-    11.93044,
-    11.05789,
-    10.92931,
-    10.77232,
-    9.92523,
-    9.90458,
-    10.16221,
-    9.87925,
-    9.72033,
-    9.88854,
-    9.90553,
-    9.84064,
-    9.91636,
-    9.95451,
-    9.99506,
-    9.97836,
-    10.07710,
-    10.03909,
-    10.12845,
-    10.10366,
-    10.13352,
-    10.14488,
-    10.12403,
-    10.08683,
-    10.04192,
-    9.99228,
-    9.97475,
-    10.00675,
-    10.05547,
-    10.07453,
-    10.09218,
-    10.07329,
-    10.03696,
-    9.96208,
-    9.87999,
-    9.75571,
-    9.32550,
-    8.43815,
-    6.92948,
-    4.94254,
-    3.26048,
-    0.13386,
-    0.06244,
-    0.89255,
-    4.29300,
-    6.85417,
-    8.87653,
-    9.51014,
-    9.65631,
-    9.73976,
-    9.81126,
-    9.87415,
-    9.93746,
-    9.99173,
-    10.04335,
-    10.08836,
-    10.13094,
-    10.16494,
-    10.19379,
-    10.21264,
-    10.21852,
-    10.20579,
-    10.16705,
-    10.08787,
-    9.96077,
-    9.80898
-  ],
-  37: <double>[
-    0.41313,
-    0.42430,
-    0.17879,
-    0.00799,
-    0.04727,
-    -0.02565,
-    -0.08340,
-    -0.09404,
-    -0.09108,
-    -0.08617,
-    0.08110,
-    0.08287,
-    0.07934,
-    -0.09107,
-    -0.10531,
-    -0.13577,
-    -0.14194,
-    -0.14319,
-    -0.14458,
-    -0.16816,
-    -0.16764,
-    -0.14958,
-    -0.14181,
-    -0.15974,
-    -0.15545,
-    -0.13756,
-    -0.13871,
-    -0.14549,
-    -0.13791,
-    -0.13320,
-    -0.13755,
-    -0.13494,
-    -0.13108,
-    -0.13479,
-    -0.13108,
-    -0.13091,
-    -0.13240,
-    -0.12884,
-    -0.13193,
-    -0.12856,
-    -0.12982,
-    -0.12769,
-    -0.12690,
-    -0.12435,
-    -0.12338,
-    -0.11521,
-    -0.11696,
-    -0.08965,
-    -0.07714,
-    -0.03489,
-    0.11804,
-    0.30442,
-    0.50191,
-    0.63461,
-    0.66262,
-    0.66616,
-    0.66360,
-    0.68294,
-    0.65213,
-    0.50018,
-    0.18587,
-    -0.02254,
-    -0.09691,
-    -0.12055,
-    -0.12854,
-    -0.13142,
-    -0.13250,
-    -0.13279,
-    -0.13267,
-    -0.13242,
-    -0.13207,
-    -0.13168,
-    -0.13123,
-    -0.13073,
-    -0.13019,
-    -0.12958,
-    -0.12887,
-    -0.12809,
-    -0.12728,
-    -0.12660
-  ],
-  75: <double>[
-    -0.58876,
-    -0.60107,
-    -0.40679,
-    -0.24854,
-    -0.26237,
-    -0.21001,
-    -0.17022,
-    -0.12951,
-    -0.11136,
-    -0.09039,
-    0.08179,
-    0.08286,
-    0.07762,
-    -0.08682,
-    -0.09946,
-    -0.11624,
-    -0.11012,
-    -0.10437,
-    -0.11412,
-    -0.12036,
-    -0.09670,
-    -0.09393,
-    -0.12977,
-    -0.12477,
-    -0.10344,
-    -0.10902,
-    -0.13622,
-    -0.12757,
-    -0.11421,
-    -0.12692,
-    -0.13455,
-    -0.12059,
-    -0.12651,
-    -0.13352,
-    -0.12238,
-    -0.12850,
-    -0.12997,
-    -0.12170,
-    -0.13190,
-    -0.12069,
-    -0.12729,
-    -0.12018,
-    -0.12112,
-    -0.11346,
-    -0.11356,
-    -0.09330,
-    -0.09916,
-    -0.03926,
-    -0.01450,
-    0.06438,
-    0.31920,
-    0.56280,
-    0.76242,
-    0.84995,
-    0.83976,
-    0.80327,
-    0.79935,
-    0.83308,
-    0.84828,
-    0.75089,
-    0.40338,
-    0.08731,
-    -0.05328,
-    -0.10312,
-    -0.12099,
-    -0.12784,
-    -0.13076,
-    -0.13193,
-    -0.13220,
-    -0.13213,
-    -0.13192,
-    -0.13158,
-    -0.13117,
-    -0.13069,
-    -0.13016,
-    -0.12956,
-    -0.12886,
-    -0.12808,
-    -0.12728,
-    -0.12659
-  ],
-  149: <double>[
-    6.12106,
-    5.70118,
-    5.86606,
-    5.95399,
-    4.85035,
-    4.49812,
-    4.58221,
-    3.16639,
-    1.79409,
-    0.49586,
-    0.10701,
-    -0.02362,
-    0.32735,
-    0.53842,
-    1.69047,
-    3.66198,
-    3.77749,
-    3.96543,
-    4.95760,
-    4.95194,
-    4.68550,
-    4.99525,
-    5.13683,
-    4.98608,
-    4.98484,
-    5.05009,
-    5.00136,
-    4.97985,
-    4.95685,
-    5.00528,
-    4.93507,
-    5.01351,
-    4.97098,
-    5.04723,
-    5.08381,
-    5.14345,
-    5.24178,
-    5.36156,
-    5.48769,
-    5.59036,
-    5.62303,
-    5.55727,
-    5.43198,
-    5.30777,
-    5.18387,
-    5.09903,
-    5.04972,
-    5.02862,
-    5.03338,
-    5.02582,
-    4.81683,
-    4.35504,
-    3.49463,
-    2.29045,
-    1.09113,
-    0.44766,
-    0.44696,
-    0.45616,
-    1.90932,
-    3.57429,
-    4.82809,
-    5.18249,
-    5.20554,
-    5.17239,
-    5.13963,
-    5.11773,
-    5.10088,
-    5.09865,
-    5.10664,
-    5.12981,
-    5.16574,
-    5.22176,
-    5.29708,
-    5.39817,
-    5.53038,
-    5.70133,
-    5.91842,
-    6.19108,
-    6.51182,
-    6.82000
-  ],
-};
+/// 合成三角滤波器组 `[257, 80]`，写成 v1 `.npy`（`<f4`）。
+Uint8List _filterbankNpy() {
+  final Float32List fb = Float32List(257 * 80);
+  for (int k = 0; k < 257; k++) {
+    for (int m = 0; m < 80; m++) {
+      fb[k * 80 + m] = math.max(0.0, 1 - (k - 3 * m - 5).abs() / 4.0) / 10;
+    }
+  }
+  String header =
+      "{'descr': '<f4', 'fortran_order': False, 'shape': (257, 80), }";
+  while ((10 + header.length + 1) % 64 != 0) {
+    header += ' ';
+  }
+  header += '\n';
+  final BytesBuilder b =
+      BytesBuilder()
+        ..add(<int>[0x93, 0x4E, 0x55, 0x4D, 0x50, 0x59, 1, 0])
+        ..add(<int>[header.length & 0xff, header.length >> 8])
+        ..add(latin1.encode(header))
+        ..add(fb.buffer.asUint8List());
+  return b.toBytes();
+}
 
 void main() {
-  test('帧数 = 1 + L/160，有效帧 = L/160', () {
-    expect(AsrNemoMel.frameCount(24000), 151);
-    expect(AsrNemoMel.validFrameCount(24000), 150);
-    expect(AsrNemoMel.frameCount(0), 0);
-    expect(AsrNemoMel.frameCount(159), 1);
-    expect(AsrNemoMel.validFrameCount(159), 0);
-  });
-
-  test('与 numpy 参考实现逐值一致（容差 2e-3）', () {
-    final AsrNemoMelFeatures out = const AsrNemoMel().compute(_signal());
-    expect(out.frames, 151);
-    expect(out.validFrames, 150);
-    expect(out.features.length, out.frames * AsrNemoMel.numMels);
-    double worst = 0;
-    _golden.forEach((int t, List<double> row) {
-      for (int m = 0; m < AsrNemoMel.numMels; m++) {
-        final double d =
-            (out.features[t * AsrNemoMel.numMels + m] - row[m]).abs();
-        if (d > worst) worst = d;
-      }
-    });
-    expect(worst, lessThan(2e-3));
-  });
-
-  test('有效帧之后的补齐帧全为 0；有效帧逐维零均值', () {
-    final AsrNemoMelFeatures out = const AsrNemoMel().compute(_signal());
-    const int dim = AsrNemoMel.numMels;
-    for (int t = out.validFrames; t < out.frames; t++) {
-      for (int m = 0; m < dim; m++) {
-        expect(out.features[t * dim + m], 0);
-      }
+  test('与 numpy 参考实现逐值一致（含 1 s 对齐的批内补零）', () {
+    final AsrNemoMel mel = AsrNemoMel.fromNpy(_filterbankNpy());
+    expect(mel.nMels, 80);
+    final AsrNemoMelBatch out = mel.batch(<Float32List>[
+      _signal(16000 * 2 + 333),
+      _signal(16000 + 77),
+    ], padTo: 16000);
+    expect(out.frames, 301);
+    expect(out.lengths, <int>[202, 100]);
+    double at(int b, int m, int t) =>
+        out.features[(b * out.nMels + m) * out.frames + t];
+    // Python：run_kitsune_ort.mel_one 在同一输入上的输出。
+    const List<(int, int, int, double)> expected = <(int, int, int, double)>[
+      (0, 0, 0, 4.57997989654541),
+      (0, 10, 5, -0.602546751499176),
+      (0, 40, 100, -0.11165217310190201),
+      (0, 79, 201, 3.2213969230651855),
+      (1, 3, 0, -9.834213256835938),
+      (1, 50, 50, -0.13622011244297028),
+      (1, 79, 100, 0.0),
+      (1, 20, 150, 0.0),
+    ];
+    for (final (int b, int m, int t, double v) in expected) {
+      expect(at(b, m, t), closeTo(v, 2e-3), reason: 'b=$b m=$m t=$t');
     }
-    for (int m = 0; m < dim; m++) {
-      double sum = 0;
-      for (int t = 0; t < out.validFrames; t++) {
-        sum += out.features[t * dim + m];
+    double absSum(int b) {
+      double s = 0;
+      for (int i = 0; i < out.nMels * out.frames; i++) {
+        s += out.features[b * out.nMels * out.frames + i].abs();
       }
-      expect((sum / out.validFrames).abs(), lessThan(1e-3), reason: 'bin $m');
+      return s;
     }
+
+    expect(absSum(0), closeTo(5074.548557822534, 0.5));
+    expect(absSum(1), closeTo(2807.487908995041, 0.5));
   });
 
-  test('空输入与不足一帧的输入不抛', () {
-    expect(const AsrNemoMel().compute(Float32List(0)).frames, 0);
-    final AsrNemoMelFeatures short =
-        const AsrNemoMel().compute(Float32List(100));
-    expect(short.frames, 1);
-    expect(short.validFrames, 0);
-    expect(short.features.every((double v) => v == 0), isTrue);
+  test('短于一帧的段输出全零、有效帧 0', () {
+    final AsrNemoMel mel = AsrNemoMel.fromNpy(_filterbankNpy());
+    final AsrNemoMelBatch out = mel.batch(<Float32List>[Float32List(100)]);
+    expect(out.lengths, <int>[0]);
+    expect(out.features.every((double v) => v == 0), isTrue);
+  });
+
+  test('拒绝非 npy 与形状不符的滤波器组', () {
+    expect(
+      () => AsrNemoMel.fromNpy(Uint8List.fromList(<int>[1, 2, 3])),
+      throwsFormatException,
+    );
   });
 }

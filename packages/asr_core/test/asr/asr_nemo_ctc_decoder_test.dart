@@ -81,10 +81,11 @@ void main() {
     await decoder.decodeBatch(segs);
     expect(session.shapes.single, <int>[2, 80, AsrNemoMel.frameCount(16000)]);
     expect(session.lengths.single, <int>[100, 50]);
-    // 第 0 行第 3 帧第 7 维 = 特征提取器帧主序的 [3][7]。
-    final AsrNemoMelFeatures f = const AsrNemoMel().compute(segs[0].samples);
+    // 第 0 行第 7 维第 3 帧 = 逐段特征（mel 主序 [80, valid]）的 [7][3]。
+    final Float32List f = AsrNemoMel.slaney80.compute(segs[0].samples);
     final int t = AsrNemoMel.frameCount(16000);
-    expect(session.lastSignal![7 * t + 3], f.features[3 * 80 + 7]);
+    final int valid = AsrNemoMel.validFrameCount(16000);
+    expect(session.lastSignal![7 * t + 3], f[7 * valid + 3]);
     // 短的那行补齐帧为 0。
     expect(session.lastSignal![80 * t + 7 * t + 60], 0);
   });

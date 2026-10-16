@@ -29,6 +29,7 @@ import 'package:fushi_asr_core/src/util/collections.dart';
 import 'package:path/path.dart' as p;
 
 import 'package:fushi_asr_core/src/asr/asr_cue_builder.dart';
+import 'package:fushi_asr_core/src/asr/asr_energy_envelope.dart';
 import 'package:fushi_asr_core/src/asr/asr_transducer_decoder.dart'
     show AsrBatchFeatures, AsrDecodeStats, AsrEncodedBatch;
 import 'package:fushi_asr_core/src/asr/asr_types.dart';
@@ -747,7 +748,14 @@ class AsrTranscribeJob {
           final AsrPcmChunk chunk = it.current;
           next = it.moveNext();
           if (chunk.samples.isEmpty) continue;
+          // 能量包络与 VAD 同吃这一块：下游对齐把句界吸到真实停顿上要用，
+          // 在这里算几乎免费（整本只解码一次）。
+          final Future<void> energy = writeAsrEnergyChunk(
+            File(asrEnergyEnvelopePath(jobDir, fileIndex)),
+            chunk,
+          );
           pending.addAll(await segmenter.feed(chunk));
+          await energy;
           lastEndSample = chunk.endSample;
           // 块内按批解码并节流发进度。
           while (!(_pauseRequested && _discardPending) && enoughPending()) {

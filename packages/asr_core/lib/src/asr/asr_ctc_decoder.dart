@@ -13,6 +13,11 @@
 ///
 /// 每帧样本数从输出反推（`num_samples / num_frames`，Omnilingual 为 320 = 20 ms），
 /// 不写死——换模型不必改代码。
+///
+/// 传了 [AsrCtcDecoder.new] 的 `nemoMel` 就走 NeMo mel 前端（Kitsune，
+/// `AsrCtcFrontend.nemoMel80`）：特征是逐段 log-mel（isolate 池），一批补零拼成
+/// `features[N, 80, T]` + `lengths[N]`，读图内 argmax 的 `ids` / `out_lengths`；
+/// 字时按 [kitsuneCharTiming]（多字 token 摊开、标点归前一个发音字）。
 library;
 
 import 'dart:async';
@@ -22,6 +27,7 @@ import 'dart:math' as math;
 import 'dart:typed_data';
 import 'package:meta/meta.dart';
 import 'package:fushi_asr_core/src/asr/asr_encoder_buckets.dart';
+import 'package:fushi_asr_core/src/asr/asr_nemo_mel.dart';
 import 'package:fushi_asr_core/src/asr/asr_transcribe_job.dart'
     show
         AsrBatchDecoder,
@@ -55,9 +61,16 @@ class AsrCtcDecoder
     required OnnxSession model,
     required AsrTokenTable tokens,
     AsrStaticEncoderPool? staticSessions,
+    AsrNemoMel? nemoMel,
+    int? melWorkers,
+    this.melPadToSamples = kAsrSampleRate,
   })  : _model = model,
         _tokens = tokens,
-        _static = staticSessions {
+        _static = nemoMel == null ? staticSessions : null,
+        _mel = nemoMel,
+        _melWorkers = nemoMel == null
+            ? null
+            : AsrNemoMelWorkers(nemoMel, workers: melWorkers) {
     if (tokens.blankId < 0) {
       throw ArgumentError.value(tokens, 'tokens', '词表缺少 blank 记号');
     }
@@ -66,6 +79,12 @@ class AsrCtcDecoder
   final OnnxSession _model;
   final AsrTokenTable _tokens;
   final AsrStaticEncoderPool? _static;
+  final AsrNemoMel? _mel;
+  final AsrNemoMelWorkers? _melWorkers;
+
+  /// mel 前端：批内最长段向上取整到这个样本数的倍数，压低 GPU EP 见到的不同
+  /// 输入形状数（每个新形状 DML 要重新编译一次）。
+  final int melPadToSamples;
 
   AsrDecodeStats _stats = const AsrDecodeStats();
 
@@ -140,24 +159,47 @@ class AsrCtcDecoder
     }
   }
 
-  /// 归一化只是一遍线性扫描（30 分钟约 30 ms），不值得过 isolate。
+  /// 波形前端的归一化只是一遍线性扫描（30 分钟约 30 ms），不值得过 isolate；
+  /// mel 前端是逐帧 FFT，走 isolate 池。
   @override
   Future<AsrBatchFeatures> computeFeaturesAsync(
     List<AsrSpeechSegment> segments,
-  ) =>
-      Future<AsrBatchFeatures>.value(computeFeatures(segments));
+  ) async {
+    final AsrNemoMelWorkers? workers = _melWorkers;
+    if (workers == null) return computeFeatures(segments);
+    final Stopwatch clock = Stopwatch()..start();
+    final List<Float32List> features = await workers.computeAll(
+      <Float32List>[for (final AsrSpeechSegment s in segments) s.samples],
+    );
+    return _packFeatures(segments, features, clock);
+  }
 
-  /// 逐段零均值单位方差归一化（double 累加，float32 输出）。
+  /// 波形前端：逐段零均值单位方差归一化（double 累加，float32 输出）；
+  /// mel 前端：逐段 `[80, valid]` log-mel。两者「帧」都按样本数计。
   @override
   AsrBatchFeatures computeFeatures(List<AsrSpeechSegment> segments) {
     final Stopwatch clock = Stopwatch()..start();
-    final List<Float32List> features = <Float32List>[];
+    final AsrNemoMel? mel = _mel;
+    return _packFeatures(
+      segments,
+      <Float32List>[
+        for (final AsrSpeechSegment s in segments)
+          mel == null ? normalizeWaveform(s.samples) : mel.compute(s.samples),
+      ],
+      clock,
+    );
+  }
+
+  static AsrBatchFeatures _packFeatures(
+    List<AsrSpeechSegment> segments,
+    List<Float32List> features,
+    Stopwatch clock,
+  ) {
     final Int64List counts = Int64List(segments.length);
     int maxSamples = 0;
     int total = 0;
     for (int i = 0; i < segments.length; i++) {
       final Float32List x = segments[i].samples;
-      features.add(normalizeWaveform(x));
       counts[i] = x.length;
       total += x.length;
       maxSamples = math.max(maxSamples, x.length);
@@ -211,6 +253,8 @@ class AsrCtcDecoder
       return AsrCtcEncodedBatch._empty(segments, feats.fbankTime);
     }
     final Stopwatch clock = Stopwatch()..start();
+    final AsrNemoMel? mel = _mel;
+    if (mel != null) return _encodeMel(mel, segments, feats, clock);
     final AsrStaticEncoderPool? pool = _static;
     final AsrStaticEncoderSession? fixed =
         pool == null ? null : await pool.sessionFor(feats.maxFrames);
@@ -270,6 +314,93 @@ class AsrCtcDecoder
       encoderTime: clock.elapsed,
       isStatic: usedStatic,
     );
+  }
+
+  /// mel 前端：一批补零拼成 `[N, 80, T]`，一次 run；读 `ids` / `out_lengths`
+  /// （导出没做图内 argmax 时退回读 `logits` 主机侧 argmax）。
+  Future<AsrCtcEncodedBatch> _encodeMel(
+    AsrNemoMel mel,
+    List<AsrSpeechSegment> segments,
+    AsrBatchFeatures feats,
+    Stopwatch clock,
+  ) async {
+    final AsrNemoMelBatch b = AsrNemoMel.assemble(
+      feats.features,
+      <int>[for (final AsrSpeechSegment s in segments) s.samples.length],
+      mel.nMels,
+      padTo: melPadToSamples,
+    );
+    final Map<String, OnnxTensor> out = await _model.run(<String, OnnxTensor>{
+      AsrModelIo.ctcInputFeatures: OnnxTensor.float32(
+        b.features,
+        <int>[b.batch, b.nMels, b.frames],
+      ),
+      AsrModelIo.ctcInputLengths: OnnxTensor.int64(b.lengths, <int>[b.batch]),
+    });
+    final OnnxTensor? idsTensor = out[AsrModelIo.ctcOutputIds];
+    final List<Int32List> ids = <Int32List>[];
+    final int outFrames;
+    if (idsTensor != null) {
+      if (idsTensor.shape.length != 2 || idsTensor.shape[0] != b.batch) {
+        throw StateError('ids 形状异常：${idsTensor.shape}（rows=${b.batch}）');
+      }
+      outFrames = idsTensor.shape[1];
+      final List<int> flat = _intsOf(idsTensor);
+      final OnnxTensor? lensTensor = out[AsrModelIo.ctcOutputLengths];
+      final List<int>? lens = lensTensor == null ? null : _intsOf(lensTensor);
+      for (int r = 0; r < b.batch; r++) {
+        final int n = math.max(
+          0,
+          math.min(lens == null ? outFrames : lens[r], outFrames),
+        );
+        ids.add(
+          Int32List.fromList(flat.sublist(r * outFrames, r * outFrames + n)),
+        );
+      }
+    } else {
+      final OnnxTensor? logits = out[AsrModelIo.ctcOutputLogits];
+      final Float32List? data = logits?.floatData;
+      if (logits == null || data == null || logits.shape.length != 3) {
+        throw StateError('模型既没有 ids 也没有 float logits 输出：${out.keys}');
+      }
+      outFrames = logits.shape[1];
+      final int vocab = logits.shape[2];
+      for (int r = 0; r < b.batch; r++) {
+        final Int32List row = Int32List(outFrames);
+        for (int t = 0; t < outFrames; t++) {
+          row[t] = _argmax(data, (r * outFrames + t) * vocab, vocab);
+        }
+        ids.add(row);
+      }
+    }
+    // 子采样倍数：输入帧 / 输出帧（Kitsune 8 → 80 ms）。
+    final int subsample =
+        outFrames == 0 ? 1 : math.max(1, (b.frames / outFrames).round());
+    final int frameSamples = AsrNemoMelParams.hop * subsample;
+    return AsrCtcEncodedBatch._(
+      segments: segments,
+      frameIds: ids,
+      frameSamples: frameSamples,
+      realFrames: feats.realFrames ~/ frameSamples,
+      paddedFrames: b.batch * b.frames ~/ subsample,
+      fbankTime: feats.fbankTime,
+      encoderTime: clock.elapsed,
+      isStatic: false,
+    );
+  }
+
+  /// int64 输出：FFI 后端给 `intData`；插件后端统一读成 float32（整数值落在
+  /// float 里）；也认 int32。
+  static List<int> _intsOf(OnnxTensor t) {
+    final Int64List? i64 = t.intData;
+    if (i64 != null) return i64;
+    final Int32List? i32 = t.int32Data;
+    if (i32 != null) return i32;
+    final Float32List? f = t.floatData;
+    if (f != null) {
+      return <int>[for (final double v in f) v.round()];
+    }
+    throw StateError('整型输出没有数据：${t.type}');
   }
 
   /// 一段波形一次 run（动态会话、精确长度），返回完整的原始 `logits[T, V]`
@@ -363,21 +494,36 @@ class AsrCtcDecoder
       final Int32List ids =
           i < encoded.frameIds.length ? encoded.frameIds[i] : Int32List(0);
       final List<int> emitted = <int>[];
-      final List<int> offsets = <int>[];
+      final List<int> frames = <int>[];
       int prev = -1;
       for (int t = 0; t < ids.length; t++) {
         final int id = ids[t];
         if (id != prev && !_tokens.isSpecial(id)) {
           emitted.add(id);
-          offsets.add(t * encoded.frameSamples * 1000 ~/ kAsrSampleRate);
+          frames.add(t);
         }
         prev = id;
+      }
+      if (_mel != null) {
+        out.add(
+          kitsuneCharTiming(
+            table: _tokens,
+            ids: emitted,
+            frames: frames,
+            frameMs: encoded.frameSamples * 1000 / kAsrSampleRate,
+            segmentMs: encoded.segments[i].lengthMs,
+          ),
+        );
+        continue;
       }
       out.add(
         AsrDecodedSegment.fromTokenIds(
           table: _tokens,
           ids: emitted,
-          offsetsMs: offsets,
+          offsetsMs: <int>[
+            for (final int t in frames)
+              t * encoded.frameSamples * 1000 ~/ kAsrSampleRate,
+          ],
         ),
       );
     }
@@ -393,6 +539,77 @@ class AsrCtcDecoder
     return out;
   }
 }
+
+/// 子词 CTC（Kitsune）的逐字时间，对齐 SubThx 评测脚本：
+/// - token 去掉 `▁` 后 trim，空的（纯 `▁`）丢弃——日语不需要词间空格；
+/// - 发射帧时刻 = 帧号 × [frameMs]；多字 token 的字在
+///   `min(下一发射帧 − 本帧, 字数)` 帧内线性摊开；
+/// - 夹进 `[0, segmentMs]` 并保持单调；
+/// - 标点 / 符号 / 空白（Unicode P / S / Z）没有声学时刻：取前一个发音字的
+///   时刻（领头的取首个发音字）。CTC 的句末「。」常晚发射到下一次停顿之后，
+///   不归位会把 cue 终点拖进静音。
+@visibleForTesting
+AsrDecodedSegment kitsuneCharTiming({
+  required AsrTokenTable table,
+  required List<int> ids,
+  required List<int> frames,
+  required double frameMs,
+  required int segmentMs,
+}) {
+  final List<String> chars = <String>[];
+  final List<double> times = <double>[];
+  for (int j = 0; j < ids.length; j++) {
+    final String text = table
+        .tokenAt(ids[j])
+        .replaceAll(AsrTokenTable.sentencePieceSpace, '')
+        .trim();
+    final List<String> runes = <String>[
+      for (final int r in text.runes) String.fromCharCode(r),
+    ];
+    if (runes.isEmpty) continue;
+    final int fr = frames[j];
+    final int next = j + 1 < ids.length ? frames[j + 1] : fr + runes.length;
+    final double span = math.min(next - fr, runes.length) * frameMs;
+    final double t0 = fr * frameMs;
+    for (int q = 0; q < runes.length; q++) {
+      chars.add(runes[q]);
+      times.add(t0 + span * q / runes.length);
+    }
+  }
+  final List<int> ms = <int>[];
+  int pv = 0;
+  for (final double x in times) {
+    final int v =
+        math.min(math.max(x, pv.toDouble()), segmentMs.toDouble()).round();
+    ms.add(v);
+    pv = v;
+  }
+  int? firstSpoken;
+  for (int k = 0; k < chars.length; k++) {
+    if (_isSpoken(chars[k])) {
+      firstSpoken = ms[k];
+      break;
+    }
+  }
+  int? last;
+  for (int k = 0; k < chars.length; k++) {
+    if (_isSpoken(chars[k])) {
+      last = ms[k];
+    } else if (last != null) {
+      ms[k] = last;
+    } else if (firstSpoken != null) {
+      ms[k] = firstSpoken;
+    }
+  }
+  return AsrDecodedSegment(
+    tokens: List<String>.unmodifiable(chars),
+    tokenOffsetsMs: List<int>.unmodifiable(ms),
+  );
+}
+
+final RegExp _kNonSpoken = RegExp(r'^[\p{P}\p{S}\p{Z}]$', unicode: true);
+
+bool _isSpoken(String c) => !_kNonSpoken.hasMatch(c);
 
 /// [AsrCtcDecoder.runLogits] 的产物：一段的原始 `logits[frames × vocab]`
 /// （行主序、未 softmax）与每帧样本数（Omnilingual 320 = 20 ms）。

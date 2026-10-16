@@ -33,10 +33,10 @@ class AsrNemoCtcDecoder implements AsrSegmentDecoder {
   AsrNemoCtcDecoder({
     required OnnxSession model,
     required AsrTokenTable tokens,
-    AsrNemoMel mel = const AsrNemoMel(),
+    AsrNemoMel? mel,
   })  : _model = model,
         _tokens = tokens,
-        _mel = mel {
+        _mel = mel ?? AsrNemoMel.slaney80 {
     if (tokens.blankId < 0) {
       throw ArgumentError.value(tokens, 'tokens', '词表缺少 blank 记号');
     }
@@ -75,8 +75,9 @@ class AsrNemoCtcDecoder implements AsrSegmentDecoder {
   ) =>
       Future<AsrBatchFeatures>.value(computeFeatures(segments));
 
-  /// 每段一份帧主序 `[frames, 80]` 特征；`frameCounts` 记**有效帧数**（喂给
-  /// `length`），总帧数 = `features[i].length / 80`。
+  /// 每段一份 mel 主序 `[80, valid]` 特征（[AsrNemoMel.compute]）；
+  /// `frameCounts` 记**有效帧数**（喂给 `length`），[AsrBatchFeatures.maxFrames]
+  /// 是批内补齐后的总帧数 `1 + L/160`（[AsrNemoMel.frameCount]）。
   @override
   AsrBatchFeatures computeFeatures(List<AsrSpeechSegment> segments) {
     final Stopwatch clock = Stopwatch()..start();
@@ -85,11 +86,12 @@ class AsrNemoCtcDecoder implements AsrSegmentDecoder {
     int maxFrames = 0;
     int real = 0;
     for (int i = 0; i < segments.length; i++) {
-      final AsrNemoMelFeatures f = _mel.compute(segments[i].samples);
-      features.add(f.features);
-      valid[i] = f.validFrames;
-      real += f.validFrames;
-      maxFrames = math.max(maxFrames, f.frames);
+      final Float32List samples = segments[i].samples;
+      features.add(_mel.compute(samples));
+      final int v = AsrNemoMel.validFrameCount(samples.length);
+      valid[i] = v;
+      real += v;
+      maxFrames = math.max(maxFrames, AsrNemoMel.frameCount(samples.length));
     }
     return AsrBatchFeatures.raw(
       segments: segments,
@@ -126,25 +128,18 @@ class AsrNemoCtcDecoder implements AsrSegmentDecoder {
       );
     }
     final Stopwatch clock = Stopwatch()..start();
-    const int dim = AsrNemoMel.numMels;
-    // [N, T, 80] → [N, 80, T]，补齐帧为 0（与特征提取器的补齐语义一致）。
-    final Float32List x = Float32List(rows * dim * t);
-    for (int r = 0; r < rows; r++) {
-      final Float32List f = feats.features[r];
-      final int frames = f.length ~/ dim;
-      final int base = r * dim * t;
-      for (int frame = 0; frame < frames; frame++) {
-        final int src = frame * dim;
-        for (int m = 0; m < dim; m++) {
-          x[base + m * t + frame] = f[src + m];
-        }
-      }
-    }
+    // 逐段 [80, valid] 拼成 [N, 80, T]，补齐帧为 0（与特征提取器的补齐语义一致）。
+    final AsrNemoMelBatch b = AsrNemoMel.assemble(
+      feats.features,
+      <int>[for (final AsrSpeechSegment s in segments) s.samples.length],
+      _mel.nMels,
+    );
     final Map<String, OnnxTensor> out = await _model.run(<String, OnnxTensor>{
-      AsrModelIo.nemoInputAudioSignal:
-          OnnxTensor.float32(x, <int>[rows, dim, t]),
-      AsrModelIo.nemoInputLength:
-          OnnxTensor.int64(Int64List.fromList(feats.frameCounts), <int>[rows]),
+      AsrModelIo.nemoInputAudioSignal: OnnxTensor.float32(
+        b.features,
+        <int>[b.batch, b.nMels, b.frames],
+      ),
+      AsrModelIo.nemoInputLength: OnnxTensor.int64(b.lengths, <int>[rows]),
     });
     final OnnxTensor? logprobs = out[AsrModelIo.nemoOutputLogprobs];
     if (logprobs == null) {

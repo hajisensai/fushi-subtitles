@@ -65,6 +65,7 @@ class AsrTranscribePlan {
     required this.expectedProvider,
     required this.modelStatus,
     this.probeError,
+    this.availableProviders = const <OnnxExecutionProvider>{},
   });
 
   final AsrLanguage language;
@@ -80,6 +81,10 @@ class AsrTranscribePlan {
   /// 用户按 CPU 速度跑完整本却不知道探测失败过——所以不吞掉，交给 UI 提示
   /// （BUG-1163 同一条纪律）。
   final String? probeError;
+
+  /// 本机运行时探测到的加速 EP（[AsrAccelerationPreference.cpuOnly] 不探测，为
+  /// 空）。界面据此决定给不给「DirectML」「CUDA」两个显式选项。
+  final Set<OnnxExecutionProvider> availableProviders;
 
   /// 能不能开始转录 —— 只看识别模型。
   bool get modelReady => modelStatus.ready;
@@ -314,6 +319,7 @@ class AsrTranscriptionService {
       expectedProvider: expected,
       modelStatus: await store.status(variant),
       probeError: probeError,
+      availableProviders: Set<OnnxExecutionProvider>.unmodifiable(available),
     );
   }
 
@@ -481,6 +487,7 @@ class AsrTranscriptionService {
         backend: _backend,
         AsrIsolateJobSpec(
           storeDirPath: store.dir.path,
+          pack: store.pack,
           language: language,
           variant: variant,
           preference: preference,

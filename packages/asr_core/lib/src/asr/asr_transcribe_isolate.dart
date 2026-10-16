@@ -45,6 +45,7 @@ import 'package:fushi_asr_core/src/onnx/onnx_inference.dart';
 class AsrIsolateJobSpec {
   const AsrIsolateJobSpec({
     required this.storeDirPath,
+    required this.pack,
     required this.language,
     required this.variant,
     required this.preference,
@@ -66,6 +67,12 @@ class AsrIsolateJobSpec {
   final int? greedyIntraOpThreads;
 
   final String storeDirPath;
+
+  /// 根 isolate 选定的模型包。**不能**在后台 isolate 里按 [language] 重查
+  /// `asrModelPackFor`：`Isolate.spawn` 的新 isolate 全局量从头初始化，宿主装进
+  /// `asrModelRegistry` 的自带 / 可选包（Kitsune 等）在那边看不见，会静默换回
+  /// 内置包。
+  final AsrModelPack pack;
   final AsrLanguage language;
   final AsrEncoderVariant variant;
   final AsrAccelerationPreference preference;
@@ -394,7 +401,7 @@ Future<void> _isolateMain(_IsolateArgs args) async {
   try {
     final AsrModelStore store = AsrModelStore(
       Directory(spec.storeDirPath),
-      asrModelPackFor(spec.language, profile: spec.audioProfile),
+      spec.pack,
     );
     final AsrEngineLoader loader = AsrEngineLoader(
       factory: args.backend.buildFactory(),

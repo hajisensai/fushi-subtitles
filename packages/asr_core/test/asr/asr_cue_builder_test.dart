@@ -53,9 +53,71 @@ void main() {
       expect(cues.map((AsrCue c) => c.text), <String>['はい。', '行く。']);
       expect(cues[0].startMs, 1500);
       expect(cues[0].tokenOffsetsMs, <int>[0, 100, 300]);
-      // 段内后续句照旧用首 token 减 leadIn；段尾照旧到外扩边界。
+      // 段内后续句照旧用首 token 减 leadIn；段尾收到 VAD 收声点 + 余量。
       expect(cues[1].startMs, 2900 - builder.leadInMs);
-      expect(cues[1].endMs, 4000);
+      expect(cues[1].endMs, 3700 + builder.tailPadMs);
+    });
+
+    test('段尾收紧不把短句收成一闪：≤3 字保底 500 ms、其余 800 ms', () {
+      AsrTranscribedSegment one(String text, int rawEnd) =>
+          AsrTranscribedSegment(
+            audioFileIndex: 0,
+            startMs: 1000,
+            endMs: 4000,
+            rawStartMs: 1500,
+            rawEndMs: rawEnd,
+            tokens: text.split(''),
+            tokenTimesMs: <int>[
+              for (int i = 0; i < text.length; i++) 1500 + i * 20,
+            ],
+          );
+      // 「はい。」2 字：收声 1600 → 保底到 1500 + 500。
+      expect(
+        builder.build(<AsrTranscribedSegment>[one('はい。', 1600)]).single.endMs,
+        2000,
+      );
+      // 4 字：保底 800。
+      expect(
+        builder.build(<AsrTranscribedSegment>[one('行こうか', 1700)]).single.endMs,
+        2300,
+      );
+      // 保底不越过外扩段尾。
+      expect(
+        builder
+            .build(<AsrTranscribedSegment>[
+              AsrTranscribedSegment(
+                audioFileIndex: 0,
+                startMs: 1000,
+                endMs: 1900,
+                rawStartMs: 1500,
+                rawEndMs: 1650,
+                tokens: '行こうか'.split(''),
+                tokenTimesMs: <int>[1500, 1520, 1540, 1560],
+              ),
+            ])
+            .single
+            .endMs,
+        1900,
+      );
+    });
+
+    test('tailPadMs < 0：段尾沿用外扩边界（旧行为）', () {
+      final AsrTranscribedSegment seg = AsrTranscribedSegment(
+        audioFileIndex: 0,
+        startMs: 1000,
+        endMs: 4000,
+        rawStartMs: 1500,
+        rawEndMs: 3700,
+        tokens: '行く。'.split(''),
+        tokenTimesMs: <int>[1600, 1800, 2000],
+      );
+      expect(
+        const AsrCueBuilder(tailPadMs: -1)
+            .build(<AsrTranscribedSegment>[seg])
+            .single
+            .endMs,
+        4000,
+      );
     });
 
     test('没有 raw 边界（旧检查点）：段首 cue 仍从外扩起点开始', () {
@@ -80,8 +142,9 @@ void main() {
         tokens: <String>['あ'],
         tokenTimesMs: <int>[1600],
       );
-      final AsrTranscribedSegment back =
-          AsrTranscribedSegment.fromJson(seg.toJson());
+      final AsrTranscribedSegment back = AsrTranscribedSegment.fromJson(
+        seg.toJson(),
+      );
       expect(back.rawStartMs, 1500);
       expect(back.rawEndMs, 3700);
       final AsrTranscribedSegment legacy = AsrTranscribedSegment.fromJson(

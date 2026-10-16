@@ -7,6 +7,8 @@ library;
 
 import 'dart:developer' as developer;
 import 'dart:io';
+import 'dart:math' as math;
+import 'dart:typed_data';
 
 import 'package:fushi_asr_core/src/asr/asr_ctc_decoder.dart';
 import 'package:fushi_asr_core/src/asr/asr_nemo_ctc_decoder.dart';
@@ -15,6 +17,7 @@ import 'package:fushi_asr_core/src/asr/asr_fp16_graph.dart';
 import 'package:fushi_asr_core/src/asr/asr_greedy_graph.dart';
 import 'package:fushi_asr_core/src/asr/asr_model_manifest.dart';
 import 'package:fushi_asr_core/src/asr/asr_model_store.dart';
+import 'package:fushi_asr_core/src/asr/asr_nemo_mel.dart';
 import 'package:fushi_asr_core/src/asr/asr_transcribe_job.dart' show AsrSegmentDecoder;
 import 'package:fushi_asr_core/src/asr/asr_transducer_decoder.dart';
 import 'package:fushi_asr_core/src/asr/asr_types.dart';
@@ -26,7 +29,11 @@ import 'package:fushi_asr_core/src/onnx/onnx_inference.dart';
 export 'package:fushi_asr_core/src/asr/asr_types.dart' show kAsrLogName;
 
 /// 加速偏好：自动、CPU，或显式选择 macOS FP32 CoreML。
-enum AsrAccelerationPreference { auto, cpuOnly, coreml }
+///
+/// [directml] / [cuda]：Windows 上显式指定 GPU 后端（[auto] 在两者都可用时取
+/// CUDA，见 [selectAsrEncoderProviders]）。与 [coreml] 同一约定：指定了却不可用
+/// 时策略函数直接抛——界面只在探测到可用时才给这两个选项。
+enum AsrAccelerationPreference { auto, cpuOnly, coreml, directml, cuda }
 
 /// 平台（纯枚举入参，保持策略函数可测纯函数）。
 enum AsrPlatform { windows, macos, ios, linux, android }
@@ -91,6 +98,19 @@ List<OnnxExecutionProvider> selectAsrEncoderProviders({
           'Requested CoreML is unavailable on this platform/runtime');
     }
     return const [OnnxExecutionProvider.coreml, OnnxExecutionProvider.cpu];
+  }
+  if (preference == AsrAccelerationPreference.directml ||
+      preference == AsrAccelerationPreference.cuda) {
+    final OnnxExecutionProvider wanted =
+        preference == AsrAccelerationPreference.cuda
+        ? OnnxExecutionProvider.cuda
+        : OnnxExecutionProvider.directml;
+    if (platform != AsrPlatform.windows || !available.contains(wanted)) {
+      throw UnsupportedError(
+        'Requested ${wanted.name} is unavailable on this platform/runtime',
+      );
+    }
+    return <OnnxExecutionProvider>[wanted, OnnxExecutionProvider.cpu];
   }
   final List<OnnxExecutionProvider> preferenceOrder = switch (platform) {
     AsrPlatform.windows => const <OnnxExecutionProvider>[
@@ -216,11 +236,33 @@ class AsrEngineSessions {
     this.decoderContextSize = kAsrDecoderContextSize,
     this.indexType = AsrIndexType.int64,
     this.encoderFp16 = false,
+    this.nemoMel,
   }) : assert(
          asrIsCtcArchitecture(architecture) ||
              (decoder != null && joiner != null),
          'transducer 需要 decoder / joiner 会话',
        );
+
+  /// 同一套会话、换一个 EP 解析说明（健康检查回退时把原因记上去）。
+  AsrEngineSessions withEncoderResolution(OnnxProviderResolution resolution) =>
+      AsrEngineSessions(
+        encoder: encoder,
+        vad: vad,
+        tokens: tokens,
+        variant: variant,
+        encoderResolution: resolution,
+        architecture: architecture,
+        decoder: decoder,
+        joiner: joiner,
+        greedy: greedy,
+        greedyPool: greedyPool,
+        greedyUnavailableReason: greedyUnavailableReason,
+        staticEncoders: staticEncoders,
+        decoderContextSize: decoderContextSize,
+        indexType: indexType,
+        encoderFp16: encoderFp16,
+        nemoMel: nemoMel,
+      );
 
   /// 模型包架构：决定 [newDecoder] 装哪种解码器、[maxSegmentMs] 取哪档。
   final AsrModelArchitecture architecture;
@@ -240,6 +282,10 @@ class AsrEngineSessions {
   final int decoderContextSize;
   final AsrIndexType indexType;
 
+  /// CTC 包的 NeMo mel 前端（`AsrCtcFrontend.nemoMel80`，Kitsune）；波形前端为
+  /// null。
+  final AsrNemoMel? nemoMel;
+
   /// 用本套会话构造批量解码器。in-process 与 isolate 两条装配路径都从这里拿，
   /// 包契约参数只在此处传递一次。
   AsrSegmentDecoder newDecoder() => switch (architecture) {
@@ -258,6 +304,7 @@ class AsrEngineSessions {
       model: encoder,
       tokens: tokens,
       staticSessions: staticEncoders,
+      nemoMel: nemoMel,
     ),
     AsrModelArchitecture.nemoCtc => AsrNemoCtcDecoder(
       model: encoder,
@@ -267,8 +314,13 @@ class AsrEngineSessions {
 
   /// VAD 单段上限：zipformer 静态桶把段切到 10 s（见 [kAsrStaticMaxSegmentMs]），
   /// CTC 桶按 21 s 建、Omnilingual 本身吃得下 40 s，保持 VAD 默认 20 s。
+  ///
+  /// NeMo mel 前端（Kitsune）也取 10 s：评测与 SubThx 都按 ≤ 10 s 段跑，段越长
+  /// 一批补零越多。
   int get maxSegmentMs =>
-      architecture == AsrModelArchitecture.transducer && staticEncoders != null
+      (architecture == AsrModelArchitecture.transducer &&
+              staticEncoders != null) ||
+          nemoMel != null
       ? kAsrStaticMaxSegmentMs
       : kAsrDefaultMaxSegmentMs;
 
@@ -357,6 +409,11 @@ class AsrEngineLoader {
   /// （BUG-1163）。[AsrAccelerationPreference.cpuOnly] 不探测。
   ///
   /// 中途任一会话建失败时已建成的会话全部关闭再抛，不留 native 泄漏。
+  ///
+  /// 编码器落在 CUDA 上时装载完先试解码一段合成音频（[_cudaHealthCheck]）：
+  /// cuDNN 缺失 / 版本不对时 ORT 建会话**不报错**，要到第一次 Run 的 Conv 才失败
+  /// （2026-10-15 plugin EP 实测）。试跑失败就整套关掉、排除 CUDA 重装（显式选了
+  /// CUDA 也一样退到 DirectML / CPU），原因记进 `encoderResolution`——不静默。
   Future<AsrEngineSessions> load({
     required AsrModelStore store,
     required AsrEncoderVariant variant,
@@ -369,11 +426,92 @@ class AsrEngineLoader {
     int? greedyIntraOpThreads = kAsrGreedyGraphIntraOpThreads,
     int? greedySessions,
   }) async {
+    Future<AsrEngineSessions> once(
+      AsrAccelerationPreference pref,
+      Set<OnnxExecutionProvider> excluded,
+    ) =>
+        _loadOnce(
+          store: store,
+          variant: variant,
+          preference: pref,
+          excluded: excluded,
+          useGreedyGraph: useGreedyGraph,
+          useStaticEncoderBuckets: useStaticEncoderBuckets,
+          useFp16Encoder: useFp16Encoder,
+          staticBucketsOverride: staticBucketsOverride,
+          materialMs: materialMs,
+          greedyIntraOpThreads: greedyIntraOpThreads,
+          greedySessions: greedySessions,
+        );
+    final AsrEngineSessions sessions =
+        await once(preference, const <OnnxExecutionProvider>{});
+    if (sessions.encoderResolution.effective != OnnxExecutionProvider.cuda) {
+      return sessions;
+    }
+    final Object? failure = await _cudaHealthCheck(sessions);
+    if (failure == null) return sessions;
+    developer.log(
+      'ASR CUDA health check failed; reloading without CUDA',
+      name: kAsrLogName,
+      error: failure,
+    );
+    await sessions.close();
+    final AsrEngineSessions retry = await once(
+      AsrAccelerationPreference.auto,
+      const <OnnxExecutionProvider>{OnnxExecutionProvider.cuda},
+    );
+    final OnnxProviderResolution r = retry.encoderResolution;
+    return retry.withEncoderResolution(
+      OnnxProviderResolution(
+        requested: <OnnxExecutionProvider>[
+          OnnxExecutionProvider.cuda,
+          ...r.requested,
+        ],
+        effective: r.effective,
+        fallbackReason: <String>[
+          'CUDA health check failed: $failure',
+          if (r.fallbackReason != null) r.fallbackReason!,
+        ].join('; '),
+      ),
+    );
+  }
+
+  /// 一秒合成音频（低电平正弦）走一遍完整解码；返回错误，成功为 null。
+  static Future<Object?> _cudaHealthCheck(AsrEngineSessions sessions) async {
+    final Float32List x = Float32List(kAsrSampleRate);
+    for (int i = 0; i < x.length; i++) {
+      x[i] = 0.05 * math.sin(2 * math.pi * 220 * i / kAsrSampleRate);
+    }
+    try {
+      await sessions.newDecoder().decodeBatch(<AsrSpeechSegment>[
+        AsrSpeechSegment(startSample: 0, samples: x),
+      ]);
+      return null;
+    } catch (error) {
+      return error;
+    }
+  }
+
+  Future<AsrEngineSessions> _loadOnce({
+    required AsrModelStore store,
+    required AsrEncoderVariant variant,
+    required AsrAccelerationPreference preference,
+    required Set<OnnxExecutionProvider> excluded,
+    required bool useGreedyGraph,
+    required bool useStaticEncoderBuckets,
+    required bool useFp16Encoder,
+    required List<AsrEncoderBucket>? staticBucketsOverride,
+    required int? materialMs,
+    required int? greedyIntraOpThreads,
+    required int? greedySessions,
+  }) async {
     Set<OnnxExecutionProvider> available = const <OnnxExecutionProvider>{};
     Object? probeError;
     if (preference != AsrAccelerationPreference.cpuOnly) {
       try {
-        available = await _factory.availableAcceleratedProviders();
+        available = (await _factory.availableAcceleratedProviders()).difference(
+          excluded,
+        );
       } catch (error) {
         probeError = error;
         developer.log(
@@ -585,12 +723,20 @@ class AsrEngineLoader {
       OnnxExecutionProvider.cpu,
     ];
     final List<OnnxSession> opened = <OnnxSession>[];
+    // NeMo mel 前端（Kitsune）：GPU 文件本身就是混合精度导出，不再派生 fp16；
+    // 输入维度名与波形桶不同，不建样本数静态桶（动态会话 + 批内 1 s 取整）。
+    final bool nemo = store.pack.ctcFrontend == AsrCtcFrontend.nemoMel80;
     try {
+      final AsrNemoMel? nemoMel = nemo
+          ? AsrNemoMel.fromNpy(
+              await store.fileFor(AsrModelRole.melFilterbank).readAsBytes(),
+            )
+          : null;
       final _OpenedEncoder openedEncoder = await _openEncoder(
         store: store,
         role: asrCtcModelRole(variant),
         providers: providers,
-        useFp16: useFp16Encoder && variant == AsrEncoderVariant.fp32,
+        useFp16: !nemo && useFp16Encoder && variant == AsrEncoderVariant.fp32,
       );
       final OnnxSession model = openedEncoder.session;
       final String modelPath = openedEncoder.modelPath;
@@ -611,9 +757,11 @@ class AsrEngineLoader {
       );
       final OnnxExecutionProvider effective = modelResolution.effective;
       AsrStaticEncoderPool? staticSessions;
-      // 静态桶按 Omnilingual 的维名（N / num_samples）钉形状；NeMo CTC 吃特征、
-      // 维名不同，且滑窗输入本就恒长，不建桶。
-      if (useStaticEncoderBuckets &&
+      // 静态桶按 Omnilingual 的维名（N / num_samples）钉形状；NeMo 前端（Kitsune
+      // 的 mel 前端 CTC、Parakeet 的 nemoCtc）吃特征、维名不同，不建桶——
+      // nemoCtc 的滑窗输入本就恒长。
+      if (!nemo &&
+          useStaticEncoderBuckets &&
           store.pack.architecture == AsrModelArchitecture.ctc &&
           kAsrStaticBucketProviders.contains(effective)) {
         final int? budget = await _factory.deviceMemoryBudgetBytes();
@@ -654,6 +802,7 @@ class AsrEngineLoader {
         variant: variant,
         encoderResolution: modelResolution,
         staticEncoders: staticSessions,
+        nemoMel: nemoMel,
       );
     } catch (_) {
       for (final OnnxSession s in opened) {

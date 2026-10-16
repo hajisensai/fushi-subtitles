@@ -1,150 +1,114 @@
-/// NeMo 风格 log-mel 特征（Parakeet / FastConformer CTC 的输入），纯 Dart。
+/// NeMo log-mel 前端（Parakeet / Kitsune 等 FastConformer CTC 用），逐项对齐
+/// onnx_asr 的 `NemoPreprocessorNumpy` 与 SubThx `mel.rs`：
 ///
-/// 与 `transformers` 的 `ParakeetFeatureExtractor`（即 NeMo
-/// `AudioToMelSpectrogramPreprocessor` 推理期配置）逐步对齐，2026-10-15 用 numpy
-/// 参考实现在 20 段真实动画对白上对拍，最大绝对差 5.6e-5、有效帧数逐段一致：
+/// 1. 预加重 0.97（首样本前视为 0），整段之外补零；
+/// 2. 居中 STFT：左右各补 `n_fft/2`，n_fft 512、Hann 400（`np.hanning`，居中
+///    零填到 512）、hop 160（10 ms）；
+/// 3. 功率谱 × slaney mel 滤波器组（`[257, n_mels]`）。两个来源：随模型包下发的
+///    npy（[AsrNemoMel.fromNpy]，Kitsune，保证与导出端逐值一致），或代码里按
+///    librosa `filters.mel(norm="slaney")` 现算的 80 维（[AsrNemoMel.slaney80]，
+///    Parakeet——包里不带滤波器组）；
+/// 4. `log(x + 2^-24)`；
+/// 5. 每个 mel 维在**有效帧**上做均值 / 标准差（ddof = 1）归一化，`std + 1e-5`；
+///    有效帧之外置零。
 ///
-/// 1. 预加重 `y[0]=x[0]`、`y[n]=x[n]-0.97·x[n-1]`（整段做一次，不是逐帧）；
-/// 2. 两端各补 `n_fft/2 = 256` 个零（`torch.stft(center=True, pad_mode="constant")`），
-///    帧数 `1 + L/160`；
-/// 3. 400 点**对称** Hann 窗（`periodic=False`）居中补零到 512，`|FFT|²`；
-/// 4. 80 维 Slaney mel（librosa `norm="slaney"`、0–8000 Hz）后取 `log(x + 2⁻²⁴)`；
-/// 5. 只在有效帧（`L / 160` 帧）上逐维做均值 / **无偏**标准差归一化
-///    `(x-μ)/(σ+1e-5)`，有效帧之后的帧置 0。
+/// 输出布局 `[B, n_mels, T]`（行主序），`T = maxLen / 160 + 1`，有效帧数
+/// `len / 160`——与导出图的 `features` / `lengths`（Parakeet 叫 `audio_signal`
+/// / `length`）输入一致。
 ///
-/// 与 kaldi fbank（`asr_fbank.dart`）的差别都在这里：没有去直流、没有 povey 窗、
-/// mel 刻度不同、要逐维归一化——混用任何一步，模型照样出字，只是错得多。
+/// 2026-10-15 两边各自对拍过：SubThx `mel.rs` 的 numpy 移植（合成滤波器组），与
+/// transformers `ParakeetFeatureExtractor`（slaney80，20 段真实动画对白最大绝对差
+/// 5.6e-5）。
 library;
 
+import 'dart:convert';
+import 'dart:isolate';
 import 'dart:math' as math;
 import 'dart:typed_data';
 
+import 'package:fushi_asr_core/src/asr/asr_fbank_workers.dart';
 import 'package:fushi_asr_core/src/asr/asr_real_fft.dart';
-import 'package:fushi_asr_core/src/asr/asr_types.dart';
+import 'package:fushi_asr_core/src/asr/asr_types.dart' show kAsrSampleRate;
 
-/// 一段音频的 NeMo log-mel：[features] 帧主序 `[frames, 80]`，前 [validFrames]
-/// 帧有效（其余为 0，供批内补齐）。
-typedef AsrNemoMelFeatures = ({
-  Float32List features,
-  int frames,
-  int validFrames,
-});
+/// NeMo log-mel 的固定帧参数。
+abstract final class AsrNemoMelParams {
+  static const int nFft = 512;
+  static const int window = 400;
+  static const int hop = 160;
+  static const double preemphasis = 0.97;
+}
+
+/// 一批段的特征：`features` 为 `[batch, nMels, frames]` 行主序。
+class AsrNemoMelBatch {
+  const AsrNemoMelBatch({
+    required this.features,
+    required this.lengths,
+    required this.batch,
+    required this.nMels,
+    required this.frames,
+  });
+
+  final Float32List features;
+
+  /// 每段的有效帧数（`samples ~/ hop`）。
+  final Int64List lengths;
+  final int batch;
+  final int nMels;
+  final int frames;
+}
 
 class AsrNemoMel {
-  const AsrNemoMel();
+  AsrNemoMel(this.filterbank, this.nMels)
+      : assert(filterbank.length == (AsrNemoMelParams.nFft ~/ 2 + 1) * nMels),
+        _lo = Int32List(nMels),
+        _hi = Int32List(nMels) {
+    // 三角滤波器只在少数 bin 上非零：记下每个 mel 维的非零区间，乘法按区间
+    // 走（稠密 257×80 每帧两万次乘加，10 h 音频单线程要一分多钟）。
+    const int bins = AsrNemoMelParams.nFft ~/ 2 + 1;
+    for (int m = 0; m < nMels; m++) {
+      int lo = bins;
+      int hi = 0;
+      for (int k = 0; k < bins; k++) {
+        if (filterbank[k * nMels + m] != 0) {
+          if (k < lo) lo = k;
+          hi = k + 1;
+        }
+      }
+      _lo[m] = lo < hi ? lo : 0;
+      _hi[m] = hi;
+    }
+  }
 
-  static const int nFft = 512;
-  static const int hopLength = 160;
-  static const int winLength = 400;
-  static const int numMels = kAsrFeatureDim;
-  static const double preemphasis = 0.97;
-  static const double logGuard = 5.960464477539063e-8; // 2^-24
-  static const double normEpsilon = 1e-5;
+  /// 从 numpy `.npy`（float32 / float64，C 序，形状 `[257, n_mels]`）读滤波器组。
+  factory AsrNemoMel.fromNpy(Uint8List bytes) {
+    final ({List<int> shape, Float32List data}) npy = readNpyFloat(bytes);
+    if (npy.shape.length != 2 ||
+        npy.shape[0] != AsrNemoMelParams.nFft ~/ 2 + 1) {
+      throw FormatException('mel 滤波器组形状异常：${npy.shape}');
+    }
+    return AsrNemoMel(npy.data, npy.shape[1]);
+  }
+
+  /// 代码里现算的 80 维 slaney 滤波器组（librosa `filters.mel(sr=16000,
+  /// n_fft=512, n_mels=80, fmin=0, fmax=8000, htk=False, norm="slaney")`）：
+  /// 模型包不随包下发滤波器组时用它（Parakeet）。
+  static final AsrNemoMel slaney80 = AsrNemoMel(_buildSlaneyFilterbank(80), 80);
+
+  /// 居中 STFT 的总帧数：`1 + L / hop`（批内补齐后的 `T` 也按它算）。
+  static int frameCount(int numSamples) =>
+      numSamples <= 0 ? 0 : 1 + numSamples ~/ AsrNemoMelParams.hop;
+
+  /// 参与归一化、喂给 `lengths` 的有效帧数：`L / hop`。
+  static int validFrameCount(int numSamples) =>
+      numSamples <= 0 ? 0 : numSamples ~/ AsrNemoMelParams.hop;
+
+  /// `[257 × nMels]`，行 = FFT bin。
+  final Float32List filterbank;
+  final int nMels;
+  final Int32List _lo;
+  final Int32List _hi;
 
   static final Float64List _window = _buildWindow();
-  static final List<({int first, Float64List weights})> _filters =
-      _buildSlaneyFilters();
-  static final AsrRealFft _fft = AsrRealFft(nFft);
-
-  /// 帧数（`center=True`）：`1 + L / hop`。
-  static int frameCount(int numSamples) =>
-      numSamples <= 0 ? 0 : 1 + numSamples ~/ hopLength;
-
-  /// 参与归一化的有效帧数：`(L + n_fft/2·2 − n_fft) / hop = L / hop`。
-  static int validFrameCount(int numSamples) =>
-      numSamples <= 0 ? 0 : numSamples ~/ hopLength;
-
-  AsrNemoMelFeatures compute(Float32List samples) {
-    final int n = samples.length;
-    final int frames = frameCount(n);
-    final int valid = validFrameCount(n);
-    final Float32List out = Float32List(frames * numMels);
-    if (frames == 0) {
-      return (features: out, frames: 0, validFrames: 0);
-    }
-    // 预加重后的整段，两侧补零 n_fft/2。
-    const int pad = nFft ~/ 2;
-    final Float64List padded = Float64List(n + 2 * pad);
-    padded[pad] = samples[0];
-    for (int i = 1; i < n; i++) {
-      padded[pad + i] = samples[i] - preemphasis * samples[i - 1];
-    }
-
-    final Float64List frame = Float64List(nFft);
-    final Float64List power = Float64List(nFft ~/ 2 + 1);
-    final Float64List mel = Float64List(numMels);
-    for (int t = 0; t < frames; t++) {
-      final int base = t * hopLength;
-      for (int k = 0; k < nFft; k++) {
-        frame[k] = padded[base + k] * _window[k];
-      }
-      _fft.powerSpectrum(frame, power);
-      for (int m = 0; m < numMels; m++) {
-        final ({int first, Float64List weights}) f = _filters[m];
-        double acc = 0;
-        for (int k = 0; k < f.weights.length; k++) {
-          acc += f.weights[k] * power[f.first + k];
-        }
-        mel[m] = acc;
-      }
-      final int row = t * numMels;
-      for (int m = 0; m < numMels; m++) {
-        out[row + m] = math.log(mel[m] + logGuard);
-      }
-    }
-    _normalizePerFeature(out, frames, valid);
-    return (features: out, frames: frames, validFrames: valid);
-  }
-
-  static void _normalizePerFeature(Float32List x, int frames, int valid) {
-    if (valid <= 0) {
-      x.fillRange(0, x.length, 0);
-      return;
-    }
-    final Float64List mean = Float64List(numMels);
-    for (int t = 0; t < valid; t++) {
-      final int row = t * numMels;
-      for (int m = 0; m < numMels; m++) {
-        mean[m] += x[row + m];
-      }
-    }
-    for (int m = 0; m < numMels; m++) {
-      mean[m] /= valid;
-    }
-    final Float64List variance = Float64List(numMels);
-    for (int t = 0; t < valid; t++) {
-      final int row = t * numMels;
-      for (int m = 0; m < numMels; m++) {
-        final double d = x[row + m] - mean[m];
-        variance[m] += d * d;
-      }
-    }
-    final int dof = math.max(valid - 1, 1);
-    final Float64List inv = Float64List(numMels);
-    for (int m = 0; m < numMels; m++) {
-      inv[m] = 1 / (math.sqrt(variance[m] / dof) + normEpsilon);
-    }
-    for (int t = 0; t < frames; t++) {
-      final int row = t * numMels;
-      if (t >= valid) {
-        x.fillRange(row, row + numMels, 0);
-        continue;
-      }
-      for (int m = 0; m < numMels; m++) {
-        x[row + m] = (x[row + m] - mean[m]) * inv[m];
-      }
-    }
-  }
-
-  /// 400 点对称 Hann（`0.5 − 0.5·cos(2πn/(N−1))`），居中补零到 512。
-  static Float64List _buildWindow() {
-    final Float64List w = Float64List(nFft);
-    const int left = (nFft - winLength) ~/ 2;
-    for (int n = 0; n < winLength; n++) {
-      w[left + n] = 0.5 - 0.5 * math.cos(2 * math.pi * n / (winLength - 1));
-    }
-    return w;
-  }
 
   static double _hzToMel(double f) {
     const double fSp = 200.0 / 3;
@@ -166,11 +130,9 @@ class AsrNemoMel {
         : fSp * m;
   }
 
-  /// librosa `filters.mel(sr=16000, n_fft=512, n_mels=80, fmin=0, fmax=8000,
-  /// htk=False, norm="slaney")`：三角滤波 × `2/(f[i+2]−f[i])`。每个滤波器只存
-  /// 非零区间。
-  static List<({int first, Float64List weights})> _buildSlaneyFilters() {
-    const int bins = nFft ~/ 2 + 1;
+  /// Slaney 三角滤波 × `2/(f[i+2]−f[i])`，0–8000 Hz，布局同 npy：`[257, nMels]`。
+  static Float32List _buildSlaneyFilterbank(int nMels) {
+    const int bins = AsrNemoMelParams.nFft ~/ 2 + 1;
     const double fMax = kAsrSampleRate / 2;
     final Float64List fftFreqs = Float64List(bins);
     for (int k = 0; k < bins; k++) {
@@ -178,40 +140,262 @@ class AsrNemoMel {
     }
     final double melMin = _hzToMel(0);
     final double melMax = _hzToMel(fMax);
-    final Float64List hz = Float64List(numMels + 2);
-    for (int i = 0; i < numMels + 2; i++) {
-      hz[i] = _melToHz(melMin + (melMax - melMin) * i / (numMels + 1));
+    final Float64List hz = Float64List(nMels + 2);
+    for (int i = 0; i < nMels + 2; i++) {
+      hz[i] = _melToHz(melMin + (melMax - melMin) * i / (nMels + 1));
     }
-    final List<({int first, Float64List weights})> out =
-        <({int first, Float64List weights})>[];
-    for (int m = 0; m < numMels; m++) {
+    final Float32List out = Float32List(bins * nMels);
+    for (int m = 0; m < nMels; m++) {
       final double lo = hz[m];
       final double mid = hz[m + 1];
       final double hi = hz[m + 2];
       final double enorm = 2.0 / (hi - lo);
-      int first = -1;
-      int last = -1;
-      final Float64List full = Float64List(bins);
       for (int k = 0; k < bins; k++) {
         final double f = fftFreqs[k];
         final double lower = (f - lo) / (mid - lo);
         final double upper = (hi - f) / (hi - mid);
-        final double w = math.max(0.0, math.min(lower, upper)) * enorm;
-        full[k] = w;
-        if (w > 0) {
-          if (first < 0) first = k;
-          last = k;
-        }
+        out[k * nMels + m] = math.max(0.0, math.min(lower, upper)) * enorm;
       }
-      out.add(
-        first < 0
-            ? (first: 0, weights: Float64List(0))
-            : (
-                first: first,
-                weights: Float64List.sublistView(full, first, last + 1),
-              ),
-      );
     }
     return out;
   }
+
+  static Float64List _buildWindow() {
+    const int n = AsrNemoMelParams.nFft;
+    const int w = AsrNemoMelParams.window;
+    const int off = (n - w) ~/ 2;
+    final Float64List out = Float64List(n);
+    for (int i = 0; i < w; i++) {
+      out[off + i] = 0.5 - 0.5 * math.cos(2 * math.pi * i / (w - 1));
+    }
+    return out;
+  }
+
+  /// 一批段 → 特征。[padTo]：把批内最长段向上取整到它的倍数（样本），减少
+  /// 不同的编码器输入形状（GPU EP 每个新形状要编译一次）；1 = 精确长度。
+  AsrNemoMelBatch batch(List<Float32List> wavs, {int padTo = 1}) => assemble(
+        <Float32List>[for (final Float32List w in wavs) compute(w)],
+        <int>[for (final Float32List w in wavs) w.length],
+        nMels,
+        padTo: padTo,
+      );
+
+  /// 把逐段 [compute] 的结果拼成 `[B, nMels, T]`，有效帧之外补零。
+  /// [sampleCounts]：各段原始样本数（决定 `T`）。
+  static AsrNemoMelBatch assemble(
+    List<Float32List> perSegment,
+    List<int> sampleCounts,
+    int nMels, {
+    int padTo = 1,
+  }) {
+    int longest = 0;
+    for (final int n in sampleCounts) {
+      longest = math.max(longest, n);
+    }
+    final int unit = math.max(1, padTo);
+    final int maxLen = (longest + unit - 1) ~/ unit * unit;
+    final int frames = maxLen ~/ AsrNemoMelParams.hop + 1;
+    final Float32List out = Float32List(perSegment.length * nMels * frames);
+    final Int64List lengths = Int64List(perSegment.length);
+    for (int b = 0; b < perSegment.length; b++) {
+      final int valid = perSegment[b].length ~/ nMels;
+      lengths[b] = valid;
+      for (int m = 0; m < nMels; m++) {
+        final int dst = (b * nMels + m) * frames;
+        out.setRange(dst, dst + valid, perSegment[b], m * valid);
+      }
+    }
+    return AsrNemoMelBatch(
+      features: out,
+      lengths: lengths,
+      batch: perSegment.length,
+      nMels: nMels,
+      frames: frames,
+    );
+  }
+
+  /// 一段 → 归一化 log-mel，布局 `[nMels, valid]`（`valid = len ~/ hop`）。
+  Float32List compute(Float32List w) {
+    final int valid = w.length ~/ AsrNemoMelParams.hop;
+    final Float32List dst = Float32List(valid * nMels);
+    _one(AsrRealFft(AsrNemoMelParams.nFft), w, valid, dst, 0);
+    return dst;
+  }
+
+  void _one(
+    AsrRealFft fft,
+    Float32List w,
+    int frames,
+    Float32List dst,
+    int dstOffset,
+  ) {
+    const int nFft = AsrNemoMelParams.nFft;
+    const int hop = AsrNemoMelParams.hop;
+    const int pad = nFft ~/ 2;
+    const int bins = nFft ~/ 2 + 1;
+    final int valid = w.length ~/ hop;
+    if (valid == 0) return;
+    // 预加重 + 居中补零（只需覆盖有效帧会读到的范围）。
+    final int need = (valid - 1) * hop + nFft;
+    final Float64List x = Float64List(need);
+    for (int i = 0; i < w.length && pad + i < need; i++) {
+      final double prev = i == 0 ? 0 : w[i - 1];
+      x[pad + i] = w[i] - AsrNemoMelParams.preemphasis * prev;
+    }
+    final Float64List frame = Float64List(nFft);
+    final Float64List power = Float64List(bins);
+    final Float32List power32 = Float32List(bins);
+    final Float32List logmel = Float32List(valid * nMels);
+    final double floor = math.pow(2, -24).toDouble();
+    for (int f = 0; f < valid; f++) {
+      final int s = f * hop;
+      for (int i = 0; i < nFft; i++) {
+        frame[i] = x[s + i] * _window[i];
+      }
+      fft.powerSpectrum(frame, power);
+      // 与参考实现一样先把功率收成 float32 再乘滤波器组。
+      for (int k = 0; k < bins; k++) {
+        power32[k] = power[k];
+      }
+      final int row = f * nMels;
+      for (int m = 0; m < nMels; m++) {
+        double acc = 0;
+        for (int k = _lo[m]; k < _hi[m]; k++) {
+          acc += power32[k] * filterbank[k * nMels + m];
+        }
+        logmel[row + m] = math.log(acc + floor);
+      }
+    }
+    for (int m = 0; m < nMels; m++) {
+      double sum = 0;
+      for (int f = 0; f < valid; f++) {
+        sum += logmel[f * nMels + m];
+      }
+      final double mean = sum / valid;
+      double sq = 0;
+      for (int f = 0; f < valid; f++) {
+        final double d = logmel[f * nMels + m] - mean;
+        sq += d * d;
+      }
+      final double std = valid > 1 ? math.sqrt(sq / (valid - 1)) : 0;
+      final double denom = std + 1e-5;
+      final int col = dstOffset + m * frames;
+      for (int f = 0; f < valid; f++) {
+        dst[col + f] = (logmel[f * nMels + m] - mean) / denom;
+      }
+    }
+  }
+}
+
+/// [AsrNemoMel.compute] 的 isolate 池：与 `AsrFbankWorkers` 同一套分组与
+/// [TransferableTypedData] 搬运，结果与逐段 [AsrNemoMel.compute] 逐元素相同。
+class AsrNemoMelWorkers {
+  AsrNemoMelWorkers(this.mel, {int? workers})
+      : workers = workers ?? defaultAsrFbankWorkerCount();
+
+  final AsrNemoMel mel;
+  final int workers;
+
+  Future<List<Float32List>> computeAll(List<Float32List> samples) async {
+    if (samples.isEmpty) return const <Float32List>[];
+    final List<List<int>> groups = AsrFbankWorkers.balancedGroups(
+      samples.map((Float32List s) => s.length).toList(growable: false),
+      workers,
+    );
+    final List<Float32List> flat = await Future.wait(
+      groups.map(
+        (List<int> g) => _runGroup(
+          g.map((int i) => samples[i]).toList(growable: false),
+          mel,
+        ),
+      ),
+    );
+    final List<Float32List> out = List<Float32List>.filled(
+      samples.length,
+      Float32List(0),
+    );
+    for (int gi = 0; gi < groups.length; gi++) {
+      int offset = 0;
+      for (final int i in groups[gi]) {
+        final int len = samples[i].length ~/ AsrNemoMelParams.hop * mel.nMels;
+        out[i] = Float32List.sublistView(flat[gi], offset, offset + len);
+        offset += len;
+      }
+    }
+    return out;
+  }
+
+  static Future<Float32List> _runGroup(
+    List<Float32List> samples,
+    AsrNemoMel mel,
+  ) async {
+    final List<int> lengths =
+        samples.map((Float32List s) => s.length).toList(growable: false);
+    final TransferableTypedData packed = TransferableTypedData.fromList(
+      samples,
+    );
+    final TransferableTypedData result = await Isolate.run(() {
+      final Float32List all = packed.materialize().asFloat32List();
+      final List<Float32List> parts = <Float32List>[];
+      int offset = 0;
+      for (final int len in lengths) {
+        parts.add(
+          mel.compute(Float32List.sublistView(all, offset, offset + len)),
+        );
+        offset += len;
+      }
+      return TransferableTypedData.fromList(parts);
+    });
+    return result.materialize().asFloat32List();
+  }
+}
+
+/// 读 numpy `.npy`（v1/v2/v3，`<f4` / `<f8`，C 序）为 float32 与形状。
+({List<int> shape, Float32List data}) readNpyFloat(Uint8List bytes) {
+  const List<int> magic = <int>[0x93, 0x4E, 0x55, 0x4D, 0x50, 0x59];
+  for (int i = 0; i < magic.length; i++) {
+    if (bytes.length <= i || bytes[i] != magic[i]) {
+      throw const FormatException('不是 .npy 文件');
+    }
+  }
+  final int major = bytes[6];
+  final ByteData view = ByteData.sublistView(bytes);
+  final int headerLen;
+  final int headerStart;
+  if (major == 1) {
+    headerLen = view.getUint16(8, Endian.little);
+    headerStart = 10;
+  } else {
+    headerLen = view.getUint32(8, Endian.little);
+    headerStart = 12;
+  }
+  final String header = latin1.decode(
+    bytes.sublist(headerStart, headerStart + headerLen),
+  );
+  final String descr =
+      RegExp(r"'descr'\s*:\s*'([^']+)'").firstMatch(header)?.group(1) ?? '';
+  if (RegExp(r"'fortran_order'\s*:\s*True").hasMatch(header)) {
+    throw const FormatException('.npy 为 Fortran 序，不支持');
+  }
+  final String shapeText =
+      RegExp(r"'shape'\s*:\s*\(([^)]*)\)").firstMatch(header)?.group(1) ?? '';
+  final List<int> shape = <int>[
+    for (final String part in shapeText.split(','))
+      if (part.trim().isNotEmpty) int.parse(part.trim()),
+  ];
+  final int count = shape.fold<int>(1, (int a, int b) => a * b);
+  final int dataStart = headerStart + headerLen;
+  final Float32List data = Float32List(count);
+  if (descr == '<f4') {
+    for (int i = 0; i < count; i++) {
+      data[i] = view.getFloat32(dataStart + i * 4, Endian.little);
+    }
+  } else if (descr == '<f8') {
+    for (int i = 0; i < count; i++) {
+      data[i] = view.getFloat64(dataStart + i * 8, Endian.little);
+    }
+  } else {
+    throw FormatException('.npy dtype 不支持：$descr');
+  }
+  return (shape: shape, data: data);
 }
