@@ -696,7 +696,7 @@ class FfmpegAsrPcmSource implements AsrPcmSource {
             '(executable=${result.executable}); falling back to mov container',
           );
           _deleteQuietly(output);
-          return _decodeBlock(
+          return await _decodeBlock(
             audioPath: audioPath,
             workDir: workDir,
             index: index,

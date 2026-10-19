@@ -25,15 +25,35 @@ Float32List _signal(double seconds, List<(double, double)> dips) {
 double _wavSeconds(String path) =>
     (File(path).lengthSync() - 44) / 2 / kAsrSampleRate;
 
-/// 假 CLI：按 [respond] 的结果写 `--text-out`，记录每次调用。
+/// audio.cpp v0.9.2 CUDA 版 `--list-devices` 的真实 stderr 形态（双卡）。
+const String _kTwoCudaDevicesStderr =
+    'ggml_cuda_init: found 2 CUDA devices (Total VRAM: 40000 MiB):\n'
+    '  Device 0: NVIDIA GeForce GTX 1080 Ti, compute capability 6.1, VMM: yes, '
+    'VRAM: 11264 MiB\n'
+    '  Device 1: NVIDIA GeForce RTX 3060, compute capability 8.6, VMM: yes, '
+    'VRAM: 12288 MiB\n'
+    'load_backend: loaded CUDA backend from ggml-cuda.dll\n';
+
+/// 假 CLI：按 [respond] 的结果写 `--text-out`，记录每次调用。`--list-devices`
+/// 单独记在 [listCalls]，按 [listDevicesStderr] 回答。
 class _FakeCli {
-  _FakeCli(this.respond);
+  _FakeCli(this.respond, {this.listDevicesStderr = _kTwoCudaDevicesStderr});
 
   /// 入参：本块时长；返回 (退出码, stderr, 原始流文本)。
   final (int, String, String) Function(double seconds) respond;
+  final String listDevicesStderr;
   final List<StartedCall> calls = <StartedCall>[];
+  final List<StartedCall> listCalls = <StartedCall>[];
 
   Future<Process> start(String executable, List<String> arguments) async {
+    if (arguments.contains('--list-devices')) {
+      final FakeProcess process = FakeProcess(
+        stdoutText: 'available_devices=1\n',
+        stderrText: listDevicesStderr,
+      );
+      listCalls.add(StartedCall(executable, arguments, process));
+      return process;
+    }
     final double seconds = _wavSeconds(
       arguments[arguments.indexOf('--audio') + 1],
     );
@@ -265,6 +285,133 @@ void main() {
       startProcess: cli.start,
     ).run(pcm, workDir: work);
     expect(cli.calls, hasLength(2));
+  });
+
+  test('空音频：直接返回空结果，不起 CLI', () async {
+    final List<MossProgress> progress = <MossProgress>[];
+    final MossTranscript t = await MossRunner(
+      cliPath: 'cli',
+      modelPath: _model(tmp),
+      backend: AudioCppBackend.cuda,
+      startProcess: (String e, List<String> args) => fail('不应起进程：$args'),
+    ).run(
+      Float32List(0),
+      workDir: Directory(p.join(tmp.path, 'job')),
+      onProgress: progress.add,
+    );
+    expect(t.cues, isEmpty);
+    expect(t.chunkCount, 0);
+    expect(t.splitCount, 0);
+    expect(t.audioSeconds, 0);
+    expect(progress.single.fraction, 1);
+  });
+
+  group('后端与设备', () {
+    test('CUDA 不传 device：按 CLI 枚举选序号最小的达标卡（不是 0 号卡），只探一次', () async {
+      final _FakeCli cli = _FakeCli((double s) => (0, '', '[0][S01]x[1]'));
+      await MossRunner(
+        cliPath: 'cli',
+        modelPath: _model(tmp),
+        backend: AudioCppBackend.cuda,
+        chunkSeconds: 30,
+        startProcess: cli.start,
+      ).run(
+        _signal(70, <(double, double)>[(28.0, 28.6)]),
+        workDir: Directory(p.join(tmp.path, 'job')),
+      );
+      expect(cli.listCalls, hasLength(1));
+      expect(cli.listCalls.single.arguments, <String>['--list-devices']);
+      expect(cli.calls, hasLength(2));
+      for (final StartedCall c in cli.calls) {
+        expect(c.arg('--backend'), 'cuda');
+        expect(c.arg('--device'), '1');
+      }
+    });
+
+    test('CUDA 卡都不达标：抛 MossRunException，不跑块', () async {
+      final _FakeCli cli = _FakeCli(
+        (double s) => (0, '', '[0][S01]x[1]'),
+        listDevicesStderr:
+            '  Device 0: Quadro P4000, compute capability 6.1, VMM: yes\n',
+      );
+      await expectLater(
+        MossRunner(
+          cliPath: 'cli',
+          modelPath: _model(tmp),
+          backend: AudioCppBackend.cuda,
+          startProcess: cli.start,
+        ).run(_signal(20, const <(double, double)>[]),
+            workDir: Directory(p.join(tmp.path, 'job'))),
+        throwsA(isA<MossRunException>().having(
+            (MossRunException e) => e.message, 'message', contains('7.5'))),
+      );
+      expect(cli.calls, isEmpty);
+    });
+
+    test('CUDA 枚举不到任何设备：抛 MossRunException', () async {
+      final _FakeCli cli = _FakeCli(
+        (double s) => (0, '', '[0][S01]x[1]'),
+        listDevicesStderr: '',
+      );
+      await expectLater(
+        MossRunner(
+          cliPath: 'cli',
+          modelPath: _model(tmp),
+          backend: AudioCppBackend.cuda,
+          startProcess: cli.start,
+        ).run(_signal(20, const <(double, double)>[]),
+            workDir: Directory(p.join(tmp.path, 'job'))),
+        throwsA(isA<MossRunException>()),
+      );
+      expect(cli.calls, isEmpty);
+    });
+
+    test('显式 device：原样传，不枚举', () async {
+      final _FakeCli cli = _FakeCli((double s) => (0, '', '[0][S01]x[1]'));
+      await MossRunner(
+        cliPath: 'cli',
+        modelPath: _model(tmp),
+        backend: AudioCppBackend.cuda,
+        device: 0,
+        startProcess: cli.start,
+      ).run(_signal(20, const <(double, double)>[]),
+          workDir: Directory(p.join(tmp.path, 'job')));
+      expect(cli.listCalls, isEmpty);
+      expect(cli.calls.single.arg('--device'), '0');
+    });
+
+    test('非 CUDA 后端：不枚举、不传 --device', () async {
+      final _FakeCli cli = _FakeCli((double s) => (0, '', '[0][S01]x[1]'));
+      await MossRunner(
+        cliPath: 'cli',
+        modelPath: _model(tmp),
+        backend: AudioCppBackend.vulkan,
+        startProcess: cli.start,
+      ).run(_signal(20, const <(double, double)>[]),
+          workDir: Directory(p.join(tmp.path, 'job')));
+      expect(cli.listCalls, isEmpty);
+      expect(cli.calls.single.arguments, isNot(contains('--device')));
+    });
+
+    test('不传 backend：按清单取当前平台实际有 CLI 的后端', () {
+      final MossRunner runner =
+          MossRunner(cliPath: 'cli', modelPath: _model(tmp));
+      expect(runner.backend, defaultMossBackendFor(currentAudioCppPlatform()));
+      if (Platform.isLinux) {
+        expect(runner.backend, AudioCppBackend.vulkan);
+      }
+    });
+
+    test('forRuntime：CLI 与后端都跟着运行库走', () {
+      final AudioCppRuntimePack pack = audioCppRuntimePackFor(
+          AudioCppPlatform.linuxX64, AudioCppBackend.vulkan)!;
+      final AudioCppRuntimeStore store =
+          AudioCppRuntimeStore(Directory(p.join(tmp.path, 'rt')), pack);
+      final MossRunner runner =
+          MossRunner.forRuntime(store, modelPath: _model(tmp));
+      expect(runner.backend, AudioCppBackend.vulkan);
+      expect(runner.cliPath, store.executable.path);
+    });
   });
 
   test('取消：杀掉正在跑的子进程并抛 AsrCancelledException', () async {

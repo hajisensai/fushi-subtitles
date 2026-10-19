@@ -174,6 +174,7 @@ dart analyze packages
 cd packages/asr_core && dart test        # 326 тестов
 cd packages/asr_onnx_ffi && dart test    # 15 тестов, нужен настоящий onnxruntime (без него группа пропускается)
 cd packages/asr_align && dart test       # 15 тестов
+cd packages/asr_subtitles && dart test   # 104 теста
 cd packages/asr && dart test             # 10 тестов
 cd packages/asr_server && dart test      # 10 тестов
 ```

@@ -39,12 +39,14 @@ void main() {
         },
         executablePath: r'D:\app\fushi-subs.exe',
         managedDir: r'D:\data\asr_runtime\ort',
+        // Windows 专属逻辑：显式用 Windows 路径风格，不依赖跑测试的宿主。
+        pathContext: p.windows,
       );
       expect(c, <String>[
         r'X:\dml\DirectML.dll',
-        p.join(r'D:\app', 'DirectML.dll'),
-        p.join(r'D:\data\asr_runtime\ort', 'DirectML.dll'),
-        p.join(r'C:\Windows', 'System32', 'DirectML.dll'),
+        r'D:\app\DirectML.dll',
+        r'D:\data\asr_runtime\ort\DirectML.dll',
+        r'C:\Windows\System32\DirectML.dll',
       ]);
     });
 

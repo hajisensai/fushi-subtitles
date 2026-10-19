@@ -15,6 +15,17 @@
 ///    尾部；
 /// 5. 结果按 start 排序（稳定）。
 ///
+/// 空音频（0 个样本）直接返回空结果，不起 CLI——一个只有 44 字节头的 wav 喂给
+/// CLI 只会失败。
+///
+/// 后端与设备：不传 [MossRunner.backend] 时按清单取这个平台实际发布了 CLI 的
+/// 后端（[defaultMossBackendFor]：Windows = cuda、Linux = vulkan）；要结合显卡
+/// 探测选，用 [chooseMossBackend]，或直接 [MossRunner.forRuntime] 跟着已下载的
+/// 运行库走。CUDA 后端且不传 [MossRunner.device] 时，第一次真要起 CLI 前跑一次
+/// `--list-devices`，选计算能力达标的卡显式传 `--device`
+/// （[selectMossCudaDevice]），与 [judgeMossCudaAvailability] 判可用的口径一致；
+/// 一张都不达标抛 [MossRunException]。
+///
 /// 进程一律经注入的 [AsrProcessStarter] 启动——宿主（Fushi）要把它登记进自己的
 /// 子进程表，本包不依赖那一套。
 ///
@@ -34,6 +45,8 @@ import 'package:path/path.dart' as p;
 import 'package:fushi_asr_core/src/asr/asr_types.dart';
 import 'package:fushi_asr_core/src/moss/asr_quiet_cuts.dart';
 import 'package:fushi_asr_core/src/moss/audiocpp_manifest.dart';
+import 'package:fushi_asr_core/src/moss/audiocpp_store.dart';
+import 'package:fushi_asr_core/src/moss/nvidia_gpu_probe.dart';
 import 'package:fushi_asr_core/src/util/asr_process.dart';
 
 /// audio.cpp 里 MOSS 的 family 名。
@@ -288,7 +301,7 @@ class MossRunner {
   MossRunner({
     required this.cliPath,
     required this.modelPath,
-    this.backend = AudioCppBackend.cuda,
+    AudioCppBackend? backend,
     this.threads = 8,
     this.maxTokens = 8192,
     this.chunkSeconds = 300,
@@ -296,7 +309,8 @@ class MossRunner {
     this.instruct,
     this.device,
     AsrProcessStarter? startProcess,
-  }) : _startProcess = startProcess ?? defaultAsrProcessStarter {
+  })  : backend = backend ?? defaultMossBackendFor(currentAudioCppPlatform()),
+        _startProcess = startProcess ?? defaultAsrProcessStarter {
     if (!modelPath.toLowerCase().endsWith('.gguf')) {
       // audio.cpp 按扩展名认格式：不是 .gguf 结尾会被当成别的格式加载失败。
       throw ArgumentError.value(modelPath, 'modelPath', '必须以 .gguf 结尾');
@@ -306,8 +320,36 @@ class MossRunner {
   /// `audiocpp_cli` 可执行文件。
   final String cliPath;
 
+  /// 跟着已下载的运行库走：CLI 取 [AudioCppRuntimeStore.executable]，后端取
+  /// 运行库自己的后端（[AudioCppRuntimePack.backend]），两者不会对不上。
+  factory MossRunner.forRuntime(
+    AudioCppRuntimeStore runtime, {
+    required String modelPath,
+    int threads = 8,
+    int maxTokens = 8192,
+    double chunkSeconds = 300,
+    double splitMinSeconds = 40,
+    String? instruct,
+    int? device,
+    AsrProcessStarter? startProcess,
+  }) =>
+      MossRunner(
+        cliPath: runtime.executable.path,
+        modelPath: modelPath,
+        backend: runtime.pack.backend,
+        threads: threads,
+        maxTokens: maxTokens,
+        chunkSeconds: chunkSeconds,
+        splitMinSeconds: splitMinSeconds,
+        instruct: instruct,
+        device: device,
+        startProcess: startProcess,
+      );
+
   /// MOSS GGUF 权重。
   final String modelPath;
+
+  /// `--backend`。构造时不传则为 [defaultMossBackendFor] 当前平台的值。
   final AudioCppBackend backend;
   final int threads;
 
@@ -323,10 +365,14 @@ class MossRunner {
   /// 可选 `--instruct`（如带热词提示的转写指令）；null = 模型默认指令。
   final String? instruct;
 
-  /// 可选 `--device`。
+  /// 可选 `--device`（CLI 后端内的设备序号）。CUDA 后端不传时自动选达标的卡，
+  /// 见文件头「后端与设备」；其它后端不传就交给 CLI 默认。
   final int? device;
 
   final AsrProcessStarter _startProcess;
+
+  /// CUDA 自动选出的设备序号（每个 runner 只探一次）。
+  int? _autoCudaDevice;
 
   /// 跑完整段 [samples]（16 kHz 单声道 float32）。
   ///
@@ -338,6 +384,21 @@ class MossRunner {
     AsrCancellationToken? cancellation,
     void Function(MossProgress progress)? onProgress,
   }) async {
+    if (samples.isEmpty) {
+      onProgress?.call(const MossProgress(
+        processedSeconds: 0,
+        totalSeconds: 0,
+        completedChunks: 0,
+        splitCount: 0,
+      ));
+      return const MossTranscript(
+        cues: <MossCue>[],
+        chunkEdgesSeconds: <double>[0],
+        chunkCount: 0,
+        splitCount: 0,
+        audioSeconds: 0,
+      );
+    }
     await workDir.create(recursive: true);
     final double total = samples.length / kAsrSampleRate;
     final List<double> cuts =
@@ -464,6 +525,7 @@ class MossRunner {
     final File wav = File(p.join(workDir.path, '$stem.wav'));
     final File txt = File(p.join(workDir.path, '$stem.txt'));
     final File seg = File(p.join(workDir.path, '$stem.seg.json'));
+    final int? deviceArg = await _deviceArgument(cancellation);
     try {
       await wav.writeAsBytes(encodePcm16Wav(pcm), flush: true);
       _deleteIfExists(txt);
@@ -478,7 +540,7 @@ class MossRunner {
           modelPath,
           '--backend',
           backend.cliValue,
-          if (device != null) ...<String>['--device', '$device'],
+          if (deviceArg != null) ...<String>['--device', '$deviceArg'],
           '--threads',
           '$threads',
           '--audio',
@@ -532,6 +594,33 @@ class MossRunner {
       _deleteIfExists(txt);
       _deleteIfExists(seg);
     }
+  }
+
+  /// 本次要传的 `--device`：显式给了就用；CUDA 后端没给时经 `--list-devices`
+  /// 选达标的卡（结果缓存在 runner 上）；其它后端为 null（CLI 默认）。
+  Future<int?> _deviceArgument(AsrCancellationToken? cancellation) async {
+    if (device != null) return device;
+    if (backend != AudioCppBackend.cuda) return null;
+    final int? cached = _autoCudaDevice;
+    if (cached != null) return cached;
+    final List<AudioCppCudaDevice> devices = await listAudioCppCudaDevices(
+      cliPath,
+      startProcess: _startProcess,
+      cancellation: cancellation,
+    );
+    final AudioCppCudaDevice? chosen = selectMossCudaDevice(devices);
+    if (chosen == null) {
+      throw MossRunException(
+        message: devices.isEmpty
+            ? 'audiocpp_cli --list-devices 没有列出任何 CUDA 设备'
+            : 'CUDA 设备计算能力都低于 7.5：${devices.join('、')}',
+        exitCode: -1,
+        stderrTail: '',
+        chunkStartSeconds: 0,
+        chunkEndSeconds: 0,
+      );
+    }
+    return _autoCudaDevice = chosen.index;
   }
 
   /// 块指纹：参数 + 该块 PCM 字节的 sha256（分块喂入，不复制 PCM）。

@@ -1,0 +1,37 @@
+name: CI
+
+# PR 与 main 上的门禁：跑 README「Development」一节写的同一条检查
+# （script/check.sh：dart pub get → dart analyze packages → 逐包 dart test）。
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+env:
+  # 与宿主 Fushi 一致：Flutter 3.47.6 自带 Dart 3.13.5。
+  DART_VERSION: '3.13.5'
+
+jobs:
+  check:
+    name: analyze + test
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dart-lang/setup-dart@v1
+        with:
+          sdk: ${{ env.DART_VERSION }}
+      - name: Show toolchain
+        run: dart --version
+      - name: script/check.sh
+        # 防御：单测各有 30 s 默认超时，但整套挂住（服务器 stop 等不完、进程不退）
+        # 时不该吃满 job 的 30 分钟才报。修法在代码里，这里只是让它早点红。
+        timeout-minutes: 15
+        run: ./script/check.sh

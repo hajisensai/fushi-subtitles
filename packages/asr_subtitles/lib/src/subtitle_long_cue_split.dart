@@ -16,6 +16,8 @@
 ///    到 token 字符流，切点 = 下一句第一个字的开始时间 − 0.1 s，且不早于上一字的
 ///    结束时间。没有 token 时间时退回按字数比例分时长。
 /// 3. **夹紧**：所有切点夹在 `[起点 + 0.3 s, 终点 − 0.3 s]`，相邻切点至少隔 0.3 s。
+///    切点一律先取整到毫秒再夹紧、再比较：浮点切点各自取整后可能落在同一毫秒，
+///    那样会产出零时长条目。两条路径对「夹不下」的处理不同，见下文差异。
 ///
 /// 不按 token 时间裁掉条目首尾的静音：同一批实测里那样做时间轴 IoU 反而从 0.773
 /// 降到 0.755。
@@ -30,7 +32,11 @@
 /// 与 Python 原型的其他差异（都是有意的）：
 /// - 句末之后紧跟的闭合括号 / 引号（`」』）)` 等）并进前一句，不会被甩到下一条开头。
 /// - 夹紧之后切点若仍落在 cue 之外（条目太短、切点太多），丢掉这个切点（相邻两片
-///   合并），不产出时长为负的条目。
+///   合并），不产出时长为负或为零的条目。
+/// - 按字数比例的退路（没有 token 时间）没有原型约束，夹紧是**硬的**：cue 短于
+///   两倍边距（`[起点 + 0.3 s, 终点 − 0.3 s]` 是空区间）时整条不拆；被最小间隔
+///   推过 `终点 − 0.3 s` 的切点丢掉（相邻两片合并）。token 路径为与原型逐条一致，
+///   保留原型「夹紧后仍在 cue 内就留」的口径。
 library;
 
 import 'package:fushi_asr_core/asr_core.dart' show AsrCueTokenTiming;
@@ -306,15 +312,11 @@ List<SubtitleCueWithTokenTiming> splitLongSubtitleCueWithTokenTiming(
     cuts = _pauseCut(text, tokenTiming!, map, options);
   }
   if (cuts.isEmpty) return unchanged;
-  final double lo = options.edgeMarginMs.toDouble();
-  final double hi = (durationMs - options.edgeMarginMs).toDouble();
-  final List<double> times = <double>[
-    for (final int k in cuts) _clamp(boundaryTime(k), lo, hi),
-  ];
-  for (int i = 1; i < times.length; i++) {
-    final double floor = times[i - 1] + options.minPieceGapMs;
-    if (times[i] < floor) times[i] = floor;
-  }
+  final List<int> times = _clampedCutTimes(
+    <double>[for (final int k in cuts) boundaryTime(k)],
+    durationMs,
+    options,
+  );
   final List<_Piece>? pieces = _pieces(cue, text, cuts, times);
   if (pieces == null) return unchanged;
   // 每片在字符流里的起点：第一片从 0 起，其余取切点的对齐位置。
@@ -408,8 +410,10 @@ class _Piece {
   final int textStart;
 }
 
-/// 按字数比例分时长（没有 token 时间时）：切点 = 起点 + 时长 × 偏移 / 总字数。
-/// 没有切点时返回 null。
+/// 按字数比例分时长（没有 token 时间时）：切点 = 起点 + 时长 × 偏移 / 总字数，
+/// 再按 [SubtitleLongCueSplitOptions.edgeMarginMs] /
+/// [SubtitleLongCueSplitOptions.minPieceGapMs] 硬夹紧（见文件头「差异」）。
+/// 没有切点、或 cue 短到容不下两侧边距时返回 null（= 不拆）。
 List<_Piece>? _splitProportional(
   SubtitleCue cue,
   List<int> text,
@@ -418,26 +422,61 @@ List<_Piece>? _splitProportional(
   final List<int> cuts = _sentenceCuts(text, options.minPieceChars);
   if (cuts.isEmpty) return null;
   final int duration = cue.endMs - cue.startMs;
-  return _pieces(cue, text, cuts, <double>[
-    for (final int k in cuts) duration * k / text.length,
-  ]);
+  final int hi = duration - options.edgeMarginMs;
+  // 容不下 [边距, 时长 − 边距] 这个区间：切哪儿都违反边距，整条不拆。
+  if (hi < options.edgeMarginMs) return null;
+  final List<int> times = _clampedCutTimes(
+    <double>[for (final int k in cuts) duration * k / text.length],
+    duration,
+    options,
+  );
+  final List<int> keptCuts = <int>[];
+  final List<int> keptTimes = <int>[];
+  for (int i = 0; i < cuts.length; i++) {
+    // 被最小间隔推过上界的切点丢掉；后面的切点只会更晚，一并丢掉。
+    if (times[i] > hi) break;
+    keptCuts.add(cuts[i]);
+    keptTimes.add(times[i]);
+  }
+  return _pieces(cue, text, keptCuts, keptTimes);
 }
 
-/// 按切点（码点偏移）与切点时刻（相对 cue 起点）组装各片；去掉首尾空白后为空的
-/// 片段不输出，落在 cue 之外 / 不递增的切点丢掉（相邻两片合并）。一个切点都不剩时
-/// 返回 null（= 不拆）。
+/// 切点时刻（相对 cue 起点，毫秒）的公共夹紧：先取整到毫秒，再夹进
+/// `[边距, 时长 − 边距]`（与原型 `min(max(v, lo), hi)` 同序：区间为空时取上界），
+/// 再保证相邻切点至少隔 [SubtitleLongCueSplitOptions.minPieceGapMs]。整数运算，
+/// 结果与「浮点夹紧后再取整」相同，但后续比较不会被取整打穿。
+List<int> _clampedCutTimes(
+  List<double> raw,
+  int durationMs,
+  SubtitleLongCueSplitOptions options,
+) {
+  final int lo = options.edgeMarginMs;
+  final int hi = durationMs - options.edgeMarginMs;
+  final List<int> times = <int>[
+    for (final double v in raw) _clampInt(v.round(), lo, hi),
+  ];
+  for (int i = 1; i < times.length; i++) {
+    final int floor = times[i - 1] + options.minPieceGapMs;
+    if (times[i] < floor) times[i] = floor;
+  }
+  return times;
+}
+
+/// 按切点（码点偏移）与切点时刻（相对 cue 起点，整数毫秒）组装各片；去掉首尾
+/// 空白后为空的片段不输出，落在 cue 之外 / 不严格递增的切点丢掉（相邻两片合并），
+/// 所以每片时长都 > 0。一个切点都不剩时返回 null（= 不拆）。
 List<_Piece>? _pieces(
   SubtitleCue cue,
   List<int> text,
   List<int> cuts,
-  List<double> times,
+  List<int> times,
 ) {
   final int duration = cue.endMs - cue.startMs;
   final List<int> keptCuts = <int>[];
-  final List<double> keptTimes = <double>[];
+  final List<int> keptTimes = <int>[];
   for (int i = 0; i < cuts.length; i++) {
-    final double t = times[i];
-    final double prev = keptTimes.isEmpty ? 0 : keptTimes.last;
+    final int t = times[i];
+    final int prev = keptTimes.isEmpty ? 0 : keptTimes.last;
     if (t <= prev || t >= duration) continue;
     keptCuts.add(cuts[i]);
     keptTimes.add(t);
@@ -446,7 +485,7 @@ List<_Piece>? _pieces(
   final List<int> edges = <int>[0, ...keptCuts, text.length];
   final List<int> bounds = <int>[
     cue.startMs,
-    for (final double t in keptTimes) cue.startMs + t.round(),
+    for (final int t in keptTimes) cue.startMs + t,
     cue.endMs,
   ];
   final List<_Piece> out = <_Piece>[];
@@ -469,9 +508,9 @@ List<_Piece>? _pieces(
   return out;
 }
 
-double _clamp(double v, double lo, double hi) {
+int _clampInt(int v, int lo, int hi) {
   // 与原型 `min(max(v, lo), hi)` 同序：lo > hi 时取 hi。
-  final double a = v > lo ? v : lo;
+  final int a = v > lo ? v : lo;
   return a < hi ? a : hi;
 }
 

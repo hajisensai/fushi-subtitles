@@ -284,7 +284,11 @@ class AsrServer {
           response.add(utf8.encode('${jsonEncode(json)}\n'));
         }
 
-        emit(<String, Object?>{'phase': 'download', 'processedMs': 0, 'totalMs': 0});
+        emit(<String, Object?>{
+          'phase': 'download',
+          'processedMs': 0,
+          'totalMs': 0
+        });
         await response.flush();
         try {
           await for (final ModelDownloadEvent e
@@ -720,11 +724,22 @@ class AsrServer {
       },
       cancelOnError: false,
     );
+    // 停止转发：之后到的请求体只计数、读掉。中继因背压暂停过时 body 也跟着暂停，
+    // 而中继被取消**不会**回调 onResume——不在这里恢复，剩下的请求体永远读不到，
+    // onDone 不来、bodyDone 永不完成，请求就挂住、400 也发不出去（请求体分几次
+    // 到达、解析器在中途报错时必现：Linux CI 上整个 job 挂到超时）。
+    void stopForwarding() {
+      relayOpen = false;
+      while (body.isPaused) {
+        body.resume();
+      }
+    }
+
     relay
       ..onPause = body.pause
       ..onResume = body.resume
       // 解析器取消 = 停止转发，但订阅仍归我们，剩余请求体继续读掉。
-      ..onCancel = () => relayOpen = false;
+      ..onCancel = stopForwarding;
 
     try {
       await _guardMultipart(() async {
@@ -771,11 +786,10 @@ class AsrServer {
         }
       });
     } finally {
-      if (relayOpen) {
-        relayOpen = false;
-        // 不 await：中继的 done 要等解析器那侧消费，这里只要求停止转发。
-        unawaited(relay.close());
-      }
+      final bool wasForwarding = relayOpen;
+      stopForwarding();
+      // 不 await：中继的 done 要等解析器那侧消费，这里只要求停止转发。
+      if (wasForwarding) unawaited(relay.close());
       drainLimit = drained + kUploadDrainSlackBytes;
       await bodyDone.future;
       await body.cancel();

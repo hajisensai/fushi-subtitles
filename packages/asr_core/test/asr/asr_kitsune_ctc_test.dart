@@ -74,24 +74,22 @@ class _KitsuneSession implements OnnxSession {
         for (int t = 0; t < outT; t++) plan(r, t),
     ];
     return <String, OnnxTensor>{
-      AsrModelIo.ctcOutputIds:
-          floatIds
-              ? OnnxTensor.float32(
-                Float32List.fromList(<double>[
-                  for (final int v in ids) v * 1.0,
-                ]),
-                <int>[rows, outT],
-              )
-              : OnnxTensor.int64(Int64List.fromList(ids), <int>[rows, outT]),
-      AsrModelIo.ctcOutputLengths:
-          floatIds
-              ? OnnxTensor.float32(
-                Float32List.fromList(<double>[
-                  for (final int v in outLens) v * 1.0,
-                ]),
-                <int>[rows],
-              )
-              : OnnxTensor.int64(outLens, <int>[rows]),
+      AsrModelIo.ctcOutputIds: floatIds
+          ? OnnxTensor.float32(
+              Float32List.fromList(<double>[
+                for (final int v in ids) v * 1.0,
+              ]),
+              <int>[rows, outT],
+            )
+          : OnnxTensor.int64(Int64List.fromList(ids), <int>[rows, outT]),
+      AsrModelIo.ctcOutputLengths: floatIds
+          ? OnnxTensor.float32(
+              Float32List.fromList(<double>[
+                for (final int v in outLens) v * 1.0,
+              ]),
+              <int>[rows],
+            )
+          : OnnxTensor.int64(outLens, <int>[rows]),
     };
   }
 
@@ -117,13 +115,13 @@ AsrSpeechSegment _segment(int samples) {
 
 /// 帧 0 `「`、帧 1 `▁今日`（帧 2 重复）、帧 3 纯 `▁`、帧 5 `は`、帧 9 `。`，其余 blank。
 int _plan(int row, int t) => switch (t) {
-  0 => 5,
-  1 || 2 => 2,
-  3 => 1,
-  5 => 3,
-  9 => 4,
-  _ => 6,
-};
+      0 => 5,
+      1 || 2 => 2,
+      3 => 1,
+      5 => 3,
+      9 => 4,
+      _ => 6,
+    };
 
 void main() {
   final AsrTokenTable tokens = AsrTokenTable.parse(

@@ -155,6 +155,7 @@ dart analyze packages
 cd packages/asr_core && dart test        # 326 條測試
 cd packages/asr_onnx_ffi && dart test    # 15 條測試，需要真的 onnxruntime（沒有就整組 skip）
 cd packages/asr_align && dart test       # 15 條測試
+cd packages/asr_subtitles && dart test   # 104 條測試
 cd packages/asr && dart test             # 10 條測試
 cd packages/asr_server && dart test      # 10 條測試
 ```

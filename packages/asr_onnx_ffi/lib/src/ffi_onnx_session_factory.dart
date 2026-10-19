@@ -29,14 +29,16 @@ import 'coreml_specialization.dart';
 /// 顺序必须与上游头文件一致（`SessionOptionsAppendExecutionProvider_DML` 是第一
 /// 个成员，后面是 DML1 / CreateGPUAllocationFromD3DResource / …），取错就是调到
 /// 别的函数上。
-// ignore: non_constant_identifier_names —— 成员名必须与 C 头文件一致
 final class OrtDmlApi extends Struct {
   external Pointer<
-      NativeFunction<
-          Pointer<OrtStatus> Function(
-            Pointer<OrtSessionOptions> options,
-            Int device_id,
-          )>> SessionOptionsAppendExecutionProvider_DML;
+          NativeFunction<
+              Pointer<OrtStatus> Function(
+                Pointer<OrtSessionOptions> options,
+                Int deviceId,
+              )>>
+      // 成员名与 C 头文件一致，便于对照上游（Struct 按位置取成员，名字不进 ABI）。
+      // ignore: non_constant_identifier_names
+      SessionOptionsAppendExecutionProvider_DML;
 }
 
 /// 纯 Dart 的 ONNX 会话工厂。
