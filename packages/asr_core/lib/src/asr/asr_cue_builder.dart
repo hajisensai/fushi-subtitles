@@ -210,6 +210,59 @@ class AsrCueBuilder {
     return out;
   }
 
+  /// 「按给定分段识别」的建 cue：**一段一条 cue**，时间严格沿用给定分段
+  /// （段的 `rawStartMs` / `rawEndMs`，即 `AsrFixedSegmenter` 写进去的原始分段；
+  /// 缺失时退回段起止）。
+  ///
+  /// 与 [build] 的差别都是有意的：
+  /// - 不按句末标点 / token 间隙再切——分段来自外部系统（MOSS），切点由它负责，
+  ///   多句长条的拆分是显示后处理的事（`fushi_asr_subtitles` 的长条拆分）。
+  /// - 不做跨段「不重叠」兜底——给定分段本身就可能重叠（多人同时说话），
+  ///   改掉任何一个时间都违背「严格沿用」。
+  /// - 识别为空、或只剩标点的段不出 cue；SRT 与 tokens sidecar 由同一份 cue
+  ///   列表写出，行号照样一一对应。
+  List<AsrCue> buildOnePerSegment(
+    List<AsrTranscribedSegment> segments, {
+    List<int> fileOffsetsMs = const <int>[],
+  }) {
+    final List<AsrTranscribedSegment> ordered =
+        List<AsrTranscribedSegment>.of(segments)
+          ..sort((AsrTranscribedSegment a, AsrTranscribedSegment b) {
+            final int byFile = a.audioFileIndex.compareTo(b.audioFileIndex);
+            if (byFile != 0) return byFile;
+            final int byStart = (a.rawStartMs ?? a.startMs).compareTo(
+              b.rawStartMs ?? b.startMs,
+            );
+            return byStart != 0
+                ? byStart
+                : (a.rawEndMs ?? a.endMs).compareTo(b.rawEndMs ?? b.endMs);
+          });
+    final List<AsrCue> out = <AsrCue>[];
+    for (final AsrTranscribedSegment seg in ordered) {
+      if (seg.tokens.isEmpty) continue;
+      final String text = seg.tokens.join().trim();
+      if (text.isEmpty || _punctOnly.hasMatch(text)) continue;
+      final int offset = seg.audioFileIndex < fileOffsetsMs.length
+          ? fileOffsetsMs[seg.audioFileIndex]
+          : 0;
+      final int start = seg.rawStartMs ?? seg.startMs;
+      final int end = seg.rawEndMs ?? seg.endMs;
+      out.add(
+        AsrCue(
+          startMs: start + offset,
+          endMs: end + offset,
+          text: text,
+          audioFileIndex: seg.audioFileIndex,
+          tokens: seg.tokens,
+          tokenOffsetsMs: List<int>.unmodifiable(
+            seg.tokenTimesMs.map((int t) => math.max(0, t - start)),
+          ),
+        ),
+      );
+    }
+    return out;
+  }
+
   /// 滑窗产物（[AsrTranscribedSegment.continuous]）没有语音边界——段界是 12 s
   /// 一格的窗口网格。把同文件首尾相接的这类段拼回一条 token 流，在 token 起点
   /// 间隔超过 [silenceSplitMs] 处切成「伪语音段」，再交给常规的逐段建 cue：
@@ -318,9 +371,8 @@ class AsrCueBuilder {
 
       // 段首 cue 从 VAD 未外扩的语音起点开始：外扩 pad 只为喂模型防首字被吃，
       // 拿它当起点字幕会比人声早约半秒。缺 raw（旧检查点）时退回外扩边界。
-      int start = isFirst
-          ? (seg.rawStartMs ?? seg.startMs)
-          : firstTokenMs - leadInMs;
+      int start =
+          isFirst ? (seg.rawStartMs ?? seg.startMs) : firstTokenMs - leadInMs;
       if (cues.isNotEmpty && start < cues.last.endMs) start = cues.last.endMs;
       if (start < seg.startMs) start = seg.startMs;
 
@@ -510,8 +562,8 @@ List<({List<String> tokens, List<int> offsetsMs})>? parseAsrCueTokens(
     try {
       final Object? decoded = jsonDecode(line);
       if (decoded is! Map<String, Object?>) return null;
-      final List<String> tokens = (decoded['t'] as List<Object?>)
-          .cast<String>();
+      final List<String> tokens =
+          (decoded['t'] as List<Object?>).cast<String>();
       final List<int> offsets = (decoded['o'] as List<Object?>)
           .map((Object? v) => (v as num).toInt())
           .toList(growable: false);
@@ -551,7 +603,7 @@ List<int> asrFileOffsetsFromDurations(List<int> fileDurationsMs) {
 @immutable
 class AsrCueTokenTiming {
   const AsrCueTokenTiming({required this.tokens, required this.offsetsMs})
-    : assert(tokens.length == offsetsMs.length);
+      : assert(tokens.length == offsetsMs.length);
 
   final List<String> tokens;
   final List<int> offsetsMs;

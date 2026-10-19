@@ -30,6 +30,7 @@ import 'package:meta/meta.dart';
 
 import 'package:fushi_asr_core/src/asr/asr_encoder_buckets.dart';
 import 'package:fushi_asr_core/src/asr/asr_engine.dart';
+import 'package:fushi_asr_core/src/asr/asr_fixed_segmenter.dart';
 import 'package:fushi_asr_core/src/asr/asr_model_manifest.dart';
 import 'package:fushi_asr_core/src/asr/asr_model_store.dart';
 import 'package:fushi_asr_core/src/asr/asr_pcm_bridge.dart';
@@ -60,7 +61,12 @@ class AsrIsolateJobSpec {
     this.materialMs,
     this.greedySessions,
     this.greedyIntraOpThreads,
+    this.segments,
   });
+
+  /// 「按给定分段识别」的分段（见 [AsrTranscriptionService.start]）；null = 用
+  /// 内部切段器。[AsrSegmentSpan] 是纯数据，原样跨 isolate。
+  final List<AsrSegmentSpan>? segments;
 
   /// 见 [AsrTranscriptionService.greedySessions] / `greedyIntraOpThreads`。
   final int? greedySessions;
@@ -434,6 +440,7 @@ Future<void> _isolateMain(_IsolateArgs args) async {
       segmenter: buildAsrSegmenter(
         profile: spec.audioProfile,
         sessions: sessions,
+        segments: spec.segments,
       ),
       decoder: decoder,
       batchSize: spec.batchSize ??
@@ -443,6 +450,7 @@ Future<void> _isolateMain(_IsolateArgs args) async {
       chunkSeconds: spec.chunkSeconds,
       statsProvider: () => decoder.stats,
       usePipeline: spec.usePipeline,
+      oneCuePerSegment: spec.segments != null,
     );
     job = j;
     if (pauseBeforeStart) j.requestPause(discardPending: discardPending);

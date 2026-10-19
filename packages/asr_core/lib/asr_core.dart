@@ -15,6 +15,7 @@ export 'src/asr/asr_encoder_buckets.dart';
 export 'src/asr/asr_energy_envelope.dart';
 export 'src/asr/asr_engine.dart';
 export 'src/asr/asr_fbank.dart';
+export 'src/asr/asr_fixed_segmenter.dart';
 export 'src/asr/asr_nemo_mel.dart';
 export 'src/asr/asr_fbank_workers.dart';
 export 'src/asr/asr_fp16_graph.dart';
