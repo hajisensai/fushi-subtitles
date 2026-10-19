@@ -176,12 +176,18 @@ class DirectMlRuntime {
   }
 
   /// 候选序列，见文件头。
+  ///
+  /// 路径按 [pathContext] 的风格拆 / 拼，默认是宿主风格（[p.context]）——生产里
+  /// 只在 Windows 上调，宿主风格就是 Windows 风格。在别的宿主上验证 Windows 路径
+  /// 的拼法时显式传 [p.windows]：用 POSIX 风格拆 `D:\app\x.exe` 只会得到 `.`。
   static List<String> resolveCandidates({
     Map<String, String>? environment,
     String? executablePath,
     String? managedDir,
     String? systemRoot,
+    p.Context? pathContext,
   }) {
+    final p.Context ctx = pathContext ?? p.context;
     final Map<String, String> env = environment ?? Platform.environment;
     final String? override = env['ASR_DIRECTML_LIB'];
     final String exe = executablePath ?? Platform.resolvedExecutable;
@@ -189,10 +195,10 @@ class DirectMlRuntime {
     final String root = systemRoot ?? env['SystemRoot'] ?? r'C:\Windows';
     return <String>[
       if (override != null && override.trim().isNotEmpty) override.trim(),
-      p.join(p.dirname(exe), libraryFileName),
+      ctx.join(ctx.dirname(exe), libraryFileName),
       if (managed != null && managed.trim().isNotEmpty)
-        p.join(managed.trim(), libraryFileName),
-      p.join(root, 'System32', libraryFileName),
+        ctx.join(managed.trim(), libraryFileName),
+      ctx.join(root, 'System32', libraryFileName),
     ];
   }
 

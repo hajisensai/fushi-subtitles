@@ -31,4 +31,7 @@ jobs:
       - name: Show toolchain
         run: dart --version
       - name: script/check.sh
+        # 防御：单测各有 30 s 默认超时，但整套挂住（服务器 stop 等不完、进程不退）
+        # 时不该吃满 job 的 30 分钟才报。修法在代码里，这里只是让它早点红。
+        timeout-minutes: 15
         run: ./script/check.sh
