@@ -6,7 +6,7 @@ import 'package:fushi_asr_core/src/asr/asr_transducer_decoder.dart';
 import 'package:fushi_asr_core/src/asr/asr_types.dart';
 import 'package:fushi_asr_core/src/onnx/onnx_inference.dart';
 
-/// 词表：0=<blk> 1..8 = 字符，9=<unk>。
+/// 词表：0=`<blk>` 1..8 = 字符，9=`<unk>`。
 const String _tokensText =
     '<blk>\t0\nあ\t1\nい\t2\nう\t3\nえ\t4\nお\t5\nか\t6\nき\t7\nく\t8\n<unk>\t9\n';
 const int _vocab = 10;

@@ -1,3 +1,5 @@
+import 'dart:math' as math;
+
 import 'package:fushi_asr_core/asr_core.dart'
     show
         AsrCueTokenTiming,
@@ -985,6 +987,172 @@ void main() {
         (1000, 7000, 'あいうえお。'),
         (7000, 13000, 'かきくけこ。'),
       ]);
+    });
+  });
+
+  group('按字数比例：硬夹紧与整数毫秒切点', () {
+    test('cue 短于两倍边距（4 ms 装 80 字）→ 不拆，不出零时长条目', () {
+      final SubtitleCue c = _cue(1000, 1004, 'あいうえおかきくけこ。' * 8);
+      expect(subtitleCueNeedsSplit(c), isTrue);
+      expect(splitLongSubtitleCue(c), <SubtitleCue>[c]);
+    });
+
+    test('切点过早 → 夹到起点 + 0.3 s', () {
+      final String long = '${'か' * 200}。';
+      final List<SubtitleCue> out =
+          splitLongSubtitleCue(_cue(0, 8000, 'あいうえ。$long'));
+      expect(_flat(out), <(int, int, String)>[
+        (0, 300, 'あいうえ。'),
+        (300, 8000, long),
+      ]);
+    });
+
+    test('相邻切点至少隔 0.3 s；被推过终点 − 0.3 s 的切点丢掉（相邻合并）', () {
+      const String s = 'あいうえおかきく。';
+      final List<SubtitleCue> out = splitLongSubtitleCue(_cue(0, 1000, s * 5));
+      expect(_flat(out), <(int, int, String)>[
+        (0, 300, s),
+        (300, 600, s),
+        (600, 1000, s * 3),
+      ]);
+    });
+
+    test('边距与间隔为 0 时：取整后重合的切点丢掉，每片时长 > 0', () {
+      const SubtitleLongCueSplitOptions zero = SubtitleLongCueSplitOptions(
+        edgeMarginMs: 0,
+        minPieceGapMs: 0,
+      );
+      const String s = 'あいうえ。';
+      // 9 个切点的浮点时刻 0.3, 0.6, …, 2.7 ms 取整后只剩 1 与 2 两个不同的毫秒。
+      final List<SubtitleCue> out =
+          splitLongSubtitleCue(_cue(0, 3, s * 10), options: zero);
+      expect(out.map((SubtitleCue c) => (c.startMs, c.endMs)).toList(),
+          <(int, int)>[(0, 1), (1, 2), (2, 3)]);
+      expect(out.map((SubtitleCue c) => c.text).join(), s * 10);
+    });
+  });
+
+  group('随机 fuzz（固定种子）', () {
+    const String alphabet = 'あいうえおかきくけこさしすせそ漢字ab ';
+    const String terminators = '。！？!?…';
+
+    String randomText(math.Random r) {
+      final StringBuffer b = StringBuffer();
+      final int sentences = 1 + r.nextInt(8);
+      for (int i = 0; i < sentences; i++) {
+        final int len = r.nextInt(14);
+        for (int k = 0; k < len; k++) {
+          b.write(alphabet[r.nextInt(alphabet.length)]);
+        }
+        if (r.nextInt(5) != 0) {
+          b.write(terminators[r.nextInt(terminators.length)]);
+        }
+        if (r.nextInt(6) == 0) b.write('」');
+      }
+      return b.toString();
+    }
+
+    int randomDuration(math.Random r) => switch (r.nextInt(4)) {
+          0 => r.nextInt(10),
+          1 => r.nextInt(1200),
+          2 => r.nextInt(9000),
+          _ => r.nextInt(30000),
+        };
+
+    AsrCueTokenTiming? randomTiming(math.Random r, String text, int duration) {
+      if (r.nextInt(3) == 0) return null;
+      final List<String> tokens = <String>[];
+      final List<String> chars =
+          text.runes.map(String.fromCharCode).toList(growable: false);
+      int i = 0;
+      while (i < chars.length) {
+        final int n = 1 + r.nextInt(3);
+        tokens.add(chars.sublist(i, math.min(chars.length, i + n)).join());
+        i += n;
+      }
+      final int span = duration <= 0 ? 1 : duration;
+      final bool monotone = r.nextInt(5) != 0;
+      final List<int> offsets = <int>[];
+      int t = 0;
+      for (int k = 0; k < tokens.length; k++) {
+        t = monotone
+            ? t + r.nextInt(span ~/ tokens.length + 2)
+            : r.nextInt(span);
+        offsets.add(t);
+      }
+      final List<int>? ends = r.nextBool()
+          ? <int>[for (final int o in offsets) o + r.nextInt(400)]
+          : null;
+      return AsrCueTokenTiming(
+        tokens: tokens,
+        offsetsMs: offsets,
+        endOffsetsMs: ends,
+      );
+    }
+
+    String squash(String s) => s.replaceAll(RegExp(r'\s'), '');
+
+    test('3000 条随机 cue：片时长 > 0、单调不重叠、不出 cue、文本不丢', () {
+      final math.Random r = math.Random(20261019);
+      const List<int> margins = <int>[0, 100, 300];
+      int splitCount = 0;
+      int proportionalSplitCount = 0;
+      for (int iter = 0; iter < 3000; iter++) {
+        final int start = r.nextInt(100000);
+        final int duration = randomDuration(r);
+        final String text = randomText(r);
+        final SubtitleCue cue = _cue(start, start + duration, text);
+        final AsrCueTokenTiming? timing = randomTiming(r, text, duration);
+        final SubtitleLongCueSplitOptions options = SubtitleLongCueSplitOptions(
+          maxDurationMs: r.nextBool() ? 7000 : 500,
+          maxChars: r.nextBool() ? 40 : 8,
+          edgeMarginMs: margins[r.nextInt(margins.length)],
+          minPieceGapMs: margins[r.nextInt(margins.length)],
+        );
+        final String label = 'iter=$iter cue=$cue timing=${timing?.tokens}';
+        final List<SubtitleCue> out =
+            splitLongSubtitleCue(cue, tokenTiming: timing, options: options);
+        expect(out, isNotEmpty, reason: label);
+        if (out.length == 1 && identical(out.single, cue)) continue;
+        splitCount++;
+        for (int i = 0; i < out.length; i++) {
+          final SubtitleCue p = out[i];
+          expect(p.endMs, greaterThan(p.startMs), reason: label);
+          expect(p.startMs, greaterThanOrEqualTo(cue.startMs), reason: label);
+          expect(p.endMs, lessThanOrEqualTo(cue.endMs), reason: label);
+          if (i > 0) {
+            expect(p.startMs, greaterThanOrEqualTo(out[i - 1].endMs),
+                reason: label);
+          }
+        }
+        expect(squash(out.map((SubtitleCue c) => c.text).join()), squash(text),
+            reason: label);
+        if (timing == null) {
+          proportionalSplitCount++;
+          // 按字数比例路径的夹紧是硬的：内部边界都在 [起点+边距, 终点−边距]，
+          // 相邻内部边界至少隔最小间隔。
+          final List<int> inner = <int>{
+            for (final SubtitleCue p in out) ...<int>[p.startMs, p.endMs],
+          }.where((int b) => b != cue.startMs && b != cue.endMs).toList()
+            ..sort();
+          for (int i = 0; i < inner.length; i++) {
+            expect(inner[i] - cue.startMs,
+                greaterThanOrEqualTo(options.edgeMarginMs),
+                reason: label);
+            expect(cue.endMs - inner[i],
+                greaterThanOrEqualTo(options.edgeMarginMs),
+                reason: label);
+            if (i > 0) {
+              expect(inner[i] - inner[i - 1],
+                  greaterThanOrEqualTo(options.minPieceGapMs),
+                  reason: label);
+            }
+          }
+        }
+      }
+      // 防空跑：随机数据确实走到了两条拆分路径。
+      expect(splitCount, greaterThan(300));
+      expect(proportionalSplitCount, greaterThan(100));
     });
   });
 

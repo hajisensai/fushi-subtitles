@@ -121,4 +121,109 @@ void main() {
       expect(hung!.killed, isTrue);
     });
   });
+
+  group('CUDA 设备枚举（audiocpp_cli --list-devices）', () {
+    test('解析 ggml 的设备行：CUDA 序号、名字、计算能力', () {
+      final List<AudioCppCudaDevice> d = parseAudioCppCudaDevices(
+        'available_devices=2\nCUDA:0 "NVIDIA GeForce RTX 5090" [GPU]\n'
+        'ggml_cuda_init: found 2 CUDA devices (Total VRAM: 44894 MiB):\n'
+        '  Device 0: NVIDIA GeForce RTX 5090, compute capability 12.0, '
+        'VMM: yes, VRAM: 32606 MiB\r\n'
+        '  Device 1: Tesla P40, compute capability 6.1, VMM: no, '
+        'VRAM: 12288 MiB\n',
+      );
+      expect(d, hasLength(2));
+      expect(d[0].index, 0);
+      expect(d[0].name, 'NVIDIA GeForce RTX 5090');
+      expect(d[0].computeCapability, 120);
+      expect(d[1].index, 1);
+      expect(d[1].computeCapability, 61);
+      expect(parseAudioCppCudaDevices('ggml_vulkan: 0 = NVIDIA ...'), isEmpty);
+    });
+
+    test('选卡：序号最小的达标卡；都不达标为 null', () {
+      AudioCppCudaDevice dev(int i, int cc) =>
+          AudioCppCudaDevice(index: i, name: 'g$i', computeCapability: cc);
+      expect(
+          selectMossCudaDevice(<AudioCppCudaDevice>[dev(0, 61), dev(1, 86)])!
+              .index,
+          1);
+      expect(
+          selectMossCudaDevice(<AudioCppCudaDevice>[dev(2, 75), dev(1, 89)])!
+              .index,
+          1);
+      expect(selectMossCudaDevice(<AudioCppCudaDevice>[dev(0, 61)]), isNull);
+      expect(selectMossCudaDevice(const <AudioCppCudaDevice>[]), isNull);
+    });
+
+    test('listAudioCppCudaDevices：参数只有 --list-devices，stdout+stderr 都读',
+        () async {
+      final List<StartedCall> calls = <StartedCall>[];
+      final List<AudioCppCudaDevice> d = await listAudioCppCudaDevices(
+        'audiocpp_cli',
+        startProcess: (String e, List<String> a) async {
+          final FakeProcess fp = FakeProcess(
+            stdoutText: 'CUDA:0 "x" [GPU]\n',
+            stderrText: '  Device 0: x, compute capability 7.5, VMM: yes\n',
+          );
+          calls.add(StartedCall(e, a, fp));
+          return fp;
+        },
+      );
+      expect(calls.single.arguments, <String>['--list-devices']);
+      expect(d.single.computeCapability, 75);
+    });
+  });
+
+  group('后端选择以清单为准', () {
+    const MossCudaAvailability yes = MossCudaAvailability(
+        available: true, reason: null, gpus: <NvidiaGpuInfo>[]);
+    const MossCudaAvailability no = MossCudaAvailability(
+        available: false, reason: 'x', gpus: <NvidiaGpuInfo>[]);
+
+    test('不探测的默认值：Windows = cuda，Linux = vulkan（没有 CUDA 版 CLI）', () {
+      expect(defaultMossBackendFor(AudioCppPlatform.windowsX64),
+          AudioCppBackend.cuda);
+      expect(defaultMossBackendFor(AudioCppPlatform.linuxX64),
+          AudioCppBackend.vulkan);
+      expect(defaultMossBackendFor(null), AudioCppBackend.cpu);
+    });
+
+    test('结合探测：CUDA 可用且清单有包才取 cuda', () {
+      expect(selectMossBackend(AudioCppPlatform.windowsX64, yes),
+          AudioCppBackend.cuda);
+      expect(selectMossBackend(AudioCppPlatform.windowsX64, no),
+          AudioCppBackend.vulkan);
+      expect(selectMossBackend(AudioCppPlatform.linuxX64, yes),
+          AudioCppBackend.vulkan);
+      expect(selectMossBackend(AudioCppPlatform.linuxX64, no),
+          AudioCppBackend.vulkan);
+    });
+
+    test('chooseMossBackend：Linux 不跑 nvidia-smi；Windows 按探测结论', () async {
+      expect(
+        await chooseMossBackend(
+          platform: AudioCppPlatform.linuxX64,
+          startProcess: (String e, List<String> a) => fail('不应探测：$e'),
+        ),
+        AudioCppBackend.vulkan,
+      );
+      expect(
+        await chooseMossBackend(
+          platform: AudioCppPlatform.windowsX64,
+          startProcess: (String e, List<String> a) async =>
+              FakeProcess(stdoutText: '596.49, 12.0\n'),
+        ),
+        AudioCppBackend.cuda,
+      );
+      expect(
+        await chooseMossBackend(
+          platform: AudioCppPlatform.windowsX64,
+          startProcess: (String e, List<String> a) async =>
+              FakeProcess(stdoutText: '596.49, 6.1\n'),
+        ),
+        AudioCppBackend.vulkan,
+      );
+    });
+  });
 }

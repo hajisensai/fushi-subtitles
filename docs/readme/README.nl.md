@@ -176,6 +176,7 @@ dart analyze packages
 cd packages/asr_core && dart test        # 326 tests
 cd packages/asr_onnx_ffi && dart test    # 15 tests, vereist een echte onnxruntime (de groep wordt anders overgeslagen)
 cd packages/asr_align && dart test       # 15 tests
+cd packages/asr_subtitles && dart test   # 104 tests
 cd packages/asr && dart test             # 10 tests
 cd packages/asr_server && dart test      # 10 tests
 ```

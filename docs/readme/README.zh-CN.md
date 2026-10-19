@@ -155,6 +155,7 @@ dart analyze packages
 cd packages/asr_core && dart test        # 326 条
 cd packages/asr_onnx_ffi && dart test    # 15 条，要真 onnxruntime（没有就整组 skip）
 cd packages/asr_align && dart test       # 15 条
+cd packages/asr_subtitles && dart test   # 104 条
 cd packages/asr && dart test             # 10 条
 cd packages/asr_server && dart test      # 10 条
 ```

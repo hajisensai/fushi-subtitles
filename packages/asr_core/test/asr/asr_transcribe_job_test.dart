@@ -202,8 +202,9 @@ void main() {
     final events = <AsrTranscribeEvent>[];
     await for (final event in job.run()) {
       events.add(event);
-      if (event is AsrTranscribeProgressEvent)
+      if (event is AsrTranscribeProgressEvent) {
         job.requestPause(discardPending: true);
+      }
     }
     expect(events.last, isA<AsrTranscribePausedEvent>());
     expect(decoder.batchSizes, isEmpty);
