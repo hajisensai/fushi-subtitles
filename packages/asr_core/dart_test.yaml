@@ -2,3 +2,6 @@ tags:
   ffmpeg:
     # 需要 PATH 上有真实 ffmpeg / ffprobe 的用例；缺失时用例自己 skip。
     skip: false
+  moss:
+    # 真跑 audio.cpp + MOSS 的用例；未设 MOSS_CLI / MOSS_MODEL / MOSS_AUDIO 时用例自己 skip。
+    skip: false
