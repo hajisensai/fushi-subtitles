@@ -142,6 +142,8 @@ void main() {
     for (final AsrDecodedSegment s in out) {
       expect(s.tokens, <String>['a', 'b', ' ', 'c']);
       expect(s.tokenOffsetsMs, <int>[0, 80, 120, 140]);
+      // 终点 = 同 id 末帧结束：a 占帧 0–2 → 60 ms，其后 blank 帧 3 不算它的。
+      expect(s.tokenEndOffsetsMs, <int>[60, 120, 140, 160]);
       expect(s.text, 'ab c');
     }
     expect(d.stats.batches, 1);

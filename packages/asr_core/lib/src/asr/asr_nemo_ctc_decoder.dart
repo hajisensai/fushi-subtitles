@@ -192,7 +192,8 @@ class AsrNemoCtcDecoder implements AsrSegmentDecoder {
     return best;
   }
 
-  /// CTC 折叠：连续相同 id 只发一次，blank / 特殊符号不发射；时间 = 首帧 × 80 ms。
+  /// CTC 折叠（[ctcCollapseFrames]）：连续相同 id 只发一次，blank / 特殊符号不
+  /// 发射；起点 = 首帧 × 80 ms，终点 = 同 id 末帧的结束 × 80 ms。
   @override
   Future<List<AsrDecodedSegment>> search(AsrEncodedBatch encodedBatch) async {
     final AsrNemoCtcEncodedBatch encoded =
@@ -200,22 +201,18 @@ class AsrNemoCtcDecoder implements AsrSegmentDecoder {
     final Stopwatch clock = Stopwatch()..start();
     final List<AsrDecodedSegment> out = <AsrDecodedSegment>[];
     for (final Int32List ids in encoded.frameIds) {
-      final List<int> emitted = <int>[];
-      final List<int> offsets = <int>[];
-      int prev = -1;
-      for (int f = 0; f < ids.length; f++) {
-        final int id = ids[f];
-        if (id != prev && !_tokens.isSpecial(id)) {
-          emitted.add(id);
-          offsets.add(f * kAsrNemoFrameMs);
-        }
-        prev = id;
-      }
+      final ({List<int> ids, List<int> startFrames, List<int> endFrames}) c =
+          ctcCollapseFrames(ids, _tokens.isSpecial);
       out.add(
         AsrDecodedSegment.fromTokenIds(
           table: _tokens,
-          ids: emitted,
-          offsetsMs: offsets,
+          ids: c.ids,
+          offsetsMs: <int>[
+            for (final int f in c.startFrames) f * kAsrNemoFrameMs
+          ],
+          endOffsetsMs: <int>[
+            for (final int f in c.endFrames) f * kAsrNemoFrameMs,
+          ],
         ),
       );
     }

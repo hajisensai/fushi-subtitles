@@ -67,6 +67,7 @@ abstract final class AsrModelIo {
   static const String nemoInputAudioSignal = 'audio_signal';
   static const String nemoInputLength = 'length';
   static const String nemoOutputLogprobs = 'logprobs';
+
   /// CTC（NeMo mel 前端，Kitsune）：`features[N, 80, T]` f32 + `lengths[N]`
   /// int64 → `ids[N, T/8]` int64（图内 argmax）+ `out_lengths[N]` int64。
   static const String ctcInputFeatures = 'features';
@@ -227,15 +228,33 @@ class AsrTokenTable {
     List<int> ids,
     List<int> timesMs,
   ) {
+    final ({List<String> tokens, List<int> timesMs, List<int>? endTimesMs}) m =
+        materializeWithEnds(ids, timesMs);
+    return (tokens: m.tokens, timesMs: m.timesMs);
+  }
+
+  /// [materialize] 的带终点版本：[endTimesMs]（与 [ids] 等长；null = 解码器给不出
+  /// 终点）随 token 一起合并。byte-fallback 合成的字符，终点取该段**最后一个**字节
+  /// 的终点（起点仍取首个字节）。
+  ({List<String> tokens, List<int> timesMs, List<int>? endTimesMs})
+      materializeWithEnds(
+    List<int> ids,
+    List<int> timesMs, [
+    List<int>? endTimesMs,
+  ]) {
     assert(ids.length == timesMs.length);
+    assert(endTimesMs == null || endTimesMs.length == ids.length);
     final List<String> outTokens = <String>[];
     final List<int> outTimes = <int>[];
+    final List<int>? outEnds = endTimesMs == null ? null : <int>[];
     final List<int> pendingBytes = <int>[];
     int pendingTime = 0;
+    int pendingEnd = 0;
     void flushBytes() {
       if (pendingBytes.isEmpty) return;
       outTokens.add(utf8.decode(pendingBytes, allowMalformed: true));
       outTimes.add(pendingTime);
+      outEnds?.add(pendingEnd);
       pendingBytes.clear();
     }
 
@@ -245,6 +264,7 @@ class AsrTokenTable {
         final int byte = byteValueOf(id);
         if (byte >= 0) {
           if (pendingBytes.isEmpty) pendingTime = timesMs[i];
+          if (endTimesMs != null) pendingEnd = endTimesMs[i];
           pendingBytes.add(byte);
           continue;
         }
@@ -253,9 +273,10 @@ class AsrTokenTable {
       final String raw = tokenAt(id);
       outTokens.add(isSentencePiece ? _materializeSentencePiece(raw) : raw);
       outTimes.add(timesMs[i]);
+      if (endTimesMs != null) outEnds!.add(endTimesMs[i]);
     }
     flushBytes();
-    return (tokens: outTokens, timesMs: outTimes);
+    return (tokens: outTokens, timesMs: outTimes, endTimesMs: outEnds);
   }
 
   /// 标点类 token（`▁,` / `▁。` / `.` 等：去掉 `▁` 后没有字母数字、也不是 CJK
@@ -287,6 +308,45 @@ class AsrTokenTable {
     if (_startsWithScriptWithoutSpaces.hasMatch(body)) return body;
     return ' $body';
   }
+}
+
+/// CTC 贪心折叠（两条 CTC 解码路径共用）：逐帧 argmax id → 发射的 token 及其
+/// 起止帧。
+///
+/// - 连续相同 id 只发射一次，blank / 特殊符号不发射；隔着 blank 的同一 id 算两个
+///   token（`a _ a` = 「aa」）。
+/// - **起点** = 这一串连续同 id 帧的首帧（与之前只给起点时同一口径）。
+/// - **终点** = 这一串连续同 id 帧的最后一帧的结束（帧号 + 1，不含）。之后的 blank
+///   帧不算它的：CTC 的尖峰通常只占一两帧，blank 正是「没在发这个音」的地方——把
+///   blank 划给前一个 token，「停顿」（前一 token 终点到后一 token 起点）就永远是 0，
+///   显示后处理找不到切点（asr_subtitles 的长条拆分）。
+///
+/// 返回的三个列表等长，帧号相对段起点。
+({List<int> ids, List<int> startFrames, List<int> endFrames}) ctcCollapseFrames(
+  List<int> frameIds,
+  bool Function(int id) isSpecial,
+) {
+  final List<int> ids = <int>[];
+  final List<int> starts = <int>[];
+  final List<int> ends = <int>[];
+  int prev = -1;
+  // 当前这串同 id 帧是不是一个已发射的 token（是则后续同 id 帧延长它的终点）。
+  bool inToken = false;
+  for (int f = 0; f < frameIds.length; f++) {
+    final int id = frameIds[f];
+    if (id != prev) {
+      inToken = !isSpecial(id);
+      if (inToken) {
+        ids.add(id);
+        starts.add(f);
+        ends.add(f + 1);
+      }
+    } else if (inToken) {
+      ends[ends.length - 1] = f + 1;
+    }
+    prev = id;
+  }
+  return (ids: ids, startFrames: starts, endFrames: ends);
 }
 
 /// VAD 切出的一段语音：相对**当前音频文件**的样本偏移 + 该段 16 kHz 单声道样本。
@@ -334,6 +394,7 @@ class AsrDecodedSegment {
   const AsrDecodedSegment({
     required this.tokens,
     required this.tokenOffsetsMs,
+    this.tokenEndOffsetsMs,
   }) : assert(tokens.length == tokenOffsetsMs.length);
 
   // 注：const 构造里的 assert 不能对 const 列表取 length，故这里只能是 final。
@@ -346,19 +407,25 @@ class AsrDecodedSegment {
     required AsrTokenTable table,
     required List<int> ids,
     required List<int> offsetsMs,
+    List<int>? endOffsetsMs,
   }) {
-    final ({List<String> tokens, List<int> timesMs}) m = table.materialize(
-      ids,
-      offsetsMs,
-    );
+    final ({List<String> tokens, List<int> timesMs, List<int>? endTimesMs}) m =
+        table.materializeWithEnds(ids, offsetsMs, endOffsetsMs);
+    final List<int>? ends = m.endTimesMs;
     return AsrDecodedSegment(
       tokens: List<String>.unmodifiable(m.tokens),
       tokenOffsetsMs: List<int>.unmodifiable(m.timesMs),
+      tokenEndOffsetsMs: ends == null ? null : List<int>.unmodifiable(ends),
     );
   }
 
   final List<String> tokens;
   final List<int> tokenOffsetsMs;
+
+  /// 各 token 的**结束**时刻（段内毫秒，与 [tokenOffsetsMs] 等长）；null = 解码器
+  /// 给不出终点（transducer：RNN-T 只有发射帧，没有时长）。CTC 的定义见
+  /// `ctcTokenSpans`：该 token 那一串连续同 id 帧的最后一帧的结束时刻。
+  final List<int>? tokenEndOffsetsMs;
 
   String get text => tokens.join();
   bool get isEmpty => tokens.isEmpty;
@@ -376,6 +443,7 @@ class AsrTranscribedSegment {
     this.rawStartMs,
     this.rawEndMs,
     this.continuous = false,
+    this.tokenEndTimesMs,
   }) : assert(tokens.length == tokenTimesMs.length);
 
   factory AsrTranscribedSegment.fromDecoded({
@@ -388,13 +456,17 @@ class AsrTranscribedSegment {
       // 更远离窗口边缘的那个窗口——边缘的帧上下文残缺，识别最不可靠。
       final int coreStartMs = speech.coreStartSample! * 1000 ~/ kAsrSampleRate;
       final int coreEndMs = speech.coreEndSample! * 1000 ~/ kAsrSampleRate;
+      final List<int>? decodedEnds = decoded.tokenEndOffsetsMs;
       final List<String> tokens = <String>[];
       final List<int> times = <int>[];
+      final List<int>? ends = decodedEnds == null ? null : <int>[];
       for (int i = 0; i < decoded.tokens.length; i++) {
         final int t = speech.startMs + decoded.tokenOffsetsMs[i];
         if (t >= coreStartMs && t < coreEndMs) {
           tokens.add(decoded.tokens[i]);
           times.add(t);
+          // 归属只看起点；终点照实保留（可能伸进下一窗的中心区一点）。
+          ends?.add(speech.startMs + decodedEnds![i]);
         }
       }
       return AsrTranscribedSegment(
@@ -403,9 +475,11 @@ class AsrTranscribedSegment {
         endMs: coreEndMs,
         tokens: List<String>.unmodifiable(tokens),
         tokenTimesMs: List<int>.unmodifiable(times),
+        tokenEndTimesMs: ends == null ? null : List<int>.unmodifiable(ends),
         continuous: true,
       );
     }
+    final List<int>? decodedEnds = decoded.tokenEndOffsetsMs;
     return AsrTranscribedSegment(
       audioFileIndex: audioFileIndex,
       startMs: speech.startMs,
@@ -416,6 +490,11 @@ class AsrTranscribedSegment {
       tokenTimesMs: List<int>.unmodifiable(
         decoded.tokenOffsetsMs.map((int o) => speech.startMs + o),
       ),
+      tokenEndTimesMs: decodedEnds == null
+          ? null
+          : List<int>.unmodifiable(
+              decodedEnds.map((int o) => speech.startMs + o),
+            ),
     );
   }
 
@@ -433,6 +512,8 @@ class AsrTranscribedSegment {
       rawStartMs: (json['rs'] as num?)?.toInt(),
       rawEndMs: (json['re'] as num?)?.toInt(),
       continuous: json['c'] == true,
+      tokenEndTimesMs:
+          _endTimesFromJson(json['te'], (json['t'] as List).length),
       // 旧检查点可能还带 `me` / `eb`（已删除的声学调轴产物）：只读自己认的键，
       // 多出来的一律忽略，旧任务照样能恢复。
     );
@@ -454,6 +535,11 @@ class AsrTranscribedSegment {
   final int? rawStartMs;
   final int? rawEndMs;
 
+  /// 每个 token 的结束时刻（毫秒，相对该音频文件，与 [tokenTimesMs] 等长）；
+  /// null = 解码器给不出（见 [AsrDecodedSegment.tokenEndOffsetsMs]）或旧检查点。
+  /// 落盘键是 `te`——**不能用 `me`**：那是已删除的声学调轴产物，旧检查点里可能还有。
+  final List<int>? tokenEndTimesMs;
+
   /// 滑窗中心区产物：[startMs]/[endMs] 是中心区边界而不是语音边界，与同文件
   /// 前后段首尾相接。建 cue 前要先拼回整条 token 流、按静音重切
   /// （`AsrCueBuilder` 负责），否则 cue 会被 12 s 一刀的窗口网格切断。
@@ -470,7 +556,21 @@ class AsrTranscribedSegment {
         if (rawStartMs != null) 'rs': rawStartMs,
         if (rawEndMs != null) 're': rawEndMs,
         if (continuous) 'c': true,
+        if (tokenEndTimesMs != null) 'te': tokenEndTimesMs,
       };
+
+  /// `te` 键：缺失、类型不对或长度与 token 数不符时按「没有终点」处理（null），
+  /// 不让一个坏字段把整段落盘结果作废。
+  static List<int>? _endTimesFromJson(Object? raw, int tokenCount) {
+    if (raw is! List) return null;
+    if (raw.length != tokenCount) return null;
+    final List<int> out = <int>[];
+    for (final Object? v in raw) {
+      if (v is! num) return null;
+      out.add(v.toInt());
+    }
+    return List<int>.unmodifiable(out);
+  }
 }
 
 /// 解码后的 PCM 块：16 kHz 单声道 float32（[-1, 1]），带相对文件起点的样本偏移。

@@ -15,7 +15,7 @@ import 'package:meta/meta.dart';
 import 'package:path/path.dart' as p;
 
 import 'package:fushi_asr_core/src/asr/asr_cue_builder.dart'
-    show AsrCueTokenTiming, parseAsrCueTokens;
+    show AsrCueTokenTiming, parseAsrCueTokenTimings;
 import 'package:fushi_asr_core/src/asr/asr_encoder_buckets.dart';
 import 'package:fushi_asr_core/src/asr/asr_engine.dart';
 import 'package:fushi_asr_core/src/asr/asr_fixed_segmenter.dart';
@@ -468,9 +468,9 @@ class AsrTranscriptionService {
       p.join(p.dirname(subtitlePath), AsrJobFiles.cueTokens),
     );
     if (!sidecar.existsSync()) return null;
-    final List<({List<String> tokens, List<int> offsetsMs})>? rows;
+    final List<AsrCueTokenTiming>? rows;
     try {
-      rows = parseAsrCueTokens(await sidecar.readAsString());
+      rows = parseAsrCueTokenTimings(await sidecar.readAsString());
     } on FileSystemException catch (error) {
       developer.log(
         'ASR cue token sidecar unreadable: ${sidecar.path}',
@@ -487,10 +487,7 @@ class AsrTranscriptionService {
       );
       return null;
     }
-    return <AsrCueTokenTiming>[
-      for (final ({List<String> tokens, List<int> offsetsMs}) row in rows)
-        AsrCueTokenTiming(tokens: row.tokens, offsetsMs: row.offsetsMs),
-    ];
+    return rows;
   }
 
   /// 全部音频的总时长（毫秒）；任一文件探不出就返回 null（策略按未知处理，

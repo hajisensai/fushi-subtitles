@@ -104,10 +104,13 @@ void main() {
         await decoder.decodeBatch(<AsrSpeechSegment>[_seg(1.0), _seg(0.5)]);
     expect(out[0].tokens, <String>['あ', 'い', 'う', '。']);
     expect(out[0].tokenOffsetsMs, <int>[0, 240, 480, 560]);
+    // 终点 = 同 id 末帧的结束：あ 占帧 0–1 → 160；之后的 blank 不算它的。
+    expect(out[0].tokenEndOffsetsMs, <int>[160, 320, 560, 640]);
     expect(kAsrNemoFrameMs, 80);
     // 行 1 只有 0.5 s（50 有效帧 → 7 输出帧）：补齐区的 'あ' 不得出现。
     expect(out[1].tokens, <String>['い']);
     expect(out[1].tokenOffsetsMs, <int>[160]);
+    expect(out[1].tokenEndOffsetsMs, <int>[240]);
   });
 
   test('统计记账：真实帧 = 各行 ceil(length/8) 之和', () async {

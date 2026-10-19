@@ -71,6 +71,7 @@ class _TwoSentenceDecoder implements AsrBatchDecoder {
             : AsrDecodedSegment(
                 tokens: const <String>['あ', '。', 'い', '。'],
                 tokenOffsetsMs: const <int>[0, 60, 120, 180],
+                tokenEndOffsetsMs: const <int>[40, 100, 160, 220],
               ),
     ];
   }
@@ -261,14 +262,15 @@ void main() {
         (5500, 7000, 'あ。い。'),
       ]);
       expect(r.cueCount, 4);
-      final List<({List<String> tokens, List<int> offsetsMs})>? rows =
-          parseAsrCueTokens(
+      final List<AsrCueTokenTiming>? rows = parseAsrCueTokenTimings(
         File(p.join(tmp.path, AsrJobFiles.cueTokens)).readAsStringSync(),
       );
       expect(rows, hasLength(cues.length));
-      for (final ({List<String> tokens, List<int> offsetsMs}) row in rows!) {
+      for (final AsrCueTokenTiming row in rows!) {
         expect(row.tokens, <String>['あ', '。', 'い', '。']);
         expect(row.offsetsMs, <int>[0, 60, 120, 180]);
+        // 解码器给的终点经 segments.jsonl（te）→ cue → sidecar（e）一路带到。
+        expect(row.endOffsetsMs, <int>[40, 100, 160, 220]);
       }
       // 每段送进模型的样本数：截断 / 补长都只动样本，不动 cue 时间。
       final Map<int, int> fedMs = <int, int>{
