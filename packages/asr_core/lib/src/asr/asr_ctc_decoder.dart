@@ -484,7 +484,8 @@ class AsrCtcDecoder
     return best;
   }
 
-  /// CTC 折叠：连续相同 id 只算一次，blank / 特殊符号不发射。
+  /// CTC 折叠（[ctcCollapseFrames]）：连续相同 id 只算一次，blank / 特殊符号不
+  /// 发射；每个 token 带起止时刻（起 = 首帧，止 = 同 id 末帧的结束）。
   @override
   Future<List<AsrDecodedSegment>> search(AsrEncodedBatch encodedBatch) async {
     final AsrCtcEncodedBatch encoded = encodedBatch as AsrCtcEncodedBatch;
@@ -493,37 +494,28 @@ class AsrCtcDecoder
     for (int i = 0; i < encoded.segments.length; i++) {
       final Int32List ids =
           i < encoded.frameIds.length ? encoded.frameIds[i] : Int32List(0);
-      final List<int> emitted = <int>[];
-      final List<int> frames = <int>[];
-      int prev = -1;
-      for (int t = 0; t < ids.length; t++) {
-        final int id = ids[t];
-        if (id != prev && !_tokens.isSpecial(id)) {
-          emitted.add(id);
-          frames.add(t);
-        }
-        prev = id;
-      }
+      final ({List<int> ids, List<int> startFrames, List<int> endFrames}) c =
+          ctcCollapseFrames(ids, _tokens.isSpecial);
       if (_mel != null) {
         out.add(
           kitsuneCharTiming(
             table: _tokens,
-            ids: emitted,
-            frames: frames,
+            ids: c.ids,
+            frames: c.startFrames,
+            endFrames: c.endFrames,
             frameMs: encoded.frameSamples * 1000 / kAsrSampleRate,
             segmentMs: encoded.segments[i].lengthMs,
           ),
         );
         continue;
       }
+      int frameToMs(int t) => t * encoded.frameSamples * 1000 ~/ kAsrSampleRate;
       out.add(
         AsrDecodedSegment.fromTokenIds(
           table: _tokens,
-          ids: emitted,
-          offsetsMs: <int>[
-            for (final int t in frames)
-              t * encoded.frameSamples * 1000 ~/ kAsrSampleRate,
-          ],
+          ids: c.ids,
+          offsetsMs: <int>[for (final int t in c.startFrames) frameToMs(t)],
+          endOffsetsMs: <int>[for (final int t in c.endFrames) frameToMs(t)],
         ),
       );
     }
@@ -548,6 +540,9 @@ class AsrCtcDecoder
 /// - 标点 / 符号 / 空白（Unicode P / S / Z）没有声学时刻：取前一个发音字的
 ///   时刻（领头的取首个发音字）。CTC 的句末「。」常晚发射到下一次停顿之后，
 ///   不归位会把 cue 终点拖进静音。
+/// - 终点（给了 [endFrames] 才有）：token 内的字首尾相接，最后一个字到
+///   `max(摊开区间末尾, 该 token 同 id 末帧的结束)`；夹进 `[本字起点, segmentMs]`。
+///   归位过的标点 / 符号没有时长，终点 = 起点。
 @visibleForTesting
 AsrDecodedSegment kitsuneCharTiming({
   required AsrTokenTable table,
@@ -555,9 +550,11 @@ AsrDecodedSegment kitsuneCharTiming({
   required List<int> frames,
   required double frameMs,
   required int segmentMs,
+  List<int>? endFrames,
 }) {
   final List<String> chars = <String>[];
   final List<double> times = <double>[];
+  final List<double> endTimes = <double>[];
   for (int j = 0; j < ids.length; j++) {
     final String text = table
         .tokenAt(ids[j])
@@ -571,9 +568,15 @@ AsrDecodedSegment kitsuneCharTiming({
     final int next = j + 1 < ids.length ? frames[j + 1] : fr + runes.length;
     final double span = math.min(next - fr, runes.length) * frameMs;
     final double t0 = fr * frameMs;
+    final double runEnd =
+        endFrames == null ? t0 + span : endFrames[j] * frameMs;
     for (int q = 0; q < runes.length; q++) {
       chars.add(runes[q]);
       times.add(t0 + span * q / runes.length);
+      final double spread = t0 + span * (q + 1) / runes.length;
+      endTimes.add(
+        q == runes.length - 1 ? math.max(spread, runEnd) : spread,
+      );
     }
   }
   final List<int> ms = <int>[];
@@ -592,18 +595,34 @@ AsrDecodedSegment kitsuneCharTiming({
     }
   }
   int? last;
+  final List<bool> moved = List<bool>.filled(chars.length, false);
   for (int k = 0; k < chars.length; k++) {
     if (_isSpoken(chars[k])) {
       last = ms[k];
     } else if (last != null) {
       ms[k] = last;
+      moved[k] = true;
     } else if (firstSpoken != null) {
       ms[k] = firstSpoken;
+      moved[k] = true;
     }
+  }
+  List<int>? ends;
+  if (endFrames != null) {
+    ends = <int>[
+      for (int k = 0; k < chars.length; k++)
+        moved[k]
+            ? ms[k]
+            : math
+                .min(math.max(endTimes[k], ms[k].toDouble()),
+                    segmentMs.toDouble())
+                .round(),
+    ];
   }
   return AsrDecodedSegment(
     tokens: List<String>.unmodifiable(chars),
     tokenOffsetsMs: List<int>.unmodifiable(ms),
+    tokenEndOffsetsMs: ends == null ? null : List<int>.unmodifiable(ends),
   );
 }
 

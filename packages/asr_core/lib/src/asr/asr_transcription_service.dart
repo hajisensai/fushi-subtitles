@@ -15,9 +15,10 @@ import 'package:meta/meta.dart';
 import 'package:path/path.dart' as p;
 
 import 'package:fushi_asr_core/src/asr/asr_cue_builder.dart'
-    show AsrCueTokenTiming, parseAsrCueTokens;
+    show AsrCueTokenTiming, parseAsrCueTokenTimings;
 import 'package:fushi_asr_core/src/asr/asr_encoder_buckets.dart';
 import 'package:fushi_asr_core/src/asr/asr_engine.dart';
+import 'package:fushi_asr_core/src/asr/asr_fixed_segmenter.dart';
 import 'package:fushi_asr_core/src/asr/asr_model_manifest.dart';
 import 'package:fushi_asr_core/src/asr/asr_model_store.dart';
 import 'package:fushi_asr_core/src/asr/asr_pcm_source.dart';
@@ -38,23 +39,28 @@ import 'package:fushi_asr_core/src/util/asr_paths.dart';
 /// - 混音素材：能量门限的前提不成立；CTC（[AsrModelArchitecture.nemoCtc]）走
 ///   滑窗、根本不切 VAD（silero 在 BGM 下大面积漏对白，见
 ///   `asr_sliding_window.dart`），其余架构用神经网络 VAD。
+/// - 给了 [segments]（「按给定分段识别」）：不按素材选，一律用
+///   [AsrFixedSegmenter]，段界就是输入。
 AsrSegmenter buildAsrSegmenter({
   required AsrAudioProfile profile,
   required AsrEngineSessions sessions,
+  List<AsrSegmentSpan>? segments,
 }) =>
-    switch (profile) {
-      AsrAudioProfile.cleanSpeech => AsrVadSegmenter(
-          scorer: EnergyVadScorer(),
-          maxSegmentMs: sessions.maxSegmentMs,
-        ),
-      AsrAudioProfile.mixedAudio =>
-        sessions.architecture == AsrModelArchitecture.nemoCtc
-            ? AsrSlidingWindowSegmenter()
-            : AsrVadSegmenter(
-                session: sessions.vad,
+    segments != null
+        ? AsrFixedSegmenter(segments)
+        : switch (profile) {
+            AsrAudioProfile.cleanSpeech => AsrVadSegmenter(
+                scorer: EnergyVadScorer(),
                 maxSegmentMs: sessions.maxSegmentMs,
               ),
-    };
+            AsrAudioProfile.mixedAudio =>
+              sessions.architecture == AsrModelArchitecture.nemoCtc
+                  ? AsrSlidingWindowSegmenter()
+                  : AsrVadSegmenter(
+                      session: sessions.vad,
+                      maxSegmentMs: sessions.maxSegmentMs,
+                    ),
+          };
 
 /// 开跑前的计划：哪个语言包、会用哪个编码器变体、期望落到哪个 EP、模型是否就绪。
 @immutable
@@ -210,6 +216,7 @@ class AsrTranscriptionService {
       _injectedLoader ??
       (_lazyLoader ??= AsrEngineLoader(factory: _backend.buildFactory()));
   final AsrPcmSource _pcm;
+
   /// 按语言 **与素材** 打开模型目录：同一语言在视频与有声书上可以是两个包
   /// （`AsrModelPack.audioProfiles`），宿主注入的实现必须按素材选包。
   final Future<AsrModelStore> Function(
@@ -223,6 +230,7 @@ class AsrTranscriptionService {
   /// （见 [AsrTranscribeJob.batchSize]）。
   final int? batchSize;
   final int chunkSeconds;
+
   /// 见 [AsrAudioProfile]：调用方对素材的断言，**没有默认值**。
   final AsrAudioProfile audioProfile;
 
@@ -332,13 +340,21 @@ class AsrTranscriptionService {
     yield* store.download(variant);
   }
 
-  /// 任务目录：文件名 + 字节数 + 模型包 id 的 SHA-1。
+  /// 任务目录：文件名 + 字节数 + 模型包 id（+ 给定分段的指纹）的 SHA-1。
+  ///
+  /// [segments] 与 [start] 的同名参数一致：给了分段的任务是另一个任务，目录不同。
   Future<Directory> jobDirFor(
     List<String> audioPaths,
-    AsrLanguage language,
-  ) async {
+    AsrLanguage language, {
+    List<AsrSegmentSpan>? segments,
+  }) async {
     final Directory root = await _jobsRoot();
-    final String id = jobIdFor(audioPaths, language, profile: audioProfile);
+    final String id = jobIdFor(
+      audioPaths,
+      language,
+      profile: audioProfile,
+      segments: segments,
+    );
     return Directory(p.join(root.path, id));
   }
 
@@ -348,10 +364,15 @@ class AsrTranscriptionService {
   /// 共用缓存（2026-10-15 实测 CLI 换 `--clean-speech` 后原样拿回上一次的 SRT）。
   /// 只在 [AsrAudioProfile.mixedAudio] 时写这一行——[AsrAudioProfile.cleanSpeech]
   /// 是 app 一直在用的那种，哈希保持原样，进行中的有声书任务不会失联。
+  ///
+  /// 给定分段（[segments]）同理：分段不同，识别的音频与产出的 cue 都不同，必须是
+  /// 不同的缓存，所以把分段指纹（[asrSegmentSpansFingerprint]，与顺序无关）写进
+  /// 哈希；不给分段时不写这一行，id 与之前逐字相同，进行中的旧任务不会失联。
   static String jobIdFor(
     List<String> audioPaths,
     AsrLanguage language, {
     AsrAudioProfile? profile,
+    List<AsrSegmentSpan>? segments,
   }) {
     final StringBuffer sb = StringBuffer();
     for (final String path in audioPaths) {
@@ -370,15 +391,26 @@ class AsrTranscriptionService {
     if (profile == AsrAudioProfile.mixedAudio) {
       sb.write('profile=mixedAudio\n');
     }
+    if (segments != null) {
+      sb
+        ..write('segments=')
+        ..write(asrSegmentSpansFingerprint(segments))
+        ..write('\n');
+    }
     return sha1.convert(utf8.encode(sb.toString())).toString();
   }
 
-  /// 已有的任务状态（没有则 null）。
+  /// 已有的任务状态（没有则 null）。[segments] 见 [jobDirFor]。
   Future<AsrJobState?> existingState(
     List<String> audioPaths,
-    AsrLanguage language,
-  ) async {
-    final Directory dir = await jobDirFor(audioPaths, language);
+    AsrLanguage language, {
+    List<AsrSegmentSpan>? segments,
+  }) async {
+    final Directory dir = await jobDirFor(
+      audioPaths,
+      language,
+      segments: segments,
+    );
     if (!File(p.join(dir.path, AsrJobFiles.state)).existsSync()) return null;
     final ({AsrJobState state, bool fresh}) loaded =
         await AsrTranscribeJob.loadStateDetailed(
@@ -389,14 +421,23 @@ class AsrTranscriptionService {
     return loaded.fresh ? null : loaded.state;
   }
 
-  /// 已完成任务的 SRT 路径（未完成或不存在则 null）。
+  /// 已完成任务的 SRT 路径（未完成或不存在则 null）。[segments] 见 [jobDirFor]。
   Future<String?> finishedSrtPath(
     List<String> audioPaths,
-    AsrLanguage language,
-  ) async {
-    final AsrJobState? state = await existingState(audioPaths, language);
+    AsrLanguage language, {
+    List<AsrSegmentSpan>? segments,
+  }) async {
+    final AsrJobState? state = await existingState(
+      audioPaths,
+      language,
+      segments: segments,
+    );
     if (state == null || !state.finished) return null;
-    final Directory dir = await jobDirFor(audioPaths, language);
+    final Directory dir = await jobDirFor(
+      audioPaths,
+      language,
+      segments: segments,
+    );
     final File srt = File(p.join(dir.path, AsrJobFiles.srt));
     return srt.existsSync() ? srt.path : null;
   }
@@ -427,9 +468,9 @@ class AsrTranscriptionService {
       p.join(p.dirname(subtitlePath), AsrJobFiles.cueTokens),
     );
     if (!sidecar.existsSync()) return null;
-    final List<({List<String> tokens, List<int> offsetsMs})>? rows;
+    final List<AsrCueTokenTiming>? rows;
     try {
-      rows = parseAsrCueTokens(await sidecar.readAsString());
+      rows = parseAsrCueTokenTimings(await sidecar.readAsString());
     } on FileSystemException catch (error) {
       developer.log(
         'ASR cue token sidecar unreadable: ${sidecar.path}',
@@ -446,10 +487,7 @@ class AsrTranscriptionService {
       );
       return null;
     }
-    return <AsrCueTokenTiming>[
-      for (final ({List<String> tokens, List<int> offsetsMs}) row in rows)
-        AsrCueTokenTiming(tokens: row.tokens, offsetsMs: row.offsetsMs),
-    ];
+    return rows;
   }
 
   /// 全部音频的总时长（毫秒）；任一文件探不出就返回 null（策略按未知处理，
@@ -464,21 +502,54 @@ class AsrTranscriptionService {
     return total;
   }
 
-  /// 丢弃该组音频在该语言下的全部转录进度与产物。
-  Future<void> discard(List<String> audioPaths, AsrLanguage language) async {
-    final Directory dir = await jobDirFor(audioPaths, language);
+  /// 丢弃该组音频在该语言下的全部转录进度与产物。[segments] 见 [jobDirFor]：
+  /// 只丢这一组分段对应的任务，同一文件不给分段的任务不受影响。
+  Future<void> discard(
+    List<String> audioPaths,
+    AsrLanguage language, {
+    List<AsrSegmentSpan>? segments,
+  }) async {
+    final Directory dir = await jobDirFor(
+      audioPaths,
+      language,
+      segments: segments,
+    );
     if (dir.existsSync()) await dir.delete(recursive: true);
   }
 
   /// 装载引擎并构造任务（不开跑；调用方订阅 [AsrRunningTranscription.run]）。
+  ///
+  /// [segments]：「按给定分段识别」。给了就不用内部切段器（VAD / 滑窗），每段
+  /// 识别成**一条** cue，cue 起止严格等于给定分段（见 [AsrFixedSegmenter] 与
+  /// `AsrCueBuilder.buildOnePerSegment`）；识别为空的段不出 cue。分段相对音频
+  /// 文件起点，所以只支持单个音频文件；不合法的分段（负起点、终点不大于起点）
+  /// 直接抛 [ArgumentError]。任务 id 含分段指纹（[jobIdFor]），查状态 / 取产物 /
+  /// 丢弃时要传同一组分段。
   Future<AsrRunningTranscription> start({
     required List<String> audioPaths,
     required AsrLanguage language,
     required AsrEncoderVariant variant,
     required AsrAccelerationPreference preference,
+    List<AsrSegmentSpan>? segments,
   }) async {
+    final List<AsrSegmentSpan>? spans =
+        segments == null ? null : List<AsrSegmentSpan>.unmodifiable(segments);
+    if (spans != null) {
+      if (audioPaths.length != 1) {
+        throw ArgumentError.value(
+          audioPaths.length,
+          'audioPaths',
+          '给定分段（segments）只支持单个音频文件',
+        );
+      }
+      validateAsrSegmentSpans(spans);
+    }
     final AsrModelStore store = await _openStore(language, audioProfile);
-    final Directory jobDir = await jobDirFor(audioPaths, language);
+    final Directory jobDir = await jobDirFor(
+      audioPaths,
+      language,
+      segments: spans,
+    );
     // 素材总时长（探测失败的文件按未知处理）：决定装载时预热几个静态桶。
     final int? materialMs = await _probeMaterialMs(audioPaths);
     if (runInIsolate) {
@@ -502,6 +573,7 @@ class AsrTranscriptionService {
           materialMs: materialMs,
           greedySessions: greedySessions,
           greedyIntraOpThreads: greedyIntraOpThreads,
+          segments: spans,
         ),
       );
     }
@@ -526,6 +598,7 @@ class AsrTranscriptionService {
         segmenter: buildAsrSegmenter(
           profile: audioProfile,
           sessions: sessions,
+          segments: spans,
         ),
         decoder: decoder,
         batchSize: batchSize ??
@@ -533,6 +606,7 @@ class AsrTranscriptionService {
         chunkSeconds: chunkSeconds,
         statsProvider: () => decoder.stats,
         usePipeline: usePipeline,
+        oneCuePerSegment: spans != null,
       );
       return AsrInProcessTranscription(
         sessions: sessions,

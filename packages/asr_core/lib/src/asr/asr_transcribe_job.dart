@@ -388,6 +388,7 @@ class AsrTranscribeJob {
     this.progressInterval = const Duration(milliseconds: 500),
     this.statsProvider,
     this.usePipeline = true,
+    this.oneCuePerSegment = false,
   })  : assert(audioPaths.isNotEmpty),
         assert(batchSize > 0),
         assert(chunkSeconds > 0);
@@ -429,6 +430,10 @@ class AsrTranscribeJob {
 
   /// 解码器支持三段式时是否走流水线（false = 逐批 decodeBatch，基准对照用）。
   final bool usePipeline;
+
+  /// 收尾时一段一条 cue、时间严格沿用段的原始分段（[AsrCueBuilder.buildOnePerSegment]）
+  /// 而不是按句末标点重切。配「按给定分段识别」（`AsrFixedSegmenter`）用。
+  final bool oneCuePerSegment;
 
   bool _pauseRequested = false;
   bool _discardPending = false;
@@ -862,10 +867,12 @@ class AsrTranscribeJob {
       audioPaths.length,
       (int i) => durations[i] ?? _maxEndMs(all, i),
     );
-    final List<AsrCue> cues = cueBuilder.build(
-      all,
-      fileOffsetsMs: asrFileOffsetsFromDurations(fileDurationsMs),
+    final List<int> fileOffsetsMs = asrFileOffsetsFromDurations(
+      fileDurationsMs,
     );
+    final List<AsrCue> cues = oneCuePerSegment
+        ? cueBuilder.buildOnePerSegment(all, fileOffsetsMs: fileOffsetsMs)
+        : cueBuilder.build(all, fileOffsetsMs: fileOffsetsMs);
     await _srtFile.writeAsString(serializeAsrCuesToSrt(cues), flush: true);
     await _cueTokensFile.writeAsString(
       serializeAsrCueTokens(cues),

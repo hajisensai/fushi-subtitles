@@ -43,6 +43,7 @@ class AsrCue {
     required this.audioFileIndex,
     this.tokens = const <String>[],
     this.tokenOffsetsMs = const <int>[],
+    this.tokenEndOffsetsMs,
   });
 
   final int startMs;
@@ -59,8 +60,20 @@ class AsrCue {
   final List<String> tokens;
   final List<int> tokenOffsetsMs;
 
+  /// 各 token 相对 [startMs] 的**结束**时刻，与 [tokens] 等长；null = 未知
+  /// （解码器给不出终点，或旧检查点）。写进 sidecar 的 `e` 字段。
+  final List<int>? tokenEndOffsetsMs;
+
   int get durationMs => endMs - startMs;
 }
+
+/// [ends]（绝对毫秒）按下标 [idx] 取出、换成相对 [base] 的偏移；[ends] 为 null 时
+/// 返回 null。与起点同口径夹到 ≥ 0（cue 起点被挤后时首 token 可能早于它）。
+List<int>? _relativeEnds(List<int>? ends, Iterable<int> idx, int base) =>
+    ends == null
+        ? null
+        : List<int>.unmodifiable(
+            idx.map((int i) => math.max(0, ends[i] - base)));
 
 final RegExp _nonSpoken = RegExp(r'[\s\p{P}\p{S}]', unicode: true);
 
@@ -204,8 +217,67 @@ class AsrCueBuilder {
           audioFileIndex: prev.audioFileIndex,
           tokens: prev.tokens,
           tokenOffsetsMs: prev.tokenOffsetsMs,
+          tokenEndOffsetsMs: prev.tokenEndOffsetsMs,
         );
       }
+    }
+    return out;
+  }
+
+  /// 「按给定分段识别」的建 cue：**一段一条 cue**，时间严格沿用给定分段
+  /// （段的 `rawStartMs` / `rawEndMs`，即 `AsrFixedSegmenter` 写进去的原始分段；
+  /// 缺失时退回段起止）。
+  ///
+  /// 与 [build] 的差别都是有意的：
+  /// - 不按句末标点 / token 间隙再切——分段来自外部系统（MOSS），切点由它负责，
+  ///   多句长条的拆分是显示后处理的事（`fushi_asr_subtitles` 的长条拆分）。
+  /// - 不做跨段「不重叠」兜底——给定分段本身就可能重叠（多人同时说话），
+  ///   改掉任何一个时间都违背「严格沿用」。
+  /// - 识别为空、或只剩标点的段不出 cue；SRT 与 tokens sidecar 由同一份 cue
+  ///   列表写出，行号照样一一对应。
+  List<AsrCue> buildOnePerSegment(
+    List<AsrTranscribedSegment> segments, {
+    List<int> fileOffsetsMs = const <int>[],
+  }) {
+    final List<AsrTranscribedSegment> ordered =
+        List<AsrTranscribedSegment>.of(segments)
+          ..sort((AsrTranscribedSegment a, AsrTranscribedSegment b) {
+            final int byFile = a.audioFileIndex.compareTo(b.audioFileIndex);
+            if (byFile != 0) return byFile;
+            final int byStart = (a.rawStartMs ?? a.startMs).compareTo(
+              b.rawStartMs ?? b.startMs,
+            );
+            return byStart != 0
+                ? byStart
+                : (a.rawEndMs ?? a.endMs).compareTo(b.rawEndMs ?? b.endMs);
+          });
+    final List<AsrCue> out = <AsrCue>[];
+    for (final AsrTranscribedSegment seg in ordered) {
+      if (seg.tokens.isEmpty) continue;
+      final String text = seg.tokens.join().trim();
+      if (text.isEmpty || _punctOnly.hasMatch(text)) continue;
+      final int offset = seg.audioFileIndex < fileOffsetsMs.length
+          ? fileOffsetsMs[seg.audioFileIndex]
+          : 0;
+      final int start = seg.rawStartMs ?? seg.startMs;
+      final int end = seg.rawEndMs ?? seg.endMs;
+      out.add(
+        AsrCue(
+          startMs: start + offset,
+          endMs: end + offset,
+          text: text,
+          audioFileIndex: seg.audioFileIndex,
+          tokens: seg.tokens,
+          tokenOffsetsMs: List<int>.unmodifiable(
+            seg.tokenTimesMs.map((int t) => math.max(0, t - start)),
+          ),
+          tokenEndOffsetsMs: _relativeEnds(
+            seg.tokenEndTimesMs,
+            Iterable<int>.generate(seg.tokens.length),
+            start,
+          ),
+        ),
+      );
     }
     return out;
   }
@@ -249,6 +321,10 @@ class AsrCueBuilder {
       // 收一串同文件、首尾相接的滑窗段。
       final List<String> tokens = <String>[...first.tokens];
       final List<int> times = <int>[...first.tokenTimesMs];
+      // 终点：整串都有才有，任一段缺（旧检查点混着新段）就整串按未知处理。
+      List<int>? ends = first.tokenEndTimesMs == null
+          ? null
+          : <int>[...first.tokenEndTimesMs!];
       int runEnd = first.endMs;
       int j = i + 1;
       while (j < sorted.length &&
@@ -257,6 +333,8 @@ class AsrCueBuilder {
           sorted[j].startMs == runEnd) {
         tokens.addAll(sorted[j].tokens);
         times.addAll(sorted[j].tokenTimesMs);
+        final List<int>? more = sorted[j].tokenEndTimesMs;
+        ends = ends == null || more == null ? null : (ends..addAll(more));
         runEnd = sorted[j].endMs;
         j++;
       }
@@ -295,6 +373,9 @@ class AsrCueBuilder {
             rawEndMs: end,
             tokens: List<String>.unmodifiable(tokens.sublist(a, b)),
             tokenTimesMs: List<int>.unmodifiable(times.sublist(a, b)),
+            tokenEndTimesMs: ends == null
+                ? null
+                : List<int>.unmodifiable(ends.sublist(a, b)),
           ),
         );
       }
@@ -318,9 +399,8 @@ class AsrCueBuilder {
 
       // 段首 cue 从 VAD 未外扩的语音起点开始：外扩 pad 只为喂模型防首字被吃，
       // 拿它当起点字幕会比人声早约半秒。缺 raw（旧检查点）时退回外扩边界。
-      int start = isFirst
-          ? (seg.rawStartMs ?? seg.startMs)
-          : firstTokenMs - leadInMs;
+      int start =
+          isFirst ? (seg.rawStartMs ?? seg.startMs) : firstTokenMs - leadInMs;
       if (cues.isNotEmpty && start < cues.last.endMs) start = cues.last.endMs;
       if (start < seg.startMs) start = seg.startMs;
 
@@ -358,6 +438,7 @@ class AsrCueBuilder {
           tokenOffsetsMs: List<int>.unmodifiable(
             idx.map((int i) => math.max(0, seg.tokenTimesMs[i] - start)),
           ),
+          tokenEndOffsetsMs: _relativeEnds(seg.tokenEndTimesMs, idx, start),
         ),
       );
     }
@@ -470,35 +551,86 @@ String serializeAsrCuesToSrt(List<AsrCue> cues) {
 
 /// 与 [serializeAsrCuesToSrt] **同一份 cue 列表**的逐 token 时间 sidecar：
 /// JSON Lines，第 n 行对应 SRT 第 n 条（同样跳过空文本 cue），
-/// `{"t":[token...],"o":[相对 cue 起点的毫秒...]}`。SRT 是给通用解析器的出境
-/// 格式，token 时间装不进去；导入链路认出转录产物后按行号配回
-/// （`AsrTranscriptionService.attachCueTokenTiming`）。
+/// `{"t":[token...],"o":[相对 cue 起点的毫秒...],"e":[相对 cue 起点的结束毫秒...]}`。
+/// `e` 可选：解码器给不出终点（transducer）时整键不写，旧文件也没有它。SRT 是给
+/// 通用解析器的出境格式，token 时间装不进去；导入链路认出转录产物后按行号配回
+/// （`AsrTranscriptionService.readCueTokenTimings`）。
 String serializeAsrCueTokens(List<AsrCue> cues) =>
-    _serializeTokenRows(<(List<String>, List<int>)>[
+    _serializeTokenRows(<(List<String>, List<int>, List<int>?)>[
       for (final AsrCue cue in cues)
-        if (cue.text.isNotEmpty) (cue.tokens, cue.tokenOffsetsMs),
+        if (cue.text.isNotEmpty)
+          (cue.tokens, cue.tokenOffsetsMs, cue.tokenEndOffsetsMs),
     ]);
 
 /// 与 [serializeAsrCueTokens] 同一格式，但输入是已经和 SRT 行号对齐的
 /// [AsrCueTokenTiming] 列表（转录结果读回后的形态：`TranscribeOutcome.tokenTimings`）。
 /// 调用方保证列表与写出的 SRT 一一对应，这里不再按空文本过滤。
 String serializeAsrCueTokenTimings(List<AsrCueTokenTiming> timings) =>
-    _serializeTokenRows(<(List<String>, List<int>)>[
-      for (final AsrCueTokenTiming t in timings) (t.tokens, t.offsetsMs),
+    _serializeTokenRows(<(List<String>, List<int>, List<int>?)>[
+      for (final AsrCueTokenTiming t in timings)
+        (t.tokens, t.offsetsMs, t.endOffsetsMs),
     ]);
 
-String _serializeTokenRows(List<(List<String>, List<int>)> rows) {
+String _serializeTokenRows(List<(List<String>, List<int>, List<int>?)> rows) {
   final StringBuffer sb = StringBuffer();
-  for (final (List<String> tokens, List<int> offsets) in rows) {
+  for (final (List<String> tokens, List<int> offsets, List<int>? ends)
+      in rows) {
     sb
-      ..write(jsonEncode(<String, Object?>{'t': tokens, 'o': offsets}))
+      ..write(
+        jsonEncode(<String, Object?>{
+          't': tokens,
+          'o': offsets,
+          if (ends != null) 'e': ends,
+        }),
+      )
       ..write('\n');
   }
   return sb.toString();
 }
 
-/// 解析 [serializeAsrCueTokens] 的产物。坏行（半行/非 JSON/长度不等）整体判
-/// 无效返回 null——sidecar 与 SRT 按行号配对，缺一行就全错位，宁可不挂。
+/// 解析 [serializeAsrCueTokens] 的产物，带上可选的终点（`e`）。
+///
+/// 坏行判据与 [parseAsrCueTokens] 相同；`e` 存在但长度不等 / 不是数字同样整体判
+/// 无效。没有 `e` 的行（旧文件、transducer 产物）[AsrCueTokenTiming.endOffsetsMs]
+/// 为 null。
+List<AsrCueTokenTiming>? parseAsrCueTokenTimings(String text) {
+  final List<AsrCueTokenTiming> out = <AsrCueTokenTiming>[];
+  for (final String raw in const LineSplitter().convert(text)) {
+    final String line = raw.trim();
+    if (line.isEmpty) continue;
+    try {
+      final Object? decoded = jsonDecode(line);
+      if (decoded is! Map<String, Object?>) return null;
+      final List<String> tokens = (decoded['t'] as List<Object?>)
+          .cast<String>()
+          .toList(growable: false);
+      final List<int> offsets = (decoded['o'] as List<Object?>)
+          .map((Object? v) => (v as num).toInt())
+          .toList(growable: false);
+      if (tokens.length != offsets.length) return null;
+      final Object? e = decoded['e'];
+      List<int>? ends;
+      if (e != null) {
+        ends = (e as List<Object?>)
+            .map((Object? v) => (v as num).toInt())
+            .toList(growable: false);
+        if (ends.length != tokens.length) return null;
+      }
+      out.add(
+        AsrCueTokenTiming(
+            tokens: tokens, offsetsMs: offsets, endOffsetsMs: ends),
+      );
+    } on Object {
+      return null;
+    }
+  }
+  return out;
+}
+
+/// 解析 [serializeAsrCueTokens] 的产物（只取 token 与起点，忽略可选的 `e`——
+/// 老调用方的记录类型不变；要终点用 [parseAsrCueTokenTimings]）。坏行（半行/非
+/// JSON/长度不等）整体判无效返回 null——sidecar 与 SRT 按行号配对，缺一行就全
+/// 错位，宁可不挂。
 List<({List<String> tokens, List<int> offsetsMs})>? parseAsrCueTokens(
   String text,
 ) {
@@ -510,8 +642,8 @@ List<({List<String> tokens, List<int> offsetsMs})>? parseAsrCueTokens(
     try {
       final Object? decoded = jsonDecode(line);
       if (decoded is! Map<String, Object?>) return null;
-      final List<String> tokens = (decoded['t'] as List<Object?>)
-          .cast<String>();
+      final List<String> tokens =
+          (decoded['t'] as List<Object?>).cast<String>();
       final List<int> offsets = (decoded['o'] as List<Object?>)
           .map((Object? v) => (v as num).toInt())
           .toList(growable: false);
@@ -550,11 +682,19 @@ List<int> asrFileOffsetsFromDurations(List<int> fileDurationsMs) {
 /// 消费方是「命中 cue 按正文句界重切」（`cue_sentence_resegmenter.dart`）。
 @immutable
 class AsrCueTokenTiming {
-  const AsrCueTokenTiming({required this.tokens, required this.offsetsMs})
-    : assert(tokens.length == offsetsMs.length);
+  const AsrCueTokenTiming({
+    required this.tokens,
+    required this.offsetsMs,
+    this.endOffsetsMs,
+  })  : assert(tokens.length == offsetsMs.length),
+        assert(endOffsetsMs == null || endOffsetsMs.length == tokens.length);
 
   final List<String> tokens;
   final List<int> offsetsMs;
+
+  /// 各 token 相对 cue 起点的**结束**时刻（与 [tokens] 等长）；null = 未知
+  /// （旧 sidecar 没有 `e`，或解码器给不出终点）。
+  final List<int>? endOffsetsMs;
 
   int get length => tokens.length;
   bool get isEmpty => tokens.isEmpty;

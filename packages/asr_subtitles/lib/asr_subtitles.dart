@@ -9,6 +9,9 @@
 ///    （[decideSubtitleSync]，含 CM 断点分段与多参考投票），再按结果只改写字幕字节
 ///    里的时间戳（[retimeSubtitleBytes]，编码 / 样式 / 行尾逐字节保留）。参考轨从哪
 ///    抽（ffmpeg / 容器 demux）本包同样不管，喂进来的只是开始时刻列表。
+/// 4. 显示后处理：多句长条按句末拆开，切点时间取自 ASR 的逐 token 时间
+///    （[splitLongSubtitleCues]），以及标点统一为全角
+///    （[normalizeSubtitlePunctuationToFullWidth]）。
 ///
 /// 转录从哪来本包不管：喂进来的只是 [RetimingTranscription] 这个窄接口（cue 列表
 /// 加可选的逐 token 发射时间）。宿主可以用本仓的 ONNX 转录，也可以用别处产的
@@ -18,6 +21,7 @@ library;
 export 'src/cancellation.dart';
 export 'src/subtitle_clock.dart';
 export 'src/subtitle_format.dart';
+export 'src/subtitle_long_cue_split.dart';
 export 'src/subtitle_reference_alignment.dart';
 export 'src/subtitle_retiming.dart';
 export 'src/subtitle_speech_text.dart';

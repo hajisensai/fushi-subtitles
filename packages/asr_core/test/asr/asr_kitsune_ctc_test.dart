@@ -151,6 +151,22 @@ void main() {
     expect(d.tokens, <String>['「', '今', '日', 'は', '。']);
     // 今 = 帧 1；日 = 帧 1 + min(3-1, 2)/2 帧；は = 帧 5；。归は；「归今。
     expect(d.tokenOffsetsMs, <int>[80, 80, 160, 400, 400]);
+    expect(d.tokenEndOffsetsMs, isNull, reason: '没给 endFrames 就没有终点');
+  });
+
+  test('字时终点：字首尾相接，末字到同 id 末帧结束；归位的标点终点 = 起点', () {
+    final AsrDecodedSegment d = kitsuneCharTiming(
+      table: tokens,
+      ids: <int>[5, 2, 1, 3, 4],
+      frames: <int>[0, 1, 3, 5, 9],
+      endFrames: <int>[1, 3, 4, 6, 10],
+      frameMs: 80,
+      segmentMs: 1000,
+    );
+    expect(d.tokens, <String>['「', '今', '日', 'は', '。']);
+    expect(d.tokenOffsetsMs, <int>[80, 80, 160, 400, 400]);
+    // 今 [80,160)、日 [160, max(240, 帧 3 结束 240))、は [400, 480)。
+    expect(d.tokenEndOffsetsMs, <int>[80, 160, 240, 480, 400]);
   });
 
   test('字时：夹进段长并单调', () {
