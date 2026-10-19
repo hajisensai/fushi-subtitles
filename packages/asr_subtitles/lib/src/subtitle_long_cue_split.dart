@@ -20,12 +20,14 @@
 /// 不按 token 时间裁掉条目首尾的静音：同一批实测里那样做时间轴 IoU 反而从 0.773
 /// 降到 0.755。
 ///
-/// 与 Python 原型的已知差异（都是有意的）：
-/// - token sidecar（`transcript.tokens.jsonl`）只有起点，没有终点：每个 token 的
-///   终点取下一个 token 的起点，最后一个取 cue 终点；所以「停顿」量的是相邻 token
-///   **起点之间**的间隔，而不是原型里 760M 词级时间戳的「前词结束到后词开始」。
-///   [SubtitleLongCueSplitOptions.minPauseMs] 的默认值沿用原型的 350 ms，按起点
-///   间隔量时它偏松（要在 Parakeet 的 sidecar 上重测）。
+/// token 时间带终点（sidecar 的 `e` 字段，CTC 解码器产出）时与原型语义一致：
+/// 停顿 = 上一 token 终点到下一 token 起点，−0.1 s 的提前量真的生效（上一字结束
+/// 早于下一字开始）。**没有终点时的退化**（旧 sidecar、transducer）：每个 token 的
+/// 终点取下一个 token 的起点、最后一个取 cue 终点，于是字符时间首尾相接，切点就落
+/// 在下一 token 起点本身；停顿改量相邻 token **起点之间**的间隔，同一个 350 ms 阈值
+/// 下偏松。
+///
+/// 与 Python 原型的其他差异（都是有意的）：
 /// - 句末之后紧跟的闭合括号 / 引号（`」』）)` 等）并进前一句，不会被甩到下一条开头。
 /// - 夹紧之后切点若仍落在 cue 之外（条目太短、切点太多），丢掉这个切点（相邻两片
 ///   合并），不产出时长为负的条目。
@@ -56,7 +58,8 @@ class SubtitleLongCueSplitOptions {
   /// 去掉首尾空白后短于它的片段并进前一片（前一片本身太短时，后一片也并进来）。
   final int minPieceChars;
 
-  /// 无句末时，最长的 token 起点间隔至少这么长才在那里切。
+  /// 无句末时，最长的 token 间停顿（上一 token 终点到下一 token 起点；没有终点时
+  /// 退回起点间隔）至少这么长才在那里切。
   final int minPauseMs;
 
   /// 切点 = 下一句首字开始时间减去这么多（但不早于上一字结束）。
@@ -164,10 +167,43 @@ List<int> _sentenceCuts(List<int> runes, int minPieceChars) {
   ];
 }
 
+/// 拆分产物的一片：拆出来的 cue，以及落在这一片里的 token 时间（偏移已改成相对
+/// **这一片**的起点）。导出时按这个列表写 SRT 和 tokens sidecar，两者行号一一对应。
+class SubtitleCueWithTokenTiming {
+  const SubtitleCueWithTokenTiming(this.cue, this.tokenTiming);
+
+  final SubtitleCue cue;
+
+  /// 这一片的 token 时间；原 cue 没给 token 时间、或按字数比例拆（没法把 token
+  /// 归到片）时为 null。偏移可以为负（token 起点早于片起点：切点被夹紧挪后时）。
+  final AsrCueTokenTiming? tokenTiming;
+}
+
 /// 拆一整份字幕。[tokenTimings] 给出时必须与 [cues] 等长、按下标一一对应（某条没有
 /// 就放 null）；不等长直接抛 [ArgumentError]——错位比没有更糟。输出按顺序重新编号
-/// （从 1 起）。
+/// （从 1 起）。要连 token 时间一起拆用 [splitLongSubtitleCuesWithTokenTimings]。
 List<SubtitleCue> splitLongSubtitleCues(
+  List<SubtitleCue> cues, {
+  List<AsrCueTokenTiming?>? tokenTimings,
+  SubtitleLongCueSplitOptions options = const SubtitleLongCueSplitOptions(),
+}) =>
+    <SubtitleCue>[
+      for (final SubtitleCueWithTokenTiming piece
+          in splitLongSubtitleCuesWithTokenTimings(
+        cues,
+        tokenTimings: tokenTimings,
+        options: options,
+      ))
+        piece.cue,
+    ];
+
+/// [splitLongSubtitleCues] 的同时返回每片 token 时间的版本。
+///
+/// token 归属：按 token 第一个有效字符在 token 字符流里的位置，落在哪一片的字符流
+/// 区间就归哪一片（片界 = 切点在字符流里的对齐位置，与算切点时刻用的是同一个对齐）。
+/// 切点落在多字 token 内部时，整个 token 归它起点所在的那一片。没拆的条目原样带回
+/// 自己的 token 时间。
+List<SubtitleCueWithTokenTiming> splitLongSubtitleCuesWithTokenTimings(
   List<SubtitleCue> cues, {
   List<AsrCueTokenTiming?>? tokenTimings,
   SubtitleLongCueSplitOptions options = const SubtitleLongCueSplitOptions(),
@@ -179,19 +215,23 @@ List<SubtitleCue> splitLongSubtitleCues(
       '必须与 cues（${cues.length} 条）一一对应',
     );
   }
-  final List<SubtitleCue> out = <SubtitleCue>[];
+  final List<SubtitleCueWithTokenTiming> out = <SubtitleCueWithTokenTiming>[];
   for (int i = 0; i < cues.length; i++) {
-    for (final SubtitleCue piece in splitLongSubtitleCue(
+    for (final SubtitleCueWithTokenTiming piece
+        in splitLongSubtitleCueWithTokenTiming(
       cues[i],
       tokenTiming: tokenTimings?[i],
       options: options,
     )) {
       out.add(
-        SubtitleCue(
-          index: out.length + 1,
-          startMs: piece.startMs,
-          endMs: piece.endMs,
-          text: piece.text,
+        SubtitleCueWithTokenTiming(
+          SubtitleCue(
+            index: out.length + 1,
+            startMs: piece.cue.startMs,
+            endMs: piece.cue.endMs,
+            text: piece.cue.text,
+          ),
+          piece.tokenTiming,
         ),
       );
     }
@@ -202,30 +242,59 @@ List<SubtitleCue> splitLongSubtitleCues(
 /// 拆一条。不超长、或找不到切点时原样返回（单元素列表）。各片沿用原 cue 的
 /// [SubtitleCue.index]，重新编号交给 [splitLongSubtitleCues]。
 ///
-/// [tokenTiming] 是这条 cue 的识别 token 及其相对 cue 起点的开始时刻
-/// （`transcript.tokens.jsonl` 的一行）；它的文本可以与 [SubtitleCue.text] 不同
-/// （LLM 校对过），对齐容忍增删改。null 或有效字符不足 2 个时按字数比例分时长。
+/// [tokenTiming] 是这条 cue 的识别 token 及其相对 cue 起点的开始（与可选的结束）
+/// 时刻（`transcript.tokens.jsonl` 的一行）；它的文本可以与 [SubtitleCue.text]
+/// 不同（LLM 校对过），对齐容忍增删改。null 或有效字符不足 2 个时按字数比例分时长。
 List<SubtitleCue> splitLongSubtitleCue(
   SubtitleCue cue, {
   AsrCueTokenTiming? tokenTiming,
   SubtitleLongCueSplitOptions options = const SubtitleLongCueSplitOptions(),
+}) =>
+    <SubtitleCue>[
+      for (final SubtitleCueWithTokenTiming piece
+          in splitLongSubtitleCueWithTokenTiming(
+        cue,
+        tokenTiming: tokenTiming,
+        options: options,
+      ))
+        piece.cue,
+    ];
+
+/// [splitLongSubtitleCue] 的同时返回每片 token 时间的版本（归属规则见
+/// [splitLongSubtitleCuesWithTokenTimings]）。
+List<SubtitleCueWithTokenTiming> splitLongSubtitleCueWithTokenTiming(
+  SubtitleCue cue, {
+  AsrCueTokenTiming? tokenTiming,
+  SubtitleLongCueSplitOptions options = const SubtitleLongCueSplitOptions(),
 }) {
-  if (!subtitleCueNeedsSplit(cue, options: options)) {
-    return <SubtitleCue>[cue];
-  }
+  final List<SubtitleCueWithTokenTiming> unchanged =
+      <SubtitleCueWithTokenTiming>[
+    SubtitleCueWithTokenTiming(cue, tokenTiming),
+  ];
+  if (!subtitleCueNeedsSplit(cue, options: options)) return unchanged;
   final List<int> text = cue.text.runes.toList(growable: false);
   final _CharTimes? chars =
       tokenTiming == null ? null : _charTimes(tokenTiming, cue);
   if (chars == null || chars.runes.length < 2) {
-    return _splitProportional(cue, text, options);
+    final List<_Piece>? pieces = _splitProportional(cue, text, options);
+    if (pieces == null) return unchanged;
+    return <SubtitleCueWithTokenTiming>[
+      for (final _Piece p in pieces) SubtitleCueWithTokenTiming(p.cue, null),
+    ];
   }
   final List<int> map = _alignToStream(text, chars.runes);
 
-  /// 切在文本位置 [k] 之前时的时刻（相对 cue 起点，毫秒）。
-  double boundaryTime(int k) {
+  /// 切在文本位置 [k] 之前时，下一片首字在字符流里的下标（夹进 `[1, 流长 − 1]`）。
+  int streamIndex(int k) {
     int j = map[k];
     if (j < 1) j = 1;
     if (j > chars.runes.length - 1) j = chars.runes.length - 1;
+    return j;
+  }
+
+  /// 切在文本位置 [k] 之前时的时刻（相对 cue 起点，毫秒）。
+  double boundaryTime(int k) {
+    final int j = streamIndex(k);
     final double next = chars.startMs[j] - options.boundaryLeadMs;
     final double prevEnd = chars.endMs[j - 1];
     return next > prevEnd ? next : prevEnd;
@@ -236,7 +305,7 @@ List<SubtitleCue> splitLongSubtitleCue(
   if (cuts.isEmpty && durationMs > options.maxDurationMs) {
     cuts = _pauseCut(text, tokenTiming!, map, options);
   }
-  if (cuts.isEmpty) return <SubtitleCue>[cue];
+  if (cuts.isEmpty) return unchanged;
   final double lo = options.edgeMarginMs.toDouble();
   final double hi = (durationMs - options.edgeMarginMs).toDouble();
   final List<double> times = <double>[
@@ -246,11 +315,50 @@ List<SubtitleCue> splitLongSubtitleCue(
     final double floor = times[i - 1] + options.minPieceGapMs;
     if (times[i] < floor) times[i] = floor;
   }
-  return _pieces(cue, text, cuts, times);
+  final List<_Piece>? pieces = _pieces(cue, text, cuts, times);
+  if (pieces == null) return unchanged;
+  // 每片在字符流里的起点：第一片从 0 起，其余取切点的对齐位置。
+  final List<int> streamStarts = <int>[
+    for (int p = 0; p < pieces.length; p++)
+      p == 0 ? 0 : streamIndex(pieces[p].textStart),
+  ];
+  final List<List<int>> owned =
+      List<List<int>>.generate(pieces.length, (_) => <int>[]);
+  for (int t = 0; t < tokenTiming!.tokens.length; t++) {
+    final int c = chars.tokenCharStart[t];
+    int p = pieces.length - 1;
+    while (p > 0 && c < streamStarts[p]) {
+      p--;
+    }
+    owned[p].add(t);
+  }
+  final List<int>? ends = tokenTiming.endOffsetsMs;
+  return <SubtitleCueWithTokenTiming>[
+    for (int p = 0; p < pieces.length; p++)
+      SubtitleCueWithTokenTiming(
+        pieces[p].cue,
+        AsrCueTokenTiming(
+          tokens: <String>[for (final int t in owned[p]) tokenTiming.tokens[t]],
+          offsetsMs: <int>[
+            for (final int t in owned[p])
+              tokenTiming.offsetsMs[t] - (pieces[p].cue.startMs - cue.startMs),
+          ],
+          endOffsetsMs: ends == null
+              ? null
+              : <int>[
+                  for (final int t in owned[p])
+                    ends[t] - (pieces[p].cue.startMs - cue.startMs),
+                ],
+        ),
+      ),
+  ];
 }
 
-/// 无句末的超长条：在最长的 token 起点间隔处切（够 [SubtitleLongCueSplitOptions.minPauseMs]
+/// 无句末的超长条：在最长的 token 间停顿处切（够 [SubtitleLongCueSplitOptions.minPauseMs]
 /// 才切），切点映射回最终文本里离它最近的位置；两边都要留够 minPieceChars 个字。
+///
+/// 停顿 = 上一 token **终点**到下一 token 起点；没有终点（旧 sidecar / transducer）
+/// 时退回相邻 token 起点之间的间隔（含 token 自身时长，同一阈值下更容易切）。
 List<int> _pauseCut(
   List<int> text,
   AsrCueTokenTiming timing,
@@ -258,11 +366,12 @@ List<int> _pauseCut(
   SubtitleLongCueSplitOptions options,
 ) {
   final List<int> o = timing.offsetsMs;
+  final List<int>? e = timing.endOffsetsMs;
   if (o.length < 2) return const <int>[];
-  int bestGap = -1;
+  int bestGap = -0x7fffffff;
   int bestAt = -1;
   for (int i = 0; i + 1 < o.length; i++) {
-    final int gap = o[i + 1] - o[i];
+    final int gap = o[i + 1] - (e == null ? o[i] : e[i]);
     // 同长取靠后的一处：与原型 `max(gaps)` 对 (gap, i) 元组取最大一致。
     if (gap >= bestGap) {
       bestGap = gap;
@@ -291,14 +400,23 @@ List<int> _pauseCut(
   return <int>[k];
 }
 
+/// 拆出来的一片及其在最终文本里的起点（码点偏移，未去空白）。
+class _Piece {
+  const _Piece(this.cue, this.textStart);
+
+  final SubtitleCue cue;
+  final int textStart;
+}
+
 /// 按字数比例分时长（没有 token 时间时）：切点 = 起点 + 时长 × 偏移 / 总字数。
-List<SubtitleCue> _splitProportional(
+/// 没有切点时返回 null。
+List<_Piece>? _splitProportional(
   SubtitleCue cue,
   List<int> text,
   SubtitleLongCueSplitOptions options,
 ) {
   final List<int> cuts = _sentenceCuts(text, options.minPieceChars);
-  if (cuts.isEmpty) return <SubtitleCue>[cue];
+  if (cuts.isEmpty) return null;
   final int duration = cue.endMs - cue.startMs;
   return _pieces(cue, text, cuts, <double>[
     for (final int k in cuts) duration * k / text.length,
@@ -306,8 +424,9 @@ List<SubtitleCue> _splitProportional(
 }
 
 /// 按切点（码点偏移）与切点时刻（相对 cue 起点）组装各片；去掉首尾空白后为空的
-/// 片段不输出，落在 cue 之外 / 不递增的切点丢掉（相邻两片合并）。
-List<SubtitleCue> _pieces(
+/// 片段不输出，落在 cue 之外 / 不递增的切点丢掉（相邻两片合并）。一个切点都不剩时
+/// 返回 null（= 不拆）。
+List<_Piece>? _pieces(
   SubtitleCue cue,
   List<int> text,
   List<int> cuts,
@@ -323,24 +442,27 @@ List<SubtitleCue> _pieces(
     keptCuts.add(cuts[i]);
     keptTimes.add(t);
   }
-  if (keptCuts.isEmpty) return <SubtitleCue>[cue];
+  if (keptCuts.isEmpty) return null;
   final List<int> edges = <int>[0, ...keptCuts, text.length];
   final List<int> bounds = <int>[
     cue.startMs,
     for (final double t in keptTimes) cue.startMs + t.round(),
     cue.endMs,
   ];
-  final List<SubtitleCue> out = <SubtitleCue>[];
+  final List<_Piece> out = <_Piece>[];
   for (int i = 0; i + 1 < edges.length; i++) {
     final String piece =
         String.fromCharCodes(text.sublist(edges[i], edges[i + 1])).trim();
     if (piece.isEmpty) continue;
     out.add(
-      SubtitleCue(
-        index: cue.index,
-        startMs: bounds[i],
-        endMs: bounds[i + 1],
-        text: piece,
+      _Piece(
+        SubtitleCue(
+          index: cue.index,
+          startMs: bounds[i],
+          endMs: bounds[i + 1],
+          text: piece,
+        ),
+        edges[i],
       ),
     );
   }
@@ -354,29 +476,42 @@ double _clamp(double v, double lo, double hi) {
 }
 
 /// token 字符流：每个有效字符（token 去首尾空白后的码点）的开始 / 结束时刻
-/// （相对 cue 起点，毫秒）。token 的时长 = 下一 token 起点 − 本 token 起点，最后
-/// 一个到 cue 终点；token 内按字符均分。
+/// （相对 cue 起点，毫秒），以及每个 token 的第一个字符在流里的下标。
+///
+/// token 的区间 = `[起点, 终点]`；没有终点时终点取下一 token 起点（最后一个取
+/// cue 终点）。token 内按字符均分（同原型 `_char_times`）。
 class _CharTimes {
-  _CharTimes(this.runes, this.startMs, this.endMs);
+  _CharTimes(this.runes, this.startMs, this.endMs, this.tokenCharStart);
 
   final List<int> runes;
   final List<double> startMs;
   final List<double> endMs;
+
+  /// 下标 = token 下标；空白 token 取它所在位置（= 下一个有效字符的下标）。
+  final List<int> tokenCharStart;
 }
 
 _CharTimes? _charTimes(AsrCueTokenTiming timing, SubtitleCue cue) {
-  if (timing.tokens.length != timing.offsetsMs.length) return null;
+  final List<int>? ends = timing.endOffsetsMs;
+  if (timing.tokens.length != timing.offsetsMs.length ||
+      (ends != null && ends.length != timing.tokens.length)) {
+    return null;
+  }
   final int duration = cue.endMs - cue.startMs;
   final List<int> runes = <int>[];
   final List<double> st = <double>[];
   final List<double> en = <double>[];
+  final List<int> tokenStart = <int>[];
   for (int i = 0; i < timing.tokens.length; i++) {
+    tokenStart.add(runes.length);
     final List<int> w = timing.tokens[i].trim().runes.toList(growable: false);
     if (w.isEmpty) continue;
     final double a = timing.offsetsMs[i].toDouble();
-    final double rawB = i + 1 < timing.offsetsMs.length
-        ? timing.offsetsMs[i + 1].toDouble()
-        : duration.toDouble();
+    final double rawB = ends != null
+        ? ends[i].toDouble()
+        : i + 1 < timing.offsetsMs.length
+            ? timing.offsetsMs[i + 1].toDouble()
+            : duration.toDouble();
     // 偏移不单调（或末 token 越过 cue 终点）时不让时长为负。
     final double b = rawB > a ? rawB : a;
     for (int c = 0; c < w.length; c++) {
@@ -385,7 +520,7 @@ _CharTimes? _charTimes(AsrCueTokenTiming timing, SubtitleCue cue) {
       en.add(a + (b - a) * (c + 1) / w.length);
     }
   }
-  return _CharTimes(runes, st, en);
+  return _CharTimes(runes, st, en, tokenStart);
 }
 
 /// 最终文本每个码点对齐到 token 字符流的哪个下标（长度 = text.length + 1，末项
