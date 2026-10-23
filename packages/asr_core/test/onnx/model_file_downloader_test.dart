@@ -58,6 +58,28 @@ Future<void> _serve(
   await response.close();
 }
 
+/// 像真实静态文件服务器那样处理 Range：起点越过文件末尾回 416 并带
+/// `Content-Range: bytes */<总长>`（[withContentRange] 为假时不带），否则同 [_serve]。
+Future<void> _serveRanged(
+  HttpRequest request,
+  List<int> body, {
+  bool withContentRange = true,
+}) async {
+  final int start = _rangeStart(request);
+  if (start > 0 && start >= body.length) {
+    request.response.statusCode = HttpStatus.requestedRangeNotSatisfiable;
+    if (withContentRange) {
+      request.response.headers.set(
+        HttpHeaders.contentRangeHeader,
+        'bytes */${body.length}',
+      );
+    }
+    await request.response.close();
+    return;
+  }
+  await _serve(request, body);
+}
+
 const ModelDownloadResilience _fast = ModelDownloadResilience(
   stallTimeout: Duration(milliseconds: 400),
   speedWindow: Duration(milliseconds: 150),
@@ -235,5 +257,92 @@ void main() {
       throwsA(isA<HttpException>()),
     );
     expect(attempts['/f.bin'], 1);
+  });
+
+  /// 预置一个 `.part` 残留。
+  void writePart(String name, List<int> bytes) =>
+      File(p.join(dir.path, '$name.part')).writeAsBytesSync(bytes);
+
+  test('.part 比 expectedBytes 长：发请求前就删掉，从 0 整文件重下', () async {
+    final List<int> body = _bytes(30 * 1024);
+    // 两条下载同时往同一个 .part 追加的产物：比真实文件长。
+    writePart('g.bin', <int>[...body, ...body.sublist(0, 7000)]);
+    handler = (HttpRequest request, int attempt) => _serveRanged(request, body);
+    await run(downloader(), <DownloadableModelFile>[
+      _File('g.bin', url('g.bin'), body.length),
+    ]);
+    await expectFile('g.bin', body);
+    expect(ranges, <String>['/g.bin null'], reason: '不该带坏偏移去续传');
+  });
+
+  test('续传被回 416 且长度对不上远端总长：删 .part 在同一次调用里重下', () async {
+    final List<int> body = _bytes(30 * 1024);
+    writePart('h.bin', <int>[...body, ...body.sublist(0, 7000)]);
+    handler = (HttpRequest request, int attempt) => _serveRanged(request, body);
+    // expectedBytes 未知：只能靠服务器的 416 发现 .part 超长。
+    await run(downloader(), <DownloadableModelFile>[
+      _File('h.bin', url('h.bin'), 0),
+    ]);
+    await expectFile('h.bin', body);
+    expect(
+        ranges, <String>['/h.bin bytes=${body.length + 7000}-', '/h.bin null']);
+  });
+
+  test('416 不带 Content-Range、远端总长无从判断：同样判 .part 不可信重下', () async {
+    final List<int> body = _bytes(30 * 1024);
+    writePart('i.bin', <int>[...body, 1, 2, 3]);
+    handler = (HttpRequest request, int attempt) =>
+        _serveRanged(request, body, withContentRange: false);
+    await run(downloader(), <DownloadableModelFile>[
+      _File('i.bin', url('i.bin'), 0),
+    ]);
+    await expectFile('i.bin', body);
+    expect(ranges, <String>['/i.bin bytes=${body.length + 3}-', '/i.bin null']);
+  });
+
+  test('expectedBytes 未知、416 的 Content-Range 总长 == .part 长度：直接转正', () async {
+    final List<int> body = _bytes(30 * 1024);
+    writePart('j.bin', body);
+    handler = (HttpRequest request, int attempt) => _serveRanged(request, body);
+    await run(downloader(), <DownloadableModelFile>[
+      _File('j.bin', url('j.bin'), 0),
+    ]);
+    await expectFile('j.bin', body);
+    expect(ranges, <String>['/j.bin bytes=${body.length}-'], reason: '不该重下');
+  });
+
+  test('.part 长度 == expectedBytes、续传回 416：直接转正（原有路径）', () async {
+    final List<int> body = _bytes(30 * 1024);
+    writePart('k.bin', body);
+    handler = (HttpRequest request, int attempt) =>
+        _serveRanged(request, body, withContentRange: false);
+    await run(downloader(), <DownloadableModelFile>[
+      _File('k.bin', url('k.bin'), body.length),
+    ]);
+    await expectFile('k.bin', body);
+    expect(ranges, <String>['/k.bin bytes=${body.length}-']);
+  });
+
+  test('重下后服务器仍回 416：如实抛出，只重下一次不打转', () async {
+    writePart('l.bin', _bytes(100));
+    handler = (HttpRequest request, int attempt) async {
+      request.response.statusCode = HttpStatus.requestedRangeNotSatisfiable;
+      await request.response.close();
+    };
+    await expectLater(
+      run(downloader(), <DownloadableModelFile>[
+        _File('l.bin', url('l.bin'), 0),
+      ]),
+      throwsA(
+        isA<ModelDownloadStatusException>().having(
+          (ModelDownloadStatusException e) => e.statusCode,
+          'statusCode',
+          HttpStatus.requestedRangeNotSatisfiable,
+        ),
+      ),
+    );
+    expect(ranges, <String>['/l.bin bytes=100-', '/l.bin null']);
+    expect(File(p.join(dir.path, 'l.bin.part')).existsSync(), isFalse,
+        reason: '不可信的 .part 必须删掉，否则下次又从同一个坏偏移 416');
   });
 }
