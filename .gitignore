@@ -5,3 +5,4 @@ pubspec.lock
 .packages
 *.onnx.fp16.onnx
 node_modules/
+native/*/target/

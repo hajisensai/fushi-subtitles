@@ -156,7 +156,7 @@ back as the last line.
 | `fushi_asr_core` | The pure-Dart transcription core: VAD segmentation, fbank, RNN-T greedy Loop graph / CTC decoding, batching and bucketing, fp16 graph conversion, model manifest and downloads, SRT output. **No Flutter, no dart:ffi, no bundled ONNX backend** | `meta` `path` `crypto` |
 | `fushi_asr_onnx_ffi` | The dart:ffi ONNX Runtime backend (CPU / DirectML / CUDA) | `fushi_asr_core` `ffi` |
 | `fushi_asr_align` | EPUB / text ↔ audio alignment: sentence-level Dice matching (including a ruby reading track), gap backfilling between anchors, cue re-splitting on sentence boundaries | `fushi_asr_core` |
-| `fushi_asr_subtitles` | Subtitle formats; retiming an existing subtitle against an ASR transcript; aligning a subtitle to a reference subtitle track by cue start times only (CM-break segments, multi-reference voting) and a byte-preserving timestamp rewriter for SRT / VTT / ASS | `fushi_asr_core` |
+| `fushi_asr_subtitles` | Subtitle formats; retiming an existing subtitle against an ASR transcript; aligning a subtitle to a reference subtitle track by cue start times only (CM-break segments, multi-reference voting) and a byte-preserving timestamp rewriter for SRT / VTT / ASS; post-processing of transcribed audiobook cues (energy snap, edge refine, in-sentence fragment merge, tempo-aware read-along margins) on a Rust core | `fushi_asr_core`, `native/asr_cue_post` |
 | `fushi_asr` | The facade: a one-call `TranscribeRunner` plus subtitle formats | the two above |
 | `fushi_asr_server` | The HTTP server and client plus the web UI | `fushi_asr` |
 | `fushi_asr_cli` | The `asr` command line | `fushi_asr` `fushi_asr_server` `args` |
@@ -169,6 +169,7 @@ injects the FFI backend, and the same algorithms run on both.
 
 ```bash
 dart analyze packages
+(cd native/asr_cue_post && cargo build --release)   # native library the asr_subtitles tests load
 cd packages/asr_core && dart test        # 326 tests
 cd packages/asr_onnx_ffi && dart test    # 15 tests, needs a real onnxruntime (the group skips without one)
 cd packages/asr_align && dart test       # 15 tests
@@ -176,6 +177,13 @@ cd packages/asr_subtitles && dart test   # 104 tests
 cd packages/asr && dart test             # 10 tests
 cd packages/asr_server && dart test      # 10 tests
 ```
+
+`fushi_asr_subtitles` needs a Rust toolchain for its cue post-processing core
+(`native/asr_cue_post`, crate `fushi_asr_cue_post`, C ABI `fcp_*`). Its tests look for the release
+build under `native/asr_cue_post/target/release/`, or wherever `FUSHI_ASR_CUE_POST_LIB` points; a
+missing library fails the tests rather than skipping them. Hosts that already ship a Rust library
+(Fushi's `fushi_compute`) depend on the crate through Cargo and hand their own `DynamicLibrary` to
+`AsrCuePostLibrary.fromDynamicLibrary`, so no extra native file is shipped.
 
 On Apple Silicon macOS, `./script/bootstrap_macos.sh` installs a project-local Dart SDK, FFmpeg and
 ONNX Runtime, after which `./script/check.sh` runs the full check. Environment notes and boundary

@@ -1,0 +1,116 @@
+name: native
+
+# native/asr_cue_post（fushi_asr_subtitles 的转录 cue 后处理 Rust 核心）五平台构建门：
+# * Windows x64 / Linux x64 / macOS arm64：cargo test + release 构建 + 用该平台产物跑
+#   asr_subtitles 的 cue_post Dart 测试（含搬迁冻结向量），证明 FFI 在三个桌面平台真能加载；
+# * Android arm64-v8a / armeabi-v7a / x86_64：NDK 交叉编译 .so，核对 fcp_* 导出；
+# * iOS arm64：交叉编译静态库，核对 fcp_* 导出。
+# 宿主（Fushi）把 crate 当 Cargo 依赖编进自己的原生库，这里保证 crate 本身在五端都编得过。
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: native-${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+env:
+  DART_VERSION: '3.13.5'
+  RUST_VERSION: '1.95.0'
+  CRATE_DIR: native/asr_cue_post
+
+jobs:
+  desktop:
+    name: ${{ matrix.name }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: linux-x64
+            os: ubuntu-latest
+            lib: libfushi_asr_cue_post.so
+          - name: windows-x64
+            os: windows-latest
+            lib: fushi_asr_cue_post.dll
+          - name: macos-arm64
+            os: macos-latest
+            lib: libfushi_asr_cue_post.dylib
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ env.RUST_VERSION }}
+      - uses: dart-lang/setup-dart@v1
+        with:
+          sdk: ${{ env.DART_VERSION }}
+      - name: cargo test
+        working-directory: ${{ env.CRATE_DIR }}
+        run: cargo test
+      - name: cargo build --release
+        working-directory: ${{ env.CRATE_DIR }}
+        run: cargo build --release
+      - name: Verify exports
+        if: runner.os != 'Windows'
+        run: ${{ env.CRATE_DIR }}/verify_exports.sh "${{ env.CRATE_DIR }}/target/release/${{ matrix.lib }}"
+      - name: Dart cue_post tests against this build
+        # Windows 上符号由测试里的 AsrCuePostLibrary.bindError 核对（缺符号即失败）。
+        run: |
+          dart pub get
+          cd packages/asr_subtitles
+          FUSHI_ASR_CUE_POST_LIB="$GITHUB_WORKSPACE/${{ env.CRATE_DIR }}/target/release/${{ matrix.lib }}" \
+            dart test test/cue_post
+
+  android:
+    name: android
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ env.RUST_VERSION }}
+          targets: aarch64-linux-android,armv7-linux-androideabi,x86_64-linux-android
+      - name: Build .so for three ABIs
+        working-directory: ${{ env.CRATE_DIR }}
+        run: |
+          set -euo pipefail
+          bin="$ANDROID_NDK_LATEST_HOME/toolchains/llvm/prebuilt/linux-x86_64/bin"
+          export CARGO_TARGET_AARCH64_LINUX_ANDROID_LINKER="$bin/aarch64-linux-android24-clang"
+          export CARGO_TARGET_ARMV7_LINUX_ANDROIDEABI_LINKER="$bin/armv7a-linux-androideabi24-clang"
+          export CARGO_TARGET_X86_64_LINUX_ANDROID_LINKER="$bin/x86_64-linux-android24-clang"
+          for t in aarch64-linux-android armv7-linux-androideabi x86_64-linux-android; do
+            cargo build --release --target "$t"
+            ./verify_exports.sh "target/$t/release/libfushi_asr_cue_post.so" "$bin/llvm-nm"
+          done
+
+  ios:
+    name: ios-arm64
+    runs-on: macos-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ env.RUST_VERSION }}
+          targets: aarch64-apple-ios
+          # Xcode 自带的 nm（Apple LLVM）读不了新 rustc（LLVM 22）产出的对象属性，
+          # 用与 rustc 同版本的 llvm-nm。
+          components: llvm-tools
+      - name: Build static library
+        working-directory: ${{ env.CRATE_DIR }}
+        run: |
+          set -euo pipefail
+          cargo build --release --target aarch64-apple-ios
+          host="$(rustc -vV | sed -n 's/^host: //p')"
+          nm_bin="$(rustc --print sysroot)/lib/rustlib/$host/bin/llvm-nm"
+          ./verify_exports.sh target/aarch64-apple-ios/release/libfushi_asr_cue_post.a "$nm_bin"

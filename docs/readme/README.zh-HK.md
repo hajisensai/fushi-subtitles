@@ -152,6 +152,7 @@ Flutter 宿主注入自己的外掛後端，伺服器端注入 FFI 後端，同�
 
 ```bash
 dart analyze packages
+(cd native/asr_cue_post && cargo build --release)   # native library the asr_subtitles tests load
 cd packages/asr_core && dart test        # 326 條測試
 cd packages/asr_onnx_ffi && dart test    # 15 條測試，需要真的 onnxruntime（沒有就整組 skip）
 cd packages/asr_align && dart test       # 15 條測試

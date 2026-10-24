@@ -164,6 +164,7 @@ const res = await fetch('/v1/retime?language=ja&format=srt', {
 
 ```bash
 dart analyze packages
+(cd native/asr_cue_post && cargo build --release)   # native library the asr_subtitles tests load
 cd packages/asr_core && dart test        # 326개 테스트
 cd packages/asr_onnx_ffi && dart test    # 15개 테스트, 실제 onnxruntime 필요 (없으면 그룹 전체 skip)
 cd packages/asr_align && dart test       # 15개 테스트

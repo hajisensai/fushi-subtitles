@@ -172,6 +172,7 @@ sunucu FFI arka ucunu enjekte eder ve aynı algoritmalar her ikisinde de çalı�
 
 ```bash
 dart analyze packages
+(cd native/asr_cue_post && cargo build --release)   # native library the asr_subtitles tests load
 cd packages/asr_core && dart test        # 326 test
 cd packages/asr_onnx_ffi && dart test    # 15 test, gerçek bir onnxruntime gerekir (yoksa grup atlanır)
 cd packages/asr_align && dart test       # 15 test
