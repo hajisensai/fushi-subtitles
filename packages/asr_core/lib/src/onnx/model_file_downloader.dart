@@ -203,6 +203,8 @@ class ModelFileDownloader {
   ///   非空」）；已就绪文件跳过（仍发一条 received==total 的完成进度，让 UI
   ///   汇总正确）。
   /// - `.part` 残留触发 Range 续传；服务器不支持（非 206）则整文件重下。
+  /// - `.part` 比远端文件长（超过 expected，或服务器对续传回 416 且长度与远端
+  ///   总长不符）即判不可信：删掉，在同一次调用里从 0 整文件重下。
   /// - 单文件完成：长度非零 + （expected>0 时）长度==expected，然后原子
   ///   rename `.part` → 最终名。
   /// - 全部完成后补发 `done=true` 收尾事件。
@@ -329,26 +331,36 @@ class ModelFileDownloader {
     _DegradeState degrade,
   ) async* {
     final File part = File('${target.path}.part');
-    int offset = part.existsSync() ? part.lengthSync() : 0;
-
-    final HttpClientRequest request = await client.getUrl(Uri.parse(url));
-    if (offset > 0) {
-      request.headers.set(HttpHeaders.rangeHeader, 'bytes=$offset-');
+    int offset = _lengthOf(part);
+    if (file.expectedBytes > 0 && offset > file.expectedBytes) {
+      // `.part` 比真实文件还长（例如两条下载同时往同一个 `.part` 追加），里面必有
+      // 不属于这个文件的字节：Range 续传只会在坏偏移上加码，直接丢掉从 0 重下。
+      part.deleteSync();
+      offset = 0;
     }
-    // 等响应头也算卡死窗口：连上了却迟迟不回头的连接与读到一半不动是同一种坏。
-    final HttpClientResponse response = await request.close().timeout(
-          resilience.stallTimeout,
-        );
+
+    HttpClientResponse response = await _open(client, url, offset);
 
     if (offset > 0 &&
-        response.statusCode == HttpStatus.requestedRangeNotSatisfiable &&
-        file.expectedBytes > 0 &&
-        offset == file.expectedBytes) {
-      // `.part` 已经完整（上次在 rename 前中断），服务器对 bytes=<len>- 回 416：
-      // 不再拉流，直接走校验 + 原子转正。
+        response.statusCode == HttpStatus.requestedRangeNotSatisfiable) {
+      // 服务器对 bytes=<len>- 回 416：`.part` 长度已到 / 超过远端文件末尾。
+      // 远端总长优先取清单的 expectedBytes，未知时取 416 的 `Content-Range: bytes */<total>`。
+      final int? remoteTotal = file.expectedBytes > 0
+          ? file.expectedBytes
+          : _unsatisfiedRangeTotal(response);
       await response.drain<void>();
-      yield _finalizePart(file, part, target);
-      return;
+      if (remoteTotal != null && offset == remoteTotal) {
+        // `.part` 已经完整（上次在 rename 前中断）：不再拉流，直接走校验 + 原子转正。
+        yield _finalizePart(file, part, target);
+        return;
+      }
+      // 长度对不上远端文件（或无从判断）：这个 `.part` 不可信。删掉后在本次调用里
+      // 不带 Range 整文件重下——留着它只会让此后每次续传都同样 416、永远下不完。
+      // 重下的请求没有 Range，服务器再回 416 就落到下面的非预期状态码分支如实
+      // 抛出，不会再回到这里，所以没有循环。
+      part.deleteSync();
+      offset = 0;
+      response = await _open(client, url, offset);
     }
 
     final IOSink sink;
@@ -417,6 +429,34 @@ class ModelFileDownloader {
     }
 
     yield _finalizePart(file, part, target);
+  }
+
+  /// 发起一次 GET；[offset] > 0 时带 `Range: bytes=<offset>-`。
+  ///
+  /// 等响应头也算卡死窗口：连上了却迟迟不回头的连接与读到一半不动是同一种坏。
+  Future<HttpClientResponse> _open(
+    HttpClient client,
+    String url,
+    int offset,
+  ) async {
+    final HttpClientRequest request = await client.getUrl(Uri.parse(url));
+    if (offset > 0) {
+      request.headers.set(HttpHeaders.rangeHeader, 'bytes=$offset-');
+    }
+    return request.close().timeout(resilience.stallTimeout);
+  }
+
+  /// 416 响应里 `Content-Range: bytes */<total>` 声明的远端总长；缺失或格式不对
+  /// 时为 null（RFC 9110 §15.5.17）。
+  static int? _unsatisfiedRangeTotal(HttpClientResponse response) {
+    final String? value = response.headers.value(
+      HttpHeaders.contentRangeHeader,
+    );
+    if (value == null) return null;
+    final RegExpMatch? match = RegExp(
+      r'^\s*bytes\s+\*/(\d+)\s*$',
+    ).firstMatch(value);
+    return match == null ? null : int.tryParse(match.group(1)!);
   }
 
   /// 完成一个 `.part`：实际大小校验（非零恒查；expected>0 时长度校验——传输
