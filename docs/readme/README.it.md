@@ -172,6 +172,7 @@ plugin, il server inietta il backend FFI, e gli stessi algoritmi girano su entra
 
 ```bash
 dart analyze packages
+(cd native/asr_cue_post && cargo build --release)   # native library the asr_subtitles tests load
 cd packages/asr_core && dart test        # 326 test
 cd packages/asr_onnx_ffi && dart test    # 15 test, richiede un onnxruntime reale (il gruppo viene saltato senza)
 cd packages/asr_align && dart test       # 15 test

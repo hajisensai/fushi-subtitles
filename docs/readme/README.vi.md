@@ -169,6 +169,7 @@ backend FFI, và cùng một bộ thuật toán chạy trên cả hai.
 
 ```bash
 dart analyze packages
+(cd native/asr_cue_post && cargo build --release)   # native library the asr_subtitles tests load
 cd packages/asr_core && dart test        # 326 bài kiểm thử
 cd packages/asr_onnx_ffi && dart test    # 15 bài kiểm thử, cần onnxruntime thật (không có thì nhóm này bị bỏ qua)
 cd packages/asr_align && dart test       # 15 bài kiểm thử

@@ -166,6 +166,7 @@ FFI バックエンドを注入し、同一のアルゴリズムが両方で動�
 
 ```bash
 dart analyze packages
+(cd native/asr_cue_post && cargo build --release)   # native library the asr_subtitles tests load
 cd packages/asr_core && dart test        # 326 件
 cd packages/asr_onnx_ffi && dart test    # 15 件。実物の onnxruntime が必要（無い場合はグループごと skip）
 cd packages/asr_align && dart test       # 15 件

@@ -103,9 +103,14 @@ jobs:
         with:
           toolchain: ${{ env.RUST_VERSION }}
           targets: aarch64-apple-ios
+          # Xcode 自带的 nm（Apple LLVM）读不了新 rustc（LLVM 22）产出的对象属性，
+          # 用与 rustc 同版本的 llvm-nm。
+          components: llvm-tools
       - name: Build static library
         working-directory: ${{ env.CRATE_DIR }}
         run: |
           set -euo pipefail
           cargo build --release --target aarch64-apple-ios
-          ./verify_exports.sh target/aarch64-apple-ios/release/libfushi_asr_cue_post.a
+          host="$(rustc -vV | sed -n 's/^host: //p')"
+          nm_bin="$(rustc --print sysroot)/lib/rustlib/$host/bin/llvm-nm"
+          ./verify_exports.sh target/aarch64-apple-ios/release/libfushi_asr_cue_post.a "$nm_bin"

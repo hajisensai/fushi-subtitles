@@ -172,6 +172,7 @@ menyuntikkan backend FFI, dan algoritme yang sama berjalan di keduanya.
 
 ```bash
 dart analyze packages
+(cd native/asr_cue_post && cargo build --release)   # native library the asr_subtitles tests load
 cd packages/asr_core && dart test        # 326 tests
 cd packages/asr_onnx_ffi && dart test    # 15 tests, needs a real onnxruntime (the group skips without one)
 cd packages/asr_align && dart test       # 15 tests
