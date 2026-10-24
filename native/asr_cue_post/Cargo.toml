@@ -1,0 +1,22 @@
+[package]
+name = "fushi_asr_cue_post"
+version = "0.1.0"
+edition = "2021"
+publish = false
+license = "GPL-3.0-only"
+description = "Post-processing for transcribed audiobook cues: energy snap, edge refine, fragment merge, read-along display margins."
+
+[lib]
+# cdylib：本仓 Dart 测试 / 独立使用时直接加载；staticlib：iOS 等只能静态链的宿主；
+# rlib：宿主把本 crate 当 Cargo 依赖编进自己的原生库（Fushi 的 fushi_compute / iOS 伞形库），
+# `fcp_*` C 导出随之进宿主库，宿主只维护一个原生库。
+crate-type = ["cdylib", "staticlib", "rlib"]
+
+# 零依赖：五端交叉编译只需要 Rust 工具链本身。
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+strip = true
+panic = "unwind"

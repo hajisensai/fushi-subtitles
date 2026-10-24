@@ -12,6 +12,10 @@
 /// 4. 显示后处理：多句长条按句末拆开，切点时间取自 ASR 的逐 token 时间
 ///    （[splitLongSubtitleCues]），以及标点统一为全角
 ///    （[normalizeSubtitlePunctuationToFullWidth]）。
+/// 5. 有声书转录 cue 的落库后处理（[AsrCuePostProcessor]）：能量吸附、修边、句内碎片
+///    合并、跟读显示余量。判定本体在 Rust（`native/asr_cue_post`），本包只打包 / 写回；
+///    原生库是硬依赖，宿主可以把 crate 编进自己的原生库再注入
+///    （[AsrCuePostLibrary.fromDynamicLibrary]）。
 ///
 /// 转录从哪来本包不管：喂进来的只是 [RetimingTranscription] 这个窄接口（cue 列表
 /// 加可选的逐 token 发射时间）。宿主可以用本仓的 ONNX 转录，也可以用别处产的
@@ -19,6 +23,8 @@
 library;
 
 export 'src/cancellation.dart';
+export 'src/cue_post/cue_post_library.dart';
+export 'src/cue_post/cue_post_processor.dart';
 export 'src/subtitle_clock.dart';
 export 'src/subtitle_format.dart';
 export 'src/subtitle_long_cue_split.dart';

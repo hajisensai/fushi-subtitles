@@ -17,6 +17,8 @@ concurrency:
 env:
   # 与宿主 Fushi 一致：Flutter 3.47.6 自带 Dart 3.13.5。
   DART_VERSION: '3.13.5'
+  # 与宿主 Fushi 的 native 门一致。
+  RUST_VERSION: '1.95.0'
 
 jobs:
   check:
@@ -28,8 +30,14 @@ jobs:
       - uses: dart-lang/setup-dart@v1
         with:
           sdk: ${{ env.DART_VERSION }}
+      # check.sh 先编 native/asr_cue_post（asr_subtitles 测试要加载它）。
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ env.RUST_VERSION }}
       - name: Show toolchain
-        run: dart --version
+        run: |
+          dart --version
+          cargo --version
       - name: script/check.sh
         # 防御：单测各有 30 s 默认超时，但整套挂住（服务器 stop 等不完、进程不退）
         # 时不该吃满 job 的 30 分钟才报。修法在代码里，这里只是让它早点红。
