@@ -473,8 +473,12 @@ Future<void> _isolateMain(_IsolateArgs args) async {
     asrShutdownTrace('isolate: sessions closed');
     pcm.close();
     asrShutdownTrace('isolate: pcm closed');
-    args.events.send(const _ExitedMessage());
-    asrShutdownTrace('isolate: exited message sent');
     control.close();
+    asrShutdownTrace('isolate: exiting');
+    // 显式退出，不靠「端口全关、事件循环空了自然退出」：宿主 bootstrap 可能在
+    // 本 isolate 里留下关不掉的端口（Flutter 的 BackgroundIsolateBinaryMessenger
+    // 就是），那样 isolate 永远不退，每转录一次漏一个。会话已在上面关完，这里
+    // 没有还需要跑完的工作；收尾消息随退出一并送达。
+    Isolate.exit(args.events, const _ExitedMessage());
   }
 }
