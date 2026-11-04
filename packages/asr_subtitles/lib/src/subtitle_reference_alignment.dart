@@ -92,8 +92,7 @@ List<double> uniqueCueStarts(
 }) {
   final List<double> xs = <double>{
     for (final double t in starts) (t * 1000).roundToDouble() / 1000,
-  }.toList()
-    ..sort();
+  }.toList()..sort();
   final List<double> out = <double>[];
   for (final double x in xs) {
     if (out.isEmpty || x - out.last > tolerance) out.add(x);
@@ -193,7 +192,7 @@ class AlignmentSegment {
 
 /// 各断点换算到**目标字幕时间**：第 i 段覆盖目标时间 `< split_i - offset_i`。
 List<({double subtitleTime, double fromOffset, double toOffset})>
-    alignmentSubtitleBoundaries(List<AlignmentSegment> segments) {
+alignmentSubtitleBoundaries(List<AlignmentSegment> segments) {
   final List<({double subtitleTime, double fromOffset, double toOffset})> out =
       <({double subtitleTime, double fromOffset, double toOffset})>[];
   for (int i = 0; i < segments.length - 1; i++) {
@@ -235,9 +234,8 @@ List<({double lo, double hi})> alignmentRemovedSpans(
 }
 
 bool alignmentIsRemoved(List<AlignmentSegment> segments, double seconds) =>
-    alignmentRemovedSpans(
-      segments,
-    ).any((({double lo, double hi}) s) => s.lo <= seconds && seconds < s.hi);
+    alignmentRemovedSpans(segments)
+        .any((({double lo, double hi}) s) => s.lo <= seconds && seconds < s.hi);
 
 // ---------------------------------------------------------------------------
 // 候选偏移
@@ -456,9 +454,11 @@ List<double>? _earnsItself(
   if (i1 - i0 >= 2 * kAlignMinSegmentCues) {
     double best = -1;
     final List<double> totals = <double>[];
-    for (int k = i0 + kAlignMinSegmentCues;
-        k <= i1 - kAlignMinSegmentCues;
-        k++) {
+    for (
+      int k = i0 + kAlignMinSegmentCues;
+      k <= i1 - kAlignMinSegmentCues;
+      k++
+    ) {
       final double t =
           (prefix[c1][k] - prefix[c1][i0] + prefix[c2][i1] - prefix[c2][k])
               .toDouble();
@@ -805,14 +805,9 @@ SubtitleReferenceFit fitSubtitleToReference(
     found.c2,
     ...labels.sublist(si + 1),
   ];
-  final List<double>? rates = _earnsItself(
-      hits,
-      b,
-      l,
-      <double>[
-        for (final int c in l) cands[c],
-      ],
-      chance);
+  final List<double>? rates = _earnsItself(hits, b, l, <double>[
+    for (final int c in l) cands[c],
+  ], chance);
   if (rates == null) return null;
   double score = 0;
   for (int i = 0; i < rates.length; i++) {
@@ -987,8 +982,23 @@ SubtitleReferenceJudgement judgeSubtitleReferenceFit(
 // 多参考投票
 // ---------------------------------------------------------------------------
 
-/// 参考 cue 少于它的轨不当参考（forced / 只有特效字的轨）。
-const int kMinReferenceCues = 30;
+/// 参考的开始时刻数至少是目标的这个比例，才算「整份台词」轨。
+///
+/// 挡的是 forced / 只有特效字的轨：它们只是整份台词的一个子集，数量通常只有同片
+/// 台词的 1–10%，单靠几条落上就会替整条字幕定偏移。比例按目标自己的 cue 数折算，
+/// 与片长无关——旧的绝对门槛（30 条）把只有十几二十句的短片整条挡在门外，
+/// 而那种轨在逐条判定（[judgeSubtitleReferenceFit]）里本来分得开。
+/// 整份台词轨之间（不同语言断句、ASR 识别稿）比例接近 1；目标是带 OP/ED 逐音节
+/// 卡拉 OK 的 ASS 时 cue 数可被撑到台词的两倍多，比例仍在 0.35 上下。0.2 取在
+/// forced 子集与整份台词之间。
+const double kMinReferenceDensityRatio = 0.2;
+
+/// [reference] 能不能给去重后的目标开始时刻 [subtitle] 当参考：
+/// 样本够对齐（≥ [kAlignMinAlignableCues]），且不是整份台词的稀疏子集
+/// （≥ [kMinReferenceDensityRatio] × 目标 cue 数）。
+bool isUsableReferenceTrack(List<double> reference, List<double> subtitle) =>
+    reference.length >= kAlignMinAlignableCues &&
+    reference.length >= kMinReferenceDensityRatio * subtitle.length;
 
 /// 两条参考在零偏移下互相命中率都 ≥ 它，视为同一份时间模板（一票）。
 const double kSameTimingTemplateRate = 0.85;
@@ -1070,17 +1080,22 @@ bool _sameTimingTemplate(List<double> a, List<double> b) =>
     alignmentMatchRate(b, a, 0) >= kSameTimingTemplateRate;
 
 /// 按时间模板把参考轨分组：同模板的多语言轨本质是同一份证据，只算一票。
+/// 对去重后的目标开始时刻 [subtitleStarts] 不可用的轨（[isUsableReferenceTrack]）
+/// 先滤掉。
 List<List<SubtitleReferenceTrack>> groupReferenceTracks(
-  List<SubtitleReferenceTrack> tracks,
-) {
-  final List<SubtitleReferenceTrack> sorted = List<SubtitleReferenceTrack>.of(
-    tracks.where(
-      (SubtitleReferenceTrack t) => t.starts.length >= kMinReferenceCues,
-    ),
-  )..sort(
-      (SubtitleReferenceTrack a, SubtitleReferenceTrack b) =>
-          b.starts.length.compareTo(a.starts.length),
-    );
+  List<SubtitleReferenceTrack> tracks, {
+  required List<double> subtitleStarts,
+}) {
+  final List<SubtitleReferenceTrack> sorted =
+      List<SubtitleReferenceTrack>.of(
+        tracks.where(
+          (SubtitleReferenceTrack t) =>
+              isUsableReferenceTrack(t.starts, subtitleStarts),
+        ),
+      )..sort(
+        (SubtitleReferenceTrack a, SubtitleReferenceTrack b) =>
+            b.starts.length.compareTo(a.starts.length),
+      );
   final List<List<SubtitleReferenceTrack>> groups =
       <List<SubtitleReferenceTrack>>[];
   for (final SubtitleReferenceTrack t in sorted) {
@@ -1136,6 +1151,7 @@ SubtitleSyncDecision decideSubtitleSync({
   final List<SubtitleReferenceGroup> groups = <SubtitleReferenceGroup>[
     for (final List<SubtitleReferenceTrack> g in groupReferenceTracks(
       references,
+      subtitleStarts: sub,
     ))
       SubtitleReferenceGroup(
         tracks: g,
@@ -1162,14 +1178,13 @@ SubtitleSyncDecision _vote(
     SubtitleReferenceGroup? chosen,
     int agreeing = 0,
     bool conflicting = false,
-  }) =>
-      SubtitleSyncDecision(
-        kind: kind,
-        groups: groups,
-        chosen: chosen,
-        agreeingGroups: agreeing,
-        conflicting: conflicting,
-      );
+  }) => SubtitleSyncDecision(
+    kind: kind,
+    groups: groups,
+    chosen: chosen,
+    agreeingGroups: agreeing,
+    conflicting: conflicting,
+  );
   if (groups.isEmpty ||
       groups.first.judgement.strength == AlignmentStrength.refused) {
     return decision(SubtitleSyncDecisionKind.refused);
@@ -1194,7 +1209,8 @@ SubtitleSyncDecision _vote(
       )
       .length;
   final bool conflicting = agreeing < accepted.length;
-  final bool auto = !conflicting &&
+  final bool auto =
+      !conflicting &&
       (agreeing >= 2 ||
           best.judgement.fit.excess >= kSingleReferenceAutoExcess);
   return decision(
