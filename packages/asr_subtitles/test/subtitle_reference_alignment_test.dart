@@ -136,8 +136,9 @@ void main() {
     });
 
     test('参考只覆盖前 8 分钟 → 拒绝（其余时段从没被检查过）', () {
-      final List<double> partial =
-          english.where((double t) => t < 480).toList();
+      final List<double> partial = english
+          .where((double t) => t < 480)
+          .toList();
       final List<double> ja = _track(
         truth,
         seed: 25,
@@ -158,13 +159,10 @@ void main() {
     });
 
     test('cue 太少：不可测，而不是高分', () {
-      final SubtitleReferenceFit fit = fitSubtitleToReference(
-          english,
-          <double>[
-            100,
-            200,
-          ],
-          durationSeconds: 1440);
+      final SubtitleReferenceFit fit = fitSubtitleToReference(english, <double>[
+        100,
+        200,
+      ], durationSeconds: 1440);
       expect(fit.excess, 0);
       expect(
         judgeSubtitleReferenceFit(
@@ -179,16 +177,14 @@ void main() {
 
   group('CM 断点两侧逐句落位（审查实测：断点前最后一句曾被推迟 / 删除）', () {
     // 断点紧前、紧后各硬塞一句，正是被错放的位置。
-    List<double> speechAround(List<double> base) => (<double>[
-          ...base.where((double t) => t < 596 || t > 640),
-          598.5,
-          641.0
-        ]..sort());
+    List<double> speechAround(List<double> base) =>
+        (<double>[...base.where((double t) => t < 596 || t > 640), 598.5, 641.0]
+          ..sort());
 
     test('正跳变：视频多出 30s（字幕缺这段）→ 每句都回到真时间', () {
-      final List<double> video = speechAround(
-        truth,
-      ).where((double t) => t < 600 || t >= 630).toList();
+      final List<double> video = speechAround(truth)
+          .where((double t) => t < 600 || t >= 630)
+          .toList();
       double subOf(double t) => t < 600 ? t : t - 30;
       final List<double> ref = _track(video, seed: 16);
       final List<double> sub = <double>[for (final double t in video) subOf(t)];
@@ -291,13 +287,15 @@ void main() {
     });
 
     test('同一时间模板的多语言轨合并成一票', () {
-      final List<double> sameTemplate =
-          english.map((double t) => t + 0.01).toList();
+      final List<double> sameTemplate = english
+          .map((double t) => t + 0.01)
+          .toList();
       final List<List<SubtitleReferenceTrack>> groups = groupReferenceTracks(
         <SubtitleReferenceTrack>[
           _ref('eng', english),
           _ref('spa', sameTemplate),
         ],
+        subtitleStarts: english,
       );
       expect(groups, hasLength(1));
       expect(groups.single, hasLength(2));
@@ -331,11 +329,71 @@ void main() {
       expect(d.chosen, isNull);
     });
 
-    test('cue 少于 30 条的轨（forced / 特效字）不当参考', () {
+    test('整份台词的稀疏子集（forced / 特效字）不当参考', () {
+      // 一集 24 分钟里只挑出 30 多条：按旧的绝对门槛（30）会被当成参考。
+      final List<double> forced = <double>[
+        for (int i = 0; i < english.length; i += 10) english[i],
+      ];
+      expect(forced.length, greaterThanOrEqualTo(30));
+      expect(isUsableReferenceTrack(forced, english), isFalse);
       final List<List<SubtitleReferenceTrack>> groups = groupReferenceTracks(
-        <SubtitleReferenceTrack>[_ref('signs', english.take(20).toList())],
+        <SubtitleReferenceTrack>[_ref('signs', forced)],
+        subtitleStarts: english,
       );
       expect(groups, isEmpty);
+    });
+
+    test('cue 少于对齐下限的轨不当参考', () {
+      final List<double> tiny = english
+          .take(kAlignMinAlignableCues - 1)
+          .toList();
+      expect(isUsableReferenceTrack(tiny, tiny), isFalse);
+    });
+  });
+
+  group('短片（台词少于 30 句）', () {
+    // 一段 90 秒的短片：开口间隔 3–6 秒，二十来句。
+    List<double> clip(int seed) {
+      final math.Random r = math.Random(seed);
+      final List<double> out = <double>[];
+      double t = 2 + r.nextDouble() * 2;
+      while (t < 88) {
+        out.add(t);
+        t += 3 + r.nextDouble() * 3;
+      }
+      return out;
+    }
+
+    final List<double> clipTruth = clip(41);
+    final List<double> asr = _track(clipTruth, seed: 42, keep: 0.9, extra: 0.1);
+
+    test('外挂字幕整体晚 2.4 秒：识别稿当参考照常判出偏移并自动写入', () {
+      expect(asr.length, lessThan(30));
+      final List<double> sidecar = _track(
+        clipTruth,
+        seed: 43,
+        keep: 0.9,
+        extra: 0.1,
+        shift: (double t) => t + 2.4,
+      );
+      final SubtitleSyncDecision d = decideSubtitleSync(
+        subtitleStarts: sidecar,
+        references: <SubtitleReferenceTrack>[_ref('asr', asr)],
+        durationSeconds: 90,
+      );
+      expect(d.groups, hasLength(1));
+      expect(d.kind, SubtitleSyncDecisionKind.autoApply);
+      expect(d.segments.single.offsetSeconds, closeTo(-2.4, 0.1));
+    });
+
+    test('配错集的外挂字幕仍被拒绝', () {
+      final List<double> otherClip = _track(clip(77), seed: 44);
+      final SubtitleSyncDecision d = decideSubtitleSync(
+        subtitleStarts: otherClip,
+        references: <SubtitleReferenceTrack>[_ref('asr', asr)],
+        durationSeconds: 90,
+      );
+      expect(d.kind, isNot(SubtitleSyncDecisionKind.autoApply));
     });
   });
 }
