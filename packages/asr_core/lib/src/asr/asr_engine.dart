@@ -218,6 +218,54 @@ AsrEncoderVariant recommendAsrEncoderVariant({
   return AsrEncoderVariant.fp32;
 }
 
+/// 此刻可以拿来跑的编码器变体，按优先级排；首项恒为 [recommended]
+/// （[recommendAsrEncoderVariant] 的结果）。
+///
+/// - 推荐 int8：只有 int8。fp32 不进来——推荐退回 int8 恰恰说明 fp32 此刻不划算
+///   或装不下（没有 GPU EP 时 fp32 在 CPU 上慢 5 倍；有显存门槛的包预算不足时
+///   fp32 会溢出到主机内存）。
+/// - 推荐 fp32 且 [preference] 是 [AsrAccelerationPreference.auto]：fp32 之后还有
+///   int8。int8 恒走 CPU（见 [selectAsrEncoderProviders]），不吃显存，任何时候都
+///   跑得起来，只是慢一些。
+/// - 推荐 fp32 但用户**显式**指定了 GPU 后端（coreml / directml / cuda）：只有
+///   fp32，退 int8 等于偷偷换成 CPU、违背用户的选择。
+List<AsrEncoderVariant> usableAsrEncoderVariants({
+  required AsrEncoderVariant recommended,
+  required AsrAccelerationPreference preference,
+}) {
+  if (recommended == AsrEncoderVariant.int8) {
+    return const <AsrEncoderVariant>[AsrEncoderVariant.int8];
+  }
+  if (preference != AsrAccelerationPreference.auto) {
+    return const <AsrEncoderVariant>[AsrEncoderVariant.fp32];
+  }
+  return const <AsrEncoderVariant>[
+    AsrEncoderVariant.fp32,
+    AsrEncoderVariant.int8,
+  ];
+}
+
+/// 计划用哪个编码器变体：[usableAsrEncoderVariants] 里第一个**已在盘**的
+/// （[isReady]），一个都没有时才是 [recommended]（= 要去下载的那个）。
+///
+/// 推荐变体随机器状态浮动：显存预算是系统此刻的空闲量（别的程序占着显存就变），
+/// EP 探测也可能这次成功下次失败。只按推荐变体判「装没装」，前一晚按 int8 下好
+/// 的模型第二天预算一涨就被判成「没下载」、再点又去下 2.5 GB 的 fp32
+/// （Fushi BUG-4128）。已下好的可用变体优先，「已安装」才不随显存预算翻转。
+AsrEncoderVariant planAsrEncoderVariant({
+  required AsrEncoderVariant recommended,
+  required AsrAccelerationPreference preference,
+  required bool Function(AsrEncoderVariant variant) isReady,
+}) {
+  for (final AsrEncoderVariant candidate in usableAsrEncoderVariants(
+    recommended: recommended,
+    preference: preference,
+  )) {
+    if (isReady(candidate)) return candidate;
+  }
+  return recommended;
+}
+
 /// 一套已装载的 ASR 会话。
 class AsrEngineSessions {
   AsrEngineSessions({
