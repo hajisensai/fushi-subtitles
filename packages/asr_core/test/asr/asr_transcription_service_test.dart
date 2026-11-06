@@ -12,10 +12,16 @@ import 'package:path/path.dart' as p;
 
 /// 只覆盖 EP 探测：可让探测抛错（模拟有 GPU 的机器 ORT 探测本身失败）。
 class _ProbeFactory implements OnnxSessionFactory {
-  _ProbeFactory({this.error});
+  _ProbeFactory({
+    this.error,
+    this.providers = const <OnnxExecutionProvider>{},
+    this.budgetBytes,
+  });
 
-  /// 非 null 时探测抛它；null 时返回「没有加速 EP」（平台无关的确定结果）。
+  /// 非 null 时探测抛它；null 时返回 [providers]（默认「没有加速 EP」）。
   final Error? error;
+  final Set<OnnxExecutionProvider> providers;
+  final int? budgetBytes;
   int probeCalls = 0;
 
   @override
@@ -23,11 +29,11 @@ class _ProbeFactory implements OnnxSessionFactory {
     probeCalls++;
     final Error? e = error;
     if (e != null) throw e;
-    return const <OnnxExecutionProvider>{};
+    return providers;
   }
 
   @override
-  Future<int?> deviceMemoryBudgetBytes() async => null;
+  Future<int?> deviceMemoryBudgetBytes() async => budgetBytes;
 
   /// 本组用例只走 `plan()`，不建会话。真被调到说明用例走错了路径，直接炸。
   @override
@@ -105,6 +111,77 @@ void main() {
       expect(plan.variant, AsrEncoderVariant.int8);
       expect(plan.probeError, isNull);
       expect(plan.language, AsrLanguage.english);
+    });
+  });
+
+  group('plan：已在盘的可用变体优先，「装没装」不随显存预算翻转（BUG-4128）', () {
+    // 视频字幕用的日语混音包（Parakeet，fp32 门槛 4 GiB）。
+    AsrTranscriptionService mixed(_ProbeFactory factory) =>
+        AsrTranscriptionService(
+          audioProfile: AsrAudioProfile.mixedAudio,
+          backend: const AsrIsolateBackend(buildFactory: _unusedFactory),
+          loader: AsrEngineLoader(factory: factory),
+          openStore: (AsrLanguage l, AsrAudioProfile p) async =>
+              AsrModelStore(tmp, asrModelPackFor(l, profile: p)),
+          jobsRoot: () async => tmp,
+          runInIsolate: false,
+        );
+
+    void install(AsrEncoderVariant variant) {
+      final AsrModelPack pack = asrModelPackFor(
+        AsrLanguage.japanese,
+        profile: AsrAudioProfile.mixedAudio,
+      );
+      for (final AsrModelFile f in pack.filesFor(variant)) {
+        File(p.join(tmp.path, f.fileName)).writeAsBytesSync(<int>[1]);
+      }
+    }
+
+    // 预算够 fp32 · DirectML 的那天。只有 Windows 的策略会因 DirectML 推荐 fp32，
+    // 别的平台推荐恒为 int8——断言对两种推荐都成立，Windows 上再多核推荐值。
+    _ProbeFactory bigBudget() => _ProbeFactory(
+          providers: const <OnnxExecutionProvider>{
+            OnnxExecutionProvider.directml,
+          },
+          budgetBytes: 12 * 1024 * 1024 * 1024,
+        );
+
+    test('前一晚只下了 int8、今天预算够 fp32 → 仍判已就绪，规划 int8 · CPU', () async {
+      install(AsrEncoderVariant.int8);
+      final AsrTranscribePlan plan = await mixed(bigBudget()).plan(
+        language: AsrLanguage.japanese,
+        preference: AsrAccelerationPreference.auto,
+      );
+      expect(plan.modelReady, isTrue);
+      expect(plan.variant, AsrEncoderVariant.int8);
+      expect(plan.expectedProvider, OnnxExecutionProvider.cpu);
+      if (Platform.isWindows) {
+        expect(plan.recommendedVariant, AsrEncoderVariant.fp32);
+      }
+    });
+
+    test('什么都没下 → 规划推荐的那个，未就绪', () async {
+      final AsrTranscribePlan plan = await mixed(bigBudget()).plan(
+        language: AsrLanguage.japanese,
+        preference: AsrAccelerationPreference.auto,
+      );
+      expect(plan.modelReady, isFalse);
+      expect(plan.variant, plan.recommendedVariant);
+    });
+
+    test('两个变体都在盘 → 用推荐的', () async {
+      install(AsrEncoderVariant.int8);
+      install(AsrEncoderVariant.fp32);
+      final AsrTranscribePlan plan = await mixed(bigBudget()).plan(
+        language: AsrLanguage.japanese,
+        preference: AsrAccelerationPreference.auto,
+      );
+      expect(plan.modelReady, isTrue);
+      expect(plan.variant, plan.recommendedVariant);
+      if (Platform.isWindows) {
+        expect(plan.variant, AsrEncoderVariant.fp32);
+        expect(plan.expectedProvider, OnnxExecutionProvider.directml);
+      }
     });
   });
 

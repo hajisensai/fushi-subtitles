@@ -72,10 +72,21 @@ class AsrTranscribePlan {
     required this.modelStatus,
     this.probeError,
     this.availableProviders = const <OnnxExecutionProvider>{},
-  });
+    AsrEncoderVariant? recommendedVariant,
+  }) : _recommendedVariant = recommendedVariant;
 
   final AsrLanguage language;
+
+  /// 这次实际要用的变体：已在盘的可用变体优先，没有时才是 [recommendedVariant]
+  /// （见 [planAsrEncoderVariant]）。[modelStatus] / [expectedProvider] 都按它算。
   final AsrEncoderVariant variant;
+
+  final AsrEncoderVariant? _recommendedVariant;
+
+  /// 按本机此刻的 EP 与显存预算推荐的变体（[recommendAsrEncoderVariant]）。
+  /// 与 [variant] 不同 = 推荐的没下、正用着另一个已下好的（例如推荐 fp32 · GPU，
+  /// 盘上只有 int8，于是按 int8 · CPU 跑）；界面可据此提示「下载 fp32 可加速」。
+  AsrEncoderVariant get recommendedVariant => _recommendedVariant ?? variant;
 
   /// 按平台策略与本机 EP 集合预期的编码器 EP（真正生效以运行期 resolution 为准）。
   final OnnxExecutionProvider expectedProvider;
@@ -270,7 +281,7 @@ class AsrTranscriptionService {
   Future<AsrModelStore> modelStore(AsrLanguage language) =>
       _openStore(language, audioProfile);
 
-  /// 计算计划：探测 EP → 推荐变体 → 查该语言包的模型状态。
+  /// 计算计划：探测 EP → 推荐变体 → 挑已在盘的可用变体 → 查它的模型状态。
   Future<AsrTranscribePlan> plan({
     required AsrLanguage language,
     required AsrAccelerationPreference preference,
@@ -307,12 +318,19 @@ class AsrTranscriptionService {
         );
       }
     }
-    final AsrEncoderVariant variant = recommendAsrEncoderVariant(
+    final AsrEncoderVariant recommended = recommendAsrEncoderVariant(
       platform: platform,
       available: available,
       preference: preference,
       fp32GpuMinBudgetBytes: pack.fp32GpuMinBudgetBytes,
       budgetBytes: budgetBytes,
+    );
+    final AsrModelStore store = await _openStore(language, audioProfile);
+    // 「装没装」看任一可用变体，不只看推荐的那个（BUG-4128）。
+    final AsrEncoderVariant variant = planAsrEncoderVariant(
+      recommended: recommended,
+      preference: preference,
+      isReady: store.isReady,
     );
     final OnnxExecutionProvider expected = selectAsrEncoderProviders(
       platform: platform,
@@ -320,10 +338,10 @@ class AsrTranscriptionService {
       preference: preference,
       variant: variant,
     ).first;
-    final AsrModelStore store = await _openStore(language, audioProfile);
     return AsrTranscribePlan(
       language: language,
       variant: variant,
+      recommendedVariant: recommended,
       expectedProvider: expected,
       modelStatus: await store.status(variant),
       probeError: probeError,
