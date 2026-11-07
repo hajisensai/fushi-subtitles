@@ -565,7 +565,21 @@ _CharTimes? _charTimes(AsrCueTokenTiming timing, SubtitleCue cue) {
 /// 最终文本每个码点对齐到 token 字符流的哪个下标（长度 = text.length + 1，末项
 /// = 流长度）。Levenshtein 回溯：匹配 / 替换 → 对应字符；文本多出来的字（流里没
 /// 有）→ 流里它所在位置的下一个字符；流里多出来的字跳过。
-List<int> _alignToStream(List<int> text, List<int> stream) {
+List<int> _alignToStream(List<int> text, List<int> stream) =>
+    _alignToStreamDetailed(text, stream).map;
+
+/// [_alignToStream] 的对齐结果，外加每个文本码点的回溯分支：[paired] = 与流里
+/// 某个字配对（匹配或替换），[exact] = 配对且字符完全相同；文本多出来的字两者都
+/// 是 false。
+class _StreamAlignment {
+  const _StreamAlignment(this.map, this.paired, this.exact);
+
+  final List<int> map;
+  final List<bool> paired;
+  final List<bool> exact;
+}
+
+_StreamAlignment _alignToStreamDetailed(List<int> text, List<int> stream) {
   final int n = text.length;
   final int m = stream.length;
   final int w = m + 1;
@@ -587,15 +601,18 @@ List<int> _alignToStream(List<int> text, List<int> stream) {
     }
   }
   final List<int> map = List<int>.filled(n + 1, 0);
+  final List<bool> paired = List<bool>.filled(n, false);
+  final List<bool> exact = List<bool>.filled(n, false);
   map[n] = m;
   int i = n;
   int j = m;
   while (i > 0) {
     final int here = d[i * w + j];
-    if (j > 0 &&
-        here ==
-            d[(i - 1) * w + j - 1] + (text[i - 1] == stream[j - 1] ? 0 : 1)) {
+    final bool same = j > 0 && text[i - 1] == stream[j - 1];
+    if (j > 0 && here == d[(i - 1) * w + j - 1] + (same ? 0 : 1)) {
       map[i - 1] = j - 1;
+      paired[i - 1] = true;
+      exact[i - 1] = same;
       i--;
       j--;
     } else if (here == d[(i - 1) * w + j] + 1) {
@@ -605,7 +622,62 @@ List<int> _alignToStream(List<int> text, List<int> stream) {
       j--;
     }
   }
-  return map;
+  return _StreamAlignment(map, paired, exact);
+}
+
+/// 一个字（码点）的唱 / 说时段，相对 cue 起点的毫秒。
+typedef SubtitleCharTime = ({int startMs, int endMs});
+
+/// 字幕正文里「计入对齐质量」的字：去掉空白、标点与符号（全角 / 半角都算）。
+final RegExp _charTimeIgnored = RegExp(r'[\s\p{P}\p{S}]', unicode: true);
+
+/// 把最终字幕正文 [cue] 的每个码点对齐到 ASR 逐 token 时间 [timing]，给出逐字
+/// 起止时刻（**相对 cue 起点**的毫秒，单调不减，夹进 `[0, cue 时长]`），长度 =
+/// `cue.text.runes.length`。用于卡拉 OK（`\kf`）这类逐字效果。
+///
+/// - token 内按字符均分时长（同长条拆分用的字符流）；最终文本与 token 字符流做
+///   Levenshtein 对齐（校对 / 标点规范化后的文本与识别原文不完全一致）。
+/// - 流里没有的字（标点、校对补进来的字）得到零时长，粘在前一个字的终点上。
+/// - 对齐质量太差返回 null：完全匹配的非标点字少于非标点字总数的
+///   [minMatchRatio]（例如校对把整段歌词替换掉了），或 token 时间本身不成形
+///   （长度不一致 / 没有有效字符）。宁可不出逐字时间，也不给错位的扫光。
+List<SubtitleCharTime>? subtitleCueCharTimes(
+  AsrCueTokenTiming timing,
+  SubtitleCue cue, {
+  double minMatchRatio = 0.6,
+}) {
+  final _CharTimes? chars = _charTimes(timing, cue);
+  if (chars == null || chars.runes.isEmpty) return null;
+  final List<int> text = cue.text.runes.toList(growable: false);
+  if (text.isEmpty) return null;
+  final _StreamAlignment al = _alignToStreamDetailed(text, chars.runes);
+  int counted = 0;
+  int matched = 0;
+  for (int i = 0; i < text.length; i++) {
+    if (_charTimeIgnored.hasMatch(String.fromCharCode(text[i]))) continue;
+    counted++;
+    if (al.exact[i]) matched++;
+  }
+  if (counted == 0 || matched < counted * minMatchRatio) return null;
+  final int duration = cue.endMs - cue.startMs;
+  final List<SubtitleCharTime> out = <SubtitleCharTime>[];
+  int prevEnd = 0;
+  for (int i = 0; i < text.length; i++) {
+    int a;
+    int b;
+    if (al.paired[i]) {
+      a = chars.startMs[al.map[i]].round();
+      b = chars.endMs[al.map[i]].round();
+    } else {
+      a = prevEnd;
+      b = prevEnd;
+    }
+    a = _clampInt(a, prevEnd, duration);
+    b = _clampInt(b, a, duration);
+    out.add((startMs: a, endMs: b));
+    prevEnd = b;
+  }
+  return out;
 }
 
 /// 半角 `!` `?` 统一成全角 `！` `？`（方案 S5：字幕标点统一为全角）。只动这两个
