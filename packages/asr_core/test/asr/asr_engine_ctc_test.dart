@@ -6,6 +6,7 @@ import 'package:fushi_asr_core/src/asr/asr_encoder_buckets.dart';
 import 'package:fushi_asr_core/src/asr/asr_engine.dart';
 import 'package:fushi_asr_core/src/asr/asr_model_manifest.dart';
 import 'package:fushi_asr_core/src/asr/asr_model_store.dart';
+import 'package:fushi_asr_core/src/asr/asr_nemo_ctc_decoder.dart';
 import 'package:fushi_asr_core/src/asr/asr_transducer_decoder.dart';
 import 'package:fushi_asr_core/src/asr/asr_vad.dart';
 import 'package:fushi_asr_core/src/onnx/onnx_inference.dart';
@@ -191,5 +192,91 @@ void main() {
       ),
       AsrEncoderVariant.int8,
     );
+  });
+
+  // Fushi issue #3380：nemoCtc（Parakeet）没有静态桶，GPU 上一批的行数必须按显存
+  // 封顶；装载时把「权重字节 + 显存预算」交给解码器，CPU 会话不封顶。
+  group('nemoCtc（Parakeet）GPU 成批上限的装配', () {
+    late Directory dir;
+    late AsrModelStore parakeet;
+    const int window = 15 * 16000;
+
+    setUp(() async {
+      dir = await Directory.systemTemp.createTemp('asr_engine_nemo_');
+      parakeet = AsrModelStore(dir, kAsrParakeetJapanesePack);
+      for (final AsrModelFile f in kAsrParakeetJapanesePack.files) {
+        if (f.role == AsrModelRole.tokens) {
+          parakeet.fileFor(f.role).writeAsStringSync('あ 0\n<blk> 1\n');
+        } else {
+          parakeet.fileFor(f.role).writeAsBytesSync(<int>[1, 2, 3]);
+        }
+      }
+    });
+    tearDown(() async {
+      if (dir.existsSync()) await dir.delete(recursive: true);
+    });
+
+    test('fp32 · GPU：预算 = 模型 + 外置权重字节与设备显存预算，解码器封顶', () async {
+      const int budget = 6 * 1024 * 1024 * 1024;
+      final _FakeFactory f = _FakeFactory(
+        available: const <OnnxExecutionProvider>{
+          OnnxExecutionProvider.directml,
+        },
+        budget: budget,
+      );
+      final AsrEngineSessions s = await AsrEngineLoader(
+        factory: f,
+        platform: AsrPlatform.windows,
+      ).load(
+        store: parakeet,
+        variant: AsrEncoderVariant.fp32,
+        preference: AsrAccelerationPreference.auto,
+        useFp16Encoder: false,
+      );
+      expect(s.encoderResolution.effective, OnnxExecutionProvider.directml);
+      expect(s.staticEncoders, isNull);
+      // model.onnx（3 字节）+ model.onnx_data（3 字节）。
+      expect(s.nemoGpuBatchBudget?.weightBytes, 6);
+      expect(s.nemoGpuBatchBudget?.budgetBytes, budget);
+      final AsrNemoCtcDecoder decoder = s.newDecoder() as AsrNemoCtcDecoder;
+      expect(decoder.batchCapFor(window), kAsrNemoGpuMaxBatchRows);
+      // 健康检查回退换 EP 说明时不能把预算弄丢。
+      expect(
+        s.withEncoderResolution(s.encoderResolution).nemoGpuBatchBudget,
+        same(s.nemoGpuBatchBudget),
+      );
+      await s.close();
+    });
+
+    test('int8 · CPU：不给预算，走任务侧的动态成批', () async {
+      final AsrEngineSessions s = await AsrEngineLoader(
+        factory: _FakeFactory(),
+      ).load(
+        store: parakeet,
+        variant: AsrEncoderVariant.int8,
+        preference: AsrAccelerationPreference.auto,
+      );
+      expect(s.encoderResolution.effective, OnnxExecutionProvider.cpu);
+      expect(s.nemoGpuBatchBudget, isNull);
+      expect((s.newDecoder() as AsrNemoCtcDecoder).batchCapFor(window), isNull);
+      await s.close();
+    });
+
+    test('Omnilingual（ctc）不受影响：没有 nemo 预算', () async {
+      final AsrEngineSessions s = await AsrEngineLoader(
+        factory: _FakeFactory(
+          available: const <OnnxExecutionProvider>{
+            OnnxExecutionProvider.directml,
+          },
+        ),
+        platform: AsrPlatform.windows,
+      ).load(
+        store: store,
+        variant: AsrEncoderVariant.fp32,
+        preference: AsrAccelerationPreference.auto,
+      );
+      expect(s.nemoGpuBatchBudget, isNull);
+      await s.close();
+    });
   });
 }

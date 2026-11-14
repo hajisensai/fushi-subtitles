@@ -285,6 +285,7 @@ class AsrEngineSessions {
     this.indexType = AsrIndexType.int64,
     this.encoderFp16 = false,
     this.nemoMel,
+    this.nemoGpuBatchBudget,
   }) : assert(
          asrIsCtcArchitecture(architecture) ||
              (decoder != null && joiner != null),
@@ -310,6 +311,7 @@ class AsrEngineSessions {
         indexType: indexType,
         encoderFp16: encoderFp16,
         nemoMel: nemoMel,
+        nemoGpuBatchBudget: nemoGpuBatchBudget,
       );
 
   /// 模型包架构：决定 [newDecoder] 装哪种解码器、[maxSegmentMs] 取哪档。
@@ -334,6 +336,10 @@ class AsrEngineSessions {
   /// null。
   final AsrNemoMel? nemoMel;
 
+  /// [AsrModelArchitecture.nemoCtc] 的模型落在 GPU EP 上时，一批行数按显存封顶
+  /// 要用的量（见 [asrNemoGpuBatchRows]）；CPU 会话与其它架构为 null。
+  final AsrNemoGpuBatchBudget? nemoGpuBatchBudget;
+
   /// 用本套会话构造批量解码器。in-process 与 isolate 两条装配路径都从这里拿，
   /// 包契约参数只在此处传递一次。
   AsrSegmentDecoder newDecoder() => switch (architecture) {
@@ -357,6 +363,7 @@ class AsrEngineSessions {
     AsrModelArchitecture.nemoCtc => AsrNemoCtcDecoder(
       model: encoder,
       tokens: tokens,
+      gpuBatchBudget: nemoGpuBatchBudget,
     ),
   };
 
@@ -835,10 +842,24 @@ class AsrEngineLoader {
           await staticSessions.prewarmSmallest();
         }
       }
+      // nemoCtc 没有静态桶，GPU 上一批的行数要按显存封顶：任务侧的动态预算
+      // 只看音频总长，Parakeet 0.6B 一批 42 个 15 s 窗口要约 10 GB 显存。
+      AsrNemoGpuBatchBudget? nemoGpuBatchBudget;
+      if (store.pack.architecture == AsrModelArchitecture.nemoCtc &&
+          effective != OnnxExecutionProvider.cpu) {
+        nemoGpuBatchBudget = AsrNemoGpuBatchBudget(
+          weightBytes: await _ctcWeightBytes(store, variant),
+          budgetBytes: await _factory.deviceMemoryBudgetBytes(),
+        );
+      }
+      final String gpuBatchNote = nemoGpuBatchBudget == null
+          ? ''
+          : ' gpuBatchRows(15 s)='
+                '${asrNemoGpuBatchRows(longestSamples: 15 * kAsrSampleRate, budget: nemoGpuBatchBudget)}';
       developer.log(
         'ASR ${store.pack.architecture.name} engine loaded (${variant.name}'
         '${openedEncoder.fp16 ? ', fp16' : ''}): $modelResolution '
-        'staticBuckets=${staticSessions != null}',
+        'staticBuckets=${staticSessions != null}$gpuBatchNote',
         name: kAsrLogName,
       );
       return AsrEngineSessions(
@@ -851,6 +872,7 @@ class AsrEngineLoader {
         encoderResolution: modelResolution,
         staticEncoders: staticSessions,
         nemoMel: nemoMel,
+        nemoGpuBatchBudget: nemoGpuBatchBudget,
       );
     } catch (_) {
       for (final OnnxSession s in opened) {
@@ -858,6 +880,21 @@ class AsrEngineLoader {
       }
       rethrow;
     }
+  }
+
+  /// CTC 模型 [variant] 的权重磁盘字节数（模型文件 + fp32 的外置权重）。
+  static Future<int> _ctcWeightBytes(
+    AsrModelStore store,
+    AsrEncoderVariant variant,
+  ) async {
+    int bytes = await store.fileFor(asrCtcModelRole(variant)).length();
+    if (variant == AsrEncoderVariant.fp32 &&
+        store.pack.files.any(
+          (AsrModelFile f) => f.role == AsrModelRole.ctcWeightsFp32,
+        )) {
+      bytes += await store.fileFor(AsrModelRole.ctcWeightsFp32).length();
+    }
+    return bytes;
   }
 
   /// 建一个**清单文件**的会话，并在失败时分辨「是不是这个文件本身坏了」。

@@ -29,14 +29,84 @@ const int kAsrNemoSubsampling = 8;
 /// 输出帧时长（毫秒）：10 ms 特征帧 × 8。
 const int kAsrNemoFrameMs = kAsrFrameShiftMs * kAsrNemoSubsampling;
 
+/// GPU 会话一批的行数上限（显存再多也不超过它）。
+///
+/// 2026-11-13 在 RTX 4070 Ti（CUDA EP）上量 Parakeet 0.6B ja fp32、15 s 窗口：
+/// 每行耗时 8 行 15 ms、16 行 15 ms、42 行 17 ms——批再大没有任何吞吐收益，只多占
+/// 显存。所以上限取 8，而不是「显存装得下多少就发多少」。
+const int kAsrNemoGpuMaxBatchRows = 8;
+
+/// 一秒音频在 GPU 上的激活开销（字节 / 行）。
+///
+/// FastConformer 的卷积下采样前端先把 `[N, 80, T]` 升到 256 通道、只降一半分辨率，
+/// 这一层的激活随 `N × T` 线性增长，是显存的大头。同一次测量（按需增长的 arena）：
+/// 8 行 +1639 MiB、16 行 +2870 MiB、42 行 +7534 MiB，即每行（15 s）180～205 MiB
+/// ≈ 13.7 MiB/s。取 16 MiB/s 给 ORT 默认的 2 的幂增长 arena 留余量。
+const int kAsrNemoGpuBytesPerAudioSecond = 16 * 1024 * 1024;
+
+/// 留给驱动、cuDNN 工作区与本进程其它显存占用的余量。
+const int kAsrNemoGpuReserveBytes = 512 * 1024 * 1024;
+
+/// 显存预算未知时一批的音频总长（秒）：4 个 15 s 窗口，峰值约 3.3 GB。
+const int kAsrNemoGpuUnknownBudgetAudioSeconds = 60;
+
+/// [AsrNemoCtcDecoder] 跑在 GPU EP 上时算成批上限要用的两个量。
+class AsrNemoGpuBatchBudget {
+  const AsrNemoGpuBatchBudget({
+    required this.weightBytes,
+    required this.budgetBytes,
+  });
+
+  /// 模型权重的磁盘字节数（`model.onnx` + 外置权重）。
+  final int weightBytes;
+
+  /// 本进程的 GPU 显存预算（`OnnxSessionFactory.deviceMemoryBudgetBytes`）；
+  /// null = 平台答不上来。
+  final int? budgetBytes;
+}
+
+/// GPU 上一批最多几行（纯函数，至少 1 行）。
+///
+/// 为什么必须封顶：任务侧的动态成批预算（`AsrTranscribeJob.batchSize` × 20 s，
+/// GPU 默认 640 s）是按 zipformer 调的，只看音频总长、不看显存。Parakeet 的滑窗
+/// 恒 15 s，于是一批 42 行、要约 10 GB 显存；6 GB 的卡装不下，NVIDIA 驱动把超出
+/// 部分放进共享系统内存，一次 Run 从 0.7 s 变成几十秒到几分钟，整台机器的 GPU
+/// 被拖住、界面跟着卡死（Fushi issue #3380）。
+///
+/// 权重常驻显存按磁盘字节的 9/8 计（实测 2369 MiB 的权重装载后占 2555 MiB）。
+int asrNemoGpuBatchRows({
+  required int longestSamples,
+  required AsrNemoGpuBatchBudget budget,
+}) {
+  final int seconds = math.max(
+    1,
+    (longestSamples + kAsrSampleRate - 1) ~/ kAsrSampleRate,
+  );
+  final int? budgetBytes = budget.budgetBytes;
+  final int rows;
+  if (budgetBytes == null) {
+    rows = kAsrNemoGpuUnknownBudgetAudioSeconds ~/ seconds;
+  } else {
+    final int usable = budgetBytes -
+        (budget.weightBytes + budget.weightBytes ~/ 8) -
+        kAsrNemoGpuReserveBytes;
+    rows = usable <= 0
+        ? 1
+        : usable ~/ (kAsrNemoGpuBytesPerAudioSecond * seconds);
+  }
+  return rows.clamp(1, kAsrNemoGpuMaxBatchRows);
+}
+
 class AsrNemoCtcDecoder implements AsrSegmentDecoder {
   AsrNemoCtcDecoder({
     required OnnxSession model,
     required AsrTokenTable tokens,
     AsrNemoMel? mel,
+    AsrNemoGpuBatchBudget? gpuBatchBudget,
   })  : _model = model,
         _tokens = tokens,
-        _mel = mel ?? AsrNemoMel.slaney80 {
+        _mel = mel ?? AsrNemoMel.slaney80,
+        _gpuBatchBudget = gpuBatchBudget {
     if (tokens.blankId < 0) {
       throw ArgumentError.value(tokens, 'tokens', '词表缺少 blank 记号');
     }
@@ -46,14 +116,22 @@ class AsrNemoCtcDecoder implements AsrSegmentDecoder {
   final AsrTokenTable _tokens;
   final AsrNemoMel _mel;
 
+  /// 非 null = 会话在 GPU EP 上，一批的行数按显存封顶（[asrNemoGpuBatchRows]）。
+  final AsrNemoGpuBatchBudget? _gpuBatchBudget;
+
   AsrDecodeStats _stats = const AsrDecodeStats();
 
   @override
   AsrDecodeStats get stats => _stats;
 
   /// 动态会话、无静态桶：滑窗的输入长度本身就恒定（15 s），不需要桶来钉形状。
+  /// CPU 上不封顶（null，走任务侧的动态预算）；GPU 上按显存封顶。
   @override
-  int? batchCapFor(int longestSamples) => null;
+  int? batchCapFor(int longestSamples) {
+    final AsrNemoGpuBatchBudget? budget = _gpuBatchBudget;
+    if (budget == null) return null;
+    return asrNemoGpuBatchRows(longestSamples: longestSamples, budget: budget);
+  }
 
   @override
   int? bucketKeyFor(int longestSamples) => null;
