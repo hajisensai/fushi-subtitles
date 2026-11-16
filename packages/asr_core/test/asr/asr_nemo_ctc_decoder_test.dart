@@ -1,9 +1,14 @@
+import 'dart:io';
 import 'dart:typed_data';
 
 import 'package:fushi_asr_core/src/asr/asr_nemo_ctc_decoder.dart';
 import 'package:fushi_asr_core/src/asr/asr_nemo_mel.dart';
+import 'package:fushi_asr_core/src/asr/asr_sliding_window.dart';
+import 'package:fushi_asr_core/src/asr/asr_transcribe_job.dart';
+import 'package:fushi_asr_core/src/asr/asr_transcription_service.dart';
 import 'package:fushi_asr_core/src/asr/asr_types.dart';
 import 'package:fushi_asr_core/src/onnx/onnx_inference.dart';
+import 'package:path/path.dart' as p;
 import 'package:test/test.dart';
 
 /// sherpa-onnx NeMo 词表形态：`<blk>` 在**末位**（Parakeet 日语是 3072）。
@@ -131,4 +136,132 @@ void main() {
       throwsArgumentError,
     );
   });
+
+  // Fushi issue #3380：6 GB 的 3060 Laptop 上 CUDA 转录在首个 Run 卡死。任务侧的
+  // 动态预算一批发 42 个 15 s 窗口，Parakeet 0.6B fp32 要约 10 GB 显存。
+  group('GPU 成批上限', () {
+    const int mib = 1024 * 1024;
+    // Parakeet 0.6B ja fp32：model.onnx + model.onnx_data。
+    const int weights = 953841 + 2484355076;
+    const int window = 15 * kAsrSampleRate;
+
+    int rows(int? budgetBytes, {int samples = window}) => asrNemoGpuBatchRows(
+          longestSamples: samples,
+          budget: AsrNemoGpuBatchBudget(
+            weightBytes: weights,
+            budgetBytes: budgetBytes,
+          ),
+        );
+
+    test('按显存预算算行数，封顶 $kAsrNemoGpuMaxBatchRows，至少 1', () {
+      // 12 GB 卡：显存再多也不超过上限（批再大没有吞吐收益）。
+      expect(rows(11000 * mib), kAsrNemoGpuMaxBatchRows);
+      // 6 GB 卡（预算约 5.3 GB）：峰值 ≈ 2.6 GB 权重 + 8 × 0.2 GB，装得下。
+      expect(rows(5400 * mib), 8);
+      // 刚过 fp32 门槛的 4 GiB 预算：只剩 3 行。
+      expect(rows(4096 * mib), 3);
+      // 预算比权重还小：仍发 1 行（单行也得解，不能卡在 0）。
+      expect(rows(2000 * mib), 1);
+      expect(rows(0), 1);
+    });
+
+    test('窗口越长行数越少；预算未知按 60 s 音频一批', () {
+      expect(rows(4096 * mib, samples: 30 * kAsrSampleRate), 1);
+      expect(rows(null), 4);
+      expect(rows(null, samples: 30 * kAsrSampleRate), 2);
+      expect(rows(null, samples: 120 * kAsrSampleRate), 1);
+      // 不足 1 s 的尾窗按 1 s 计，不除零、不超上限。
+      expect(rows(null, samples: 100), kAsrNemoGpuMaxBatchRows);
+    });
+
+    test('CPU 会话（不给预算）不封顶，GPU 会话 batchCapFor 给出行数', () {
+      final _NemoSession session = _NemoSession((int r, int f) => _kBlank);
+      expect(
+        AsrNemoCtcDecoder(model: session, tokens: tokens).batchCapFor(window),
+        isNull,
+      );
+      expect(
+        AsrNemoCtcDecoder(
+          model: session,
+          tokens: tokens,
+          gpuBatchBudget: const AsrNemoGpuBatchBudget(
+            weightBytes: weights,
+            budgetBytes: 4096 * mib,
+          ),
+        ).batchCapFor(window),
+        3,
+      );
+    });
+
+    group('整条任务（滑窗 + GPU 默认 batchSize）', () {
+      late Directory tmp;
+      setUp(() => tmp = Directory.systemTemp.createTempSync('asr_nemo_cap_'));
+      tearDown(() {
+        if (tmp.existsSync()) tmp.deleteSync(recursive: true);
+      });
+
+      Future<List<int>> batchRows(AsrNemoGpuBatchBudget? budget) async {
+        final _NemoSession session = _NemoSession((int r, int f) => _kBlank);
+        final AsrTranscribeJob job = AsrTranscribeJob(
+          jobDir: Directory(p.join(tmp.path, budget == null ? 'cpu' : 'gpu')),
+          audioPaths: const <String>['a.mkv'],
+          modelId: 'm',
+          pcm: _SilencePcm(seconds: 780),
+          segmenter: AsrSlidingWindowSegmenter(),
+          decoder: AsrNemoCtcDecoder(
+            model: session,
+            tokens: tokens,
+            gpuBatchBudget: budget,
+          ),
+          batchSize: AsrTranscriptionService.defaultBatchSizeFor(
+            OnnxExecutionProvider.cuda,
+          ),
+          progressInterval: Duration.zero,
+        );
+        final List<AsrTranscribeEvent> events = await job.run().toList();
+        expect(events.last, isA<AsrTranscribeFinishedEvent>());
+        return <int>[for (final List<int> s in session.shapes) s[0]];
+      }
+
+      test('不封顶时一批 42 行（复现）；封顶后每批 ≤ 上限且窗口一个不少', () async {
+        // 780 s、步长 12 s → 65 个窗口。
+        final List<int> uncapped = await batchRows(null);
+        expect(uncapped.reduce((int a, int b) => a + b), 65);
+        expect(uncapped.first, 42, reason: '动态预算 640 s ÷ 15 s');
+
+        final List<int> capped = await batchRows(
+          const AsrNemoGpuBatchBudget(
+            weightBytes: weights,
+            budgetBytes: 5400 * mib,
+          ),
+        );
+        expect(capped.reduce((int a, int b) => a + b), 65);
+        expect(capped.every((int n) => n <= kAsrNemoGpuMaxBatchRows), isTrue);
+        expect(capped.first, kAsrNemoGpuMaxBatchRows);
+      });
+    });
+  });
+}
+
+/// 一整条静音 PCM（按 [chunkSeconds] 分块）。
+class _SilencePcm implements AsrPcmSource {
+  _SilencePcm({required this.seconds});
+  final int seconds;
+
+  @override
+  Future<int?> probeDurationMs(String audioPath) async => seconds * 1000;
+
+  @override
+  Stream<AsrPcmChunk> decode(
+    String audioPath, {
+    int startSample = 0,
+    int chunkSeconds = 600,
+  }) async* {
+    final int total = seconds * kAsrSampleRate;
+    final int step = chunkSeconds * kAsrSampleRate;
+    for (int at = startSample; at < total; at += step) {
+      final int end = at + step < total ? at + step : total;
+      yield AsrPcmChunk(startSample: at, samples: Float32List(end - at));
+    }
+  }
 }
