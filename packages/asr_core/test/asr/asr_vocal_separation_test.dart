@@ -42,6 +42,50 @@ class _SilenceSession implements OnnxSession {
   Future<void> close() async {}
 }
 
+/// 不是恒等的确定性「模型」：逐频点乘一个随频率变化的增益（实部虚部同乘），
+/// 左右两路给不同增益——足以让分离结果与输入不同，又与窗口位置无关。
+class _GainSession implements OnnxSession {
+  @override
+  Future<Map<String, OnnxTensor>> run(Map<String, OnnxTensor> inputs) async {
+    final OnnxTensor x = inputs['input']!;
+    final Float32List src = x.floatData!;
+    final int dimF = x.shape[2];
+    final int dimT = x.shape[3];
+    final int plane = dimF * dimT;
+    final Float32List y = Float32List(src.length);
+    for (int c = 0; c < 4; c++) {
+      for (int f = 0; f < dimF; f++) {
+        final double g = (c < 2 ? 0.8 : 0.4) * (1 + math.cos(f / 37));
+        for (int t = 0; t < dimT; t++) {
+          final int i = c * plane + f * dimT + t;
+          y[i] = src[i] * g;
+        }
+      }
+    }
+    return <String, OnnxTensor>{'output': OnnxTensor.float32(y, x.shape)};
+  }
+
+  @override
+  Future<void> close() async {}
+}
+
+/// 记下送进模型的张量，回静音。
+class _CaptureSession implements OnnxSession {
+  final List<Float32List> inputs = <Float32List>[];
+
+  @override
+  Future<Map<String, OnnxTensor>> run(Map<String, OnnxTensor> inputs) async {
+    final OnnxTensor x = inputs['input']!;
+    this.inputs.add(Float32List.fromList(x.floatData!));
+    return <String, OnnxTensor>{
+      'output': OnnxTensor.float32(Float32List(x.elementCount), x.shape),
+    };
+  }
+
+  @override
+  Future<void> close() async {}
+}
+
 class _ListPcm implements AsrPcmSource {
   _ListPcm(this.chunks);
   final List<AsrPcmChunk> chunks;
@@ -54,8 +98,7 @@ class _ListPcm implements AsrPcmSource {
     String audioPath, {
     int startSample = 0,
     int chunkSeconds = 600,
-  }) =>
-      Stream<AsrPcmChunk>.fromIterable(chunks);
+  }) => Stream<AsrPcmChunk>.fromIterable(chunks);
 }
 
 Float32List _sine(int n, double hz, int rate, {double amp = 0.5}) {
@@ -127,17 +170,88 @@ void main() {
       expect(_maxAbsDiff(x, y, 800, n - 800), lessThan(5e-3));
     });
 
+    test('流式 separate 与「整段上采样 → 分离 → 整段下采样」逐样本相同', () async {
+      // 不落整段 44.1 kHz 中间量是内存修正，不许改结果：拿非恒等模型、跨四个
+      // 窗口、尾窗不满的长度逐样本对照参考路径。
+      final int n = 20 * kAsrSampleRate + 777;
+      final math.Random rng = math.Random(7);
+      final Float32List x = Float32List(n);
+      for (int i = 0; i < n; i++) {
+        x[i] =
+            0.3 * math.sin(2 * math.pi * 440 * i / kAsrSampleRate) +
+            0.1 * (rng.nextDouble() * 2 - 1);
+      }
+      final AsrVocalSeparator streaming = AsrVocalSeparator(_GainSession());
+      final AsrVocalSeparator reference = AsrVocalSeparator(_GainSession());
+      final Float32List got = await streaming.separate(x);
+      final AsrResampler up = AsrResampler(
+        fromRate: kAsrSampleRate,
+        toRate: kAsrVocalSeparationSampleRate,
+      );
+      final AsrResampler down = AsrResampler(
+        fromRate: kAsrVocalSeparationSampleRate,
+        toRate: kAsrSampleRate,
+      );
+      final Float32List want = down.process(
+        await reference.separateAtModelRate(up.process(x)),
+      );
+      expect(got.length, n);
+      // 两次取整可能短一两个样本，separate 在尾部补零。
+      expect(want.length, inInclusiveRange(n - 2, n));
+      expect(_maxAbsDiff(got, want, 0, want.length), 0);
+      for (int i = want.length; i < n; i++) {
+        expect(got[i], 0);
+      }
+      // 非恒等：确实改了信号（防止两边都退化成原样直通也算过）。
+      expect(_maxAbsDiff(got, x, 800, n - 800), greaterThan(1e-2));
+    });
+
+    test('模型输入布局与 torch.stft 同约定：[左实, 左虚, 右实, 右虚]，e^{-iωn}', () async {
+      // 频率恰在第 100 个频点、且每帧起点相位为 0 的余弦 / 正弦：内部帧在该频点
+      // 的值是 Σ w·cos² = N/4（实）与 −Σ w·sin² = −N/4（虚）。共轭约定或通道
+      // 次序错了，恒等往返测不出来，真模型却会看到另一份谱。
+      const AsrMdxConfig c = AsrMdxConfig();
+      const int f0 = 100;
+      final int n = c.windowSamples * 2;
+      final int plane = c.dimF * c.dimT;
+      for (final bool sine in <bool>[false, true]) {
+        final _CaptureSession session = _CaptureSession();
+        final Float32List x = Float32List(n);
+        for (int i = 0; i < n; i++) {
+          final double a = 2 * math.pi * f0 * i / c.nFft;
+          x[i] = sine ? math.sin(a) : math.cos(a);
+        }
+        await AsrVocalSeparator(session).separateAtModelRate(x);
+        final Float32List in0 = session.inputs.first;
+        for (final int t in <int>[8, 100, 200]) {
+          final int idx = f0 * c.dimT + t;
+          final double re = in0[idx];
+          final double im = in0[plane + idx];
+          if (sine) {
+            expect(re.abs(), lessThan(1), reason: 'sin 实部 t=$t');
+            expect(im, closeTo(-c.nFft / 4, 1), reason: 'sin 虚部 t=$t');
+          } else {
+            expect(re, closeTo(c.nFft / 4, 1), reason: 'cos 实部 t=$t');
+            expect(im.abs(), lessThan(1), reason: 'cos 虚部 t=$t');
+          }
+          expect(in0[2 * plane + idx], re, reason: '右实 = 左实');
+          expect(in0[3 * plane + idx], im, reason: '右虚 = 左虚');
+        }
+      }
+    });
+
     test('模型判定没有人声：输出静音', () async {
       final AsrVocalSeparator separator = AsrVocalSeparator(_SilenceSession());
-      final Float32List y =
-          await separator.separate(_sine(kAsrSampleRate * 2, 440, 16000));
+      final Float32List y = await separator.separate(
+        _sine(kAsrSampleRate * 2, 440, 16000),
+      );
       expect(_rms(y, 0, y.length), lessThan(1e-6));
     });
 
     test('空块原样返回空', () async {
       final _IdentitySession session = _IdentitySession();
-      final Float32List y =
-          await AsrVocalSeparator(session).separate(Float32List(0));
+      final Float32List y = await AsrVocalSeparator(session)
+          .separate(Float32List(0));
       expect(y, isEmpty);
       expect(session.runs, 0);
     });
@@ -172,13 +286,10 @@ void main() {
       expect(mixed.hasVocalSeparator, isFalse);
       expect(song.hasVocalSeparator, isTrue);
       for (final AsrEncoderVariant v in AsrEncoderVariant.values) {
-        expect(
-          song.filesFor(v).map((AsrModelFile f) => f.fileName),
-          <String>[
-            ...mixed.filesFor(v).map((AsrModelFile f) => f.fileName),
-            kAsrVocalSeparatorFile.fileName,
-          ],
-        );
+        expect(song.filesFor(v).map((AsrModelFile f) => f.fileName), <String>[
+          ...mixed.filesFor(v).map((AsrModelFile f) => f.fileName),
+          kAsrVocalSeparatorFile.fileName,
+        ]);
         expect(
           song.totalBytes(v),
           mixed.totalBytes(v) + kAsrVocalSeparatorFile.expectedBytes,
@@ -194,14 +305,18 @@ void main() {
       expect(AsrAudioProfile.mixedAudio.separatesVocals, isFalse);
       expect(AsrAudioProfile.cleanSpeech.separatesVocals, isFalse);
       expect(
-          kAsrParakeetJapanesePack.servesProfile(AsrAudioProfile.song), isTrue);
+        kAsrParakeetJapanesePack.servesProfile(AsrAudioProfile.song),
+        isTrue,
+      );
       // 通用包仍是通用包（加了 song 不改变「不带素材的老调用方」能看到谁）。
       expect(kAsrJapanesePack.servesProfile(null), isTrue);
       expect(kAsrParakeetJapanesePack.servesProfile(null), isFalse);
       expect(
         AsrModelRegistry.builtin()
-            .packForLanguage(AsrLanguage.japanese,
-                profile: AsrAudioProfile.song)
+            .packForLanguage(
+              AsrLanguage.japanese,
+              profile: AsrAudioProfile.song,
+            )
             ?.id,
         kAsrParakeetJapanesePack.id,
       );

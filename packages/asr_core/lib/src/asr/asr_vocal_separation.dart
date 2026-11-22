@@ -29,7 +29,9 @@ const int kAsrVocalSeparationSampleRate = 44100;
 
 /// 一次分离前向的峰值工作集（字节）：权重 28 MB + ORT CPU arena。2026-11-23
 /// onnxruntime 1.22 CPU EP 实测一个 `[1, 4, 2048, 256]` 窗口 RSS 从 90 MB 涨到
-/// 616 MB，取整留余量。宿主的内存门槛（移动端）在识别模型的估算上加这一项。
+/// 616 MB，取整留余量。Dart 侧缓冲按窗口算（输入 / 输出张量各 8 MiB、iSTFT
+/// 累加 4 MiB、人声尾巴 1 MiB，见 [AsrVocalSeparator.separate]），不随块长涨，
+/// 落在余量里。宿主的内存门槛（移动端）在识别模型的估算上加这一项。
 const int kAsrVocalSeparationWorkingSetBytes = 640 * 1024 * 1024;
 
 /// MDX-Net 的 STFT 与张量形状。默认值逐项对照 [kAsrVocalSeparatorFile] 的 ONNX
@@ -89,14 +91,15 @@ class AsrResampler {
         // 第 j 个抽头对应输入 base + (j - half + 1)，与输出时刻相距 t。
         final double t = (j - _half + 1) - frac;
         final double x = 2 * cutoff * t;
-        final double sinc =
-            x == 0 ? 1.0 : math.sin(math.pi * x) / (math.pi * x);
+        final double sinc = x == 0
+            ? 1.0
+            : math.sin(math.pi * x) / (math.pi * x);
         final double u = (t + _half) / (2 * _half); // 0..1
         final double w = u <= 0 || u >= 1
             ? 0.0
             : 0.42 -
-                0.5 * math.cos(2 * math.pi * u) +
-                0.08 * math.cos(4 * math.pi * u);
+                  0.5 * math.cos(2 * math.pi * u) +
+                  0.08 * math.cos(4 * math.pi * u);
         final double h = 2 * cutoff * sinc * w;
         _table[phase * taps + j] = h;
         sum += h;
@@ -123,42 +126,69 @@ class AsrResampler {
   /// [input] 重采样后的长度。
   int outputLength(int inputLength) => inputLength * _up ~/ _down;
 
+  /// 每个输出样本用到的输入样本数。
+  int get taps => 2 * _half;
+
+  /// 输出样本 [i] 用到的第一个输入下标（区间 `[firstInputFor(i), +taps)`，越界
+  /// 部分按 0 计）。随 [i] 单调不减。
+  int firstInputFor(int i) => (i * _down) ~/ _up - _half + 1;
+
   Float32List process(Float32List input) {
     final int n = input.length;
     final Float32List out = Float32List(outputLength(n));
-    final int taps = 2 * _half;
     for (int i = 0; i < out.length; i++) {
-      final int pos = i * _down;
-      final int base = pos ~/ _up;
-      final int phase = pos - base * _up;
-      final int row = phase * taps;
-      final int first = base - _half + 1;
-      double acc = 0;
-      if (first >= 0 && first + taps <= n) {
-        for (int j = 0; j < taps; j++) {
-          acc += input[first + j] * _table[row + j];
-        }
-      } else {
-        for (int j = 0; j < taps; j++) {
-          final int k = first + j;
-          if (k < 0 || k >= n) continue;
-          acc += input[k] * _table[row + j];
-        }
-      }
-      out[i] = acc;
+      out[i] = sampleAt(input, 0, n, i);
     }
     return out;
+  }
+
+  /// 把输出样本 `[outStart, outStart + dest.length)` 写进 [dest]；超出
+  /// `[0, outputLength(input.length))` 的位置写 0。与 [process] 逐样本相同，
+  /// 只是不落整段输出。
+  void renderInto(Float32List input, int outStart, Float32List dest) {
+    final int n = input.length;
+    final int total = outputLength(n);
+    for (int i = 0; i < dest.length; i++) {
+      final int k = outStart + i;
+      dest[i] = k >= 0 && k < total ? sampleAt(input, 0, n, k) : 0.0;
+    }
+  }
+
+  /// 输出样本 [i]：输入逻辑长度 [n]，[window] 里存的是输入下标
+  /// `[offset, offset + window.length)` 那一段（[i] 用到的落在 `[0, n)` 内的
+  /// 输入都必须在里面）。
+  double sampleAt(Float32List window, int offset, int n, int i) {
+    final int taps = 2 * _half;
+    final int pos = i * _down;
+    final int base = pos ~/ _up;
+    final int phase = pos - base * _up;
+    final int row = phase * taps;
+    final int first = base - _half + 1;
+    double acc = 0;
+    if (first >= 0 && first + taps <= n) {
+      final int o = first - offset;
+      for (int j = 0; j < taps; j++) {
+        acc += window[o + j] * _table[row + j];
+      }
+    } else {
+      for (int j = 0; j < taps; j++) {
+        final int k = first + j;
+        if (k < 0 || k >= n) continue;
+        acc += window[k - offset] * _table[row + j];
+      }
+    }
+    return acc;
   }
 }
 
 /// 原地复数 FFT（基 2）。`inverse` 时做共轭变换并除以 N。
 class _ComplexFft {
   _ComplexFft(this.size)
-      : _re = Float64List(size),
-        _im = Float64List(size),
-        _cos = Float64List(size ~/ 2),
-        _sin = Float64List(size ~/ 2),
-        _rev = Int32List(size) {
+    : _re = Float64List(size),
+      _im = Float64List(size),
+      _cos = Float64List(size ~/ 2),
+      _sin = Float64List(size ~/ 2),
+      _rev = Int32List(size) {
     if (size < 2 || (size & (size - 1)) != 0) {
       throw ArgumentError.value(size, 'size', 'FFT 长度必须是 2 的幂');
     }
@@ -241,16 +271,16 @@ class AsrVocalSeparator {
     this.config = const AsrMdxConfig(),
     this.inputName = 'input',
     this.outputName = 'output',
-  })  : _fft = _ComplexFft(config.nFft),
-        _window = _periodicHann(config.nFft),
-        _up = AsrResampler(
-          fromRate: kAsrSampleRate,
-          toRate: kAsrVocalSeparationSampleRate,
-        ),
-        _downsample = AsrResampler(
-          fromRate: kAsrVocalSeparationSampleRate,
-          toRate: kAsrSampleRate,
-        );
+  }) : _fft = _ComplexFft(config.nFft),
+       _window = _periodicHann(config.nFft),
+       _up = AsrResampler(
+         fromRate: kAsrSampleRate,
+         toRate: kAsrVocalSeparationSampleRate,
+       ),
+       _downsample = AsrResampler(
+         fromRate: kAsrVocalSeparationSampleRate,
+         toRate: kAsrSampleRate,
+       );
 
   final OnnxSession session;
   final AsrMdxConfig config;
@@ -262,6 +292,9 @@ class AsrVocalSeparator {
   final AsrResampler _up;
   final AsrResampler _downsample;
 
+  /// 模型输入张量 `[1, 4, dimF, dimT]`，窗口间复用。
+  late final Float32List _input = Float32List(4 * config.dimF * config.dimT);
+
   static Float64List _periodicHann(int n) {
     final Float64List w = Float64List(n);
     for (int i = 0; i < n; i++) {
@@ -271,15 +304,56 @@ class AsrVocalSeparator {
   }
 
   /// 16 kHz 单声道 → 同长度的 16 kHz 人声。
+  ///
+  /// 结果与 `downsample(separateAtModelRate(upsample(pcm16k)))` 逐样本相同，但
+  /// **不落整段 44.1 kHz 中间量**：上采样按窗口现算，分离出的 44.1 kHz 人声只留
+  /// 下采样滤波器还要用的那一截（< 一个窗口步长 + 滤波器长度）。一个 300 s 的块
+  /// 整段落两份 44.1 kHz float 是 ~106 MB，而 [kAsrVocalSeparationWorkingSetBytes]
+  /// 只按窗口级缓冲记账。
   Future<Float32List> separate(Float32List pcm16k) async {
-    if (pcm16k.isEmpty) return Float32List(0);
-    final Float32List wide = _up.process(pcm16k);
-    final Float32List vocals = await separateAtModelRate(wide);
-    final Float32List narrow = _downsample.process(vocals);
-    if (narrow.length == pcm16k.length) return narrow;
+    final int n16 = pcm16k.length;
+    if (n16 == 0) return Float32List(0);
+    final AsrMdxConfig c = config;
+    final int n44 = _up.outputLength(n16);
+    final int trim = c.trim;
+    final int gen = c.genSamples;
+    final AsrResampler down = _downsample;
+    final int downTaps = down.taps;
     // 两次取整可能差一两个样本：按输入长度截齐 / 补零，时间轴不能漂。
-    final Float32List out = Float32List(pcm16k.length);
-    out.setRange(0, math.min(out.length, narrow.length), narrow);
+    final int nOut = math.min(n16, down.outputLength(n44));
+    final Float32List out = Float32List(n16);
+    final Float32List segment = Float32List(c.windowSamples);
+    // 已分离的 44.1 kHz 人声：buf[0, bufLen) 是逻辑下标 [bufStart, bufStart + bufLen)。
+    final Float32List buf = Float32List(gen + downTaps + 1);
+    int bufStart = 0;
+    int bufLen = 0;
+    int next = 0;
+    for (int start = 0; start < n44 && next < nOut; start += gen) {
+      _up.renderInto(pcm16k, start - trim, segment);
+      final Float32List seg = await _separateWindow(segment);
+      // seg 与 segment 同长；[trim, trim + gen) 对应 44.1 kHz 人声 [start, start + gen)。
+      final int take = math.min(gen, n44 - start);
+      buf.setRange(bufLen, bufLen + take, seg, trim);
+      bufLen += take;
+      final int produced = bufStart + bufLen;
+      final bool last = produced >= n44;
+      while (next < nOut &&
+          (last || down.firstInputFor(next) + downTaps <= produced)) {
+        out[next] = down.sampleAt(buf, bufStart, n44, next);
+        next++;
+      }
+      // 丢掉下一个输出样本再也用不到的前缀。
+      final int keepFrom = math.max(
+        bufStart,
+        math.min(produced, down.firstInputFor(next)),
+      );
+      final int drop = keepFrom - bufStart;
+      if (drop > 0) {
+        buf.setRange(0, bufLen - drop, buf, drop);
+        bufLen -= drop;
+        bufStart = keepFrom;
+      }
+    }
     return out;
   }
 
@@ -297,42 +371,42 @@ class AsrVocalSeparator {
     final int trim = c.trim;
     final int gen = c.genSamples;
     final int win = c.windowSamples;
-    final int bins = c.nFft ~/ 2 + 1;
-    final int plane = c.dimF * c.dimT;
-    final Float32List input = Float32List(4 * plane);
     final Float32List segment = Float32List(win);
-    // 帧谱（只存模型看的前 dimF 个频点）。
     for (int start = 0; start < n; start += gen) {
       // 窗口在「补过零的信号」里从 start 起，对应原信号 [start - trim, start - trim + win)。
       for (int i = 0; i < win; i++) {
         final int k = start - trim + i;
         segment[i] = k >= 0 && k < n ? x[k] : 0.0;
       }
-      _stftInto(segment, input, plane);
-      final Map<String, OnnxTensor> result = await session.run(
-        <String, OnnxTensor>{
-          inputName: OnnxTensor.float32(
-            input,
-            <int>[1, 4, c.dimF, c.dimT],
-          ),
-        },
-      );
-      final OnnxTensor? y = result[outputName] ?? result.values.firstOrNull;
-      final Float32List? spec = y?.floatData;
-      if (spec == null || spec.length != 4 * plane) {
-        throw StateError(
-          '人声分离模型输出形状不符：期望 ${4 * plane} 个 float，实得 '
-          '${spec?.length} (${y?.shape})',
-        );
-      }
-      final Float32List seg = _istft(spec, plane, bins);
+      final Float32List seg = await _separateWindow(segment);
       // seg 与 segment 同长；[trim, trim + gen) 对应原信号 [start, start + gen)。
       final int take = math.min(gen, n - start);
-      for (int i = 0; i < take; i++) {
-        out[start + i] = seg[trim + i];
-      }
+      out.setRange(start, start + take, seg, trim);
     }
     return out;
+  }
+
+  /// 一个窗口：center STFT → 模型 → iSTFT，返回与 [segment] 同长的人声。
+  Future<Float32List> _separateWindow(Float32List segment) async {
+    final AsrMdxConfig c = config;
+    final int bins = c.nFft ~/ 2 + 1;
+    final int plane = c.dimF * c.dimT;
+    final Float32List input = _input;
+    _stftInto(segment, input, plane);
+    final Map<String, OnnxTensor> result = await session.run(
+      <String, OnnxTensor>{
+        inputName: OnnxTensor.float32(input, <int>[1, 4, c.dimF, c.dimT]),
+      },
+    );
+    final OnnxTensor? y = result[outputName] ?? result.values.firstOrNull;
+    final Float32List? spec = y?.floatData;
+    if (spec == null || spec.length != 4 * plane) {
+      throw StateError(
+        '人声分离模型输出形状不符：期望 ${4 * plane} 个 float，实得 '
+        '${spec?.length} (${y?.shape})',
+      );
+    }
+    return _istft(spec, plane, bins);
   }
 
   void _stftInto(Float32List segment, Float32List input, int plane) {
