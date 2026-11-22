@@ -58,6 +58,18 @@ class ArgResultsLike {
 
 // ---------------------------------------------------------------- transcribe
 
+/// `--clean-speech` / `--song` → 素材断言；都不给按混音素材（正确优先）。
+AsrAudioProfile _audioProfileOf(Command<int> command) {
+  final bool clean = command.argResults!['clean-speech'] as bool;
+  final bool song = command.argResults!['song'] as bool;
+  if (clean && song) {
+    command.usageException('--clean-speech 与 --song 不能同时使用');
+  }
+  if (clean) return AsrAudioProfile.cleanSpeech;
+  if (song) return AsrAudioProfile.song;
+  return AsrAudioProfile.mixedAudio;
+}
+
 class TranscribeCommand extends Command<int> {
   TranscribeCommand() {
     argParser
@@ -81,6 +93,11 @@ class TranscribeCommand extends Command<int> {
           help: '断言素材是干净朗读（有声书/口述）：语音与静默能量差 30 dB 以上，'
               '走零模型调用的能量门限切段。默认按混音素材处理（动画/影视/任何带 '
               'BGM 的音源），能量门限在那类素材上前提不成立。',
+          negatable: false)
+      ..addFlag('song',
+          help: '断言素材是歌曲（人声叠在伴奏上）：按混音素材选包与切段，识别前先用 '
+              'UVR MDX-Net 做人声分离（多下一个 28 MB 的分离模型）。不能与 '
+              '--clean-speech 同用。',
           negatable: false)
       ..addFlag('cpu', help: '强制 CPU（不试 GPU EP）', negatable: false)
       ..addFlag('coreml', help: '使用 macOS CoreML（FP32 模型）', negatable: false)
@@ -143,9 +160,7 @@ class TranscribeCommand extends Command<int> {
     }
 
     // 默认按混音素材处理：能量门限是带前提的优化，前提由调用方显式断言。
-    final AsrAudioProfile audioProfile = argResults!['clean-speech'] as bool
-        ? AsrAudioProfile.cleanSpeech
-        : AsrAudioProfile.mixedAudio;
+    final AsrAudioProfile audioProfile = _audioProfileOf(this);
 
     final String? out = argResults!['output'] as String?;
     final String text;
@@ -317,7 +332,9 @@ class _ModelsPullCommand extends Command<int> {
           help: '下有声书 / 口述用的包（与 transcribe --clean-speech 对应）。默认下'
               '混音素材（动画/影视）用的包——同一语言两者可能不同（日语：视频用 '
               'Parakeet，有声书用 ReazonSpeech）。',
-          negatable: false);
+          negatable: false)
+      ..addFlag('song',
+          help: '连同歌曲用的人声分离模型一起下（与 transcribe --song 对应）。', negatable: false);
   }
 
   @override
@@ -347,9 +364,7 @@ class _ModelsPullCommand extends Command<int> {
             : AsrEncoderVariant.int8;
     final AsrModelStore store = await AsrModelStore.open(
       language,
-      profile: argResults!['clean-speech'] as bool
-          ? AsrAudioProfile.cleanSpeech
-          : AsrAudioProfile.mixedAudio,
+      profile: _audioProfileOf(this),
     );
     await for (final ModelDownloadEvent e in store.download(variant)) {
       final String pct = e.totalBytes == 0

@@ -98,7 +98,37 @@ enum AsrAudioProfile {
   /// 代价已经付过：`silero_vad.onnx` 是每个语言包的必下文件，会话在引擎装载时
   /// 无条件打开（跑能量门限时它也开着），零新依赖、零额外下载。
   mixedAudio,
+
+  /// 歌曲：唱腔人声叠在伴奏上（音乐库歌词、OP/ED、角色歌）。
+  ///
+  /// 声学上是 [mixedAudio] 的一个特例，选包与切段都按 [mixedAudio]
+  /// （[packProfile]）；区别只在识别前多一道**人声分离**
+  /// （`asr_vocal_separation.dart`，UVR MDX-Net）：伴奏压掉后再送 ASR。
+  ///
+  /// 为什么值得多一道：2026-11-23 拿 メルト（やなぎなぎ ver.，270 s）在
+  /// Parakeet TDT-CTC 0.6B ja 上实测，直接识别整句不出字（「死んでしまうわ」
+  /// 「メルト 溶けてしまいそう」只剩「夢 / も / けてしま」）——是模型对唱腔 +
+  /// 伴奏不出字，不是后处理删的（CLI 路径没有校对 / 去幻听）；先分离再识别，
+  /// 这些句子回来了。代价是多下一个分离模型（[kAsrVocalSeparatorFile]，28 MB）
+  /// 与每窗口一次分离前向（CPU 上约 0.35 s / 5.8 s 音频，峰值工作集见
+  /// [kAsrVocalSeparationWorkingSetBytes]）。
+  song;
+
+  /// 选模型包、切段时当作哪种素材：[song] 按 [mixedAudio]，其余是自己。
+  AsrAudioProfile get packProfile =>
+      this == AsrAudioProfile.song ? AsrAudioProfile.mixedAudio : this;
+
+  /// 识别前是否先做人声分离。
+  bool get separatesVocals => this == AsrAudioProfile.song;
 }
+
+/// 模型包能声明服务的素材（[AsrModelPack.audioProfiles]）：只有声学上可区分的
+/// 两类。[AsrAudioProfile.song] 是「[AsrAudioProfile.mixedAudio] + 前处理」，
+/// 不是一种独立的包属性，包清单里写它是错的。
+const List<AsrAudioProfile> kAsrPackAudioProfiles = <AsrAudioProfile>[
+  AsrAudioProfile.cleanSpeech,
+  AsrAudioProfile.mixedAudio,
+];
 
 /// 转录语言。持久化用 [AsrLanguage.tag]（BCP-47 主子标签；粤语用 ISO 639-3
 /// `yue` 与普通话 `zh` 区分——它们是两种口语，不是两种书写），不要存枚举下标。
@@ -248,6 +278,10 @@ enum AsrModelRole {
   melFilterbank,
   tokens,
   vad,
+
+  /// 人声分离模型（[AsrAudioProfile.song] 才有，见 [AsrModelPack.withVocalSeparation]）。
+  /// 两个编码器变体共用。
+  vocalSeparator,
 }
 
 /// 清单里的一个模型文件。
@@ -310,7 +344,7 @@ class AsrModelPack {
     this.indexType = AsrIndexType.int64,
     this.blankToken = '<blk>',
     this.fp32GpuMinBudgetBytes,
-    this.audioProfiles = AsrAudioProfile.values,
+    this.audioProfiles = kAsrPackAudioProfiles,
     this.ctcFrontend = AsrCtcFrontend.waveform,
     this.license,
   });
@@ -325,9 +359,11 @@ class AsrModelPack {
   final List<AsrAudioProfile> audioProfiles;
 
   /// 是否在 [profile] 素材上参选；[profile] 为 null（老调用方）时只认通用包。
+  ///
+  /// [AsrAudioProfile.song] 按 [AsrAudioProfile.packProfile]（混音）参选。
   bool servesProfile(AsrAudioProfile? profile) => profile == null
-      ? audioProfiles.length == AsrAudioProfile.values.length
-      : audioProfiles.contains(profile);
+      ? kAsrPackAudioProfiles.every(audioProfiles.contains)
+      : audioProfiles.contains(profile.packProfile);
 
   /// CTC 包的输入前端（transducer 包忽略）。
   final AsrCtcFrontend ctcFrontend;
@@ -387,6 +423,7 @@ class AsrModelPack {
         fileForRole(asrJoinerRole(variant)),
         fileForRole(AsrModelRole.tokens),
         fileForRole(AsrModelRole.vad),
+        ..._vocalSeparatorFiles,
       ],
       // ctc / nemoCtc：模型（fp32 可能带外置权重）+ tokens / vad。
       AsrModelArchitecture.ctc || AsrModelArchitecture.nemoCtc =>
@@ -399,8 +436,41 @@ class AsrModelPack {
           if (f.role == AsrModelRole.melFilterbank) f,
         fileForRole(AsrModelRole.tokens),
         fileForRole(AsrModelRole.vad),
+        ..._vocalSeparatorFiles,
       ],
     };
+  }
+
+  Iterable<AsrModelFile> get _vocalSeparatorFiles =>
+      files.where((AsrModelFile f) => f.role == AsrModelRole.vocalSeparator);
+
+  /// 本包是否带人声分离模型（[withVocalSeparation] 派生出来的才有）。
+  bool get hasVocalSeparator =>
+      files.any((AsrModelFile f) => f.role == AsrModelRole.vocalSeparator);
+
+  /// [AsrAudioProfile.song] 用的派生包：同一套识别文件 + [kAsrVocalSeparatorFile]。
+  ///
+  /// **[id] 不变**：分离模型落在同一个语言包目录里，「装没装 / 下载 / 删包」
+  /// 全走这个包原有的 [filesFor] 路径，宿主的模型下载入口不用为歌曲另开一条；
+  /// 代价是两个语言都转歌曲时各存一份 28 MB。任务目录哈希靠
+  /// `AsrTranscriptionService.jobIdFor` 里的素材行区分，不靠 id。
+  AsrModelPack withVocalSeparation() {
+    if (hasVocalSeparator) return this;
+    return AsrModelPack(
+      languages: languages,
+      id: id,
+      displayName: displayName,
+      sourceUrl: sourceUrl,
+      files: <AsrModelFile>[...files, kAsrVocalSeparatorFile],
+      architecture: architecture,
+      decoderContextSize: decoderContextSize,
+      indexType: indexType,
+      blankToken: blankToken,
+      fp32GpuMinBudgetBytes: fp32GpuMinBudgetBytes,
+      audioProfiles: audioProfiles,
+      ctcFrontend: ctcFrontend,
+      license: license,
+    );
   }
 
   /// 某个变体全套文件的预期总字节数（用于「需要下多少」展示）。
@@ -420,7 +490,7 @@ class AsrModelPack {
         'blankToken': blankToken,
         if (fp32GpuMinBudgetBytes != null)
           'fp32GpuMinBudgetBytes': fp32GpuMinBudgetBytes,
-        if (audioProfiles.length != AsrAudioProfile.values.length)
+        if (!kAsrPackAudioProfiles.every(audioProfiles.contains))
           'audioProfiles': <String>[
             for (final AsrAudioProfile p in audioProfiles) p.name,
           ],
@@ -541,15 +611,16 @@ List<String> _asStringList(Map<String, Object?> m, String key) {
 
 /// 缺省 = 通用包（全部素材）；写了就必须非空、且每项都认得。
 List<AsrAudioProfile> _audioProfilesFromJson(Map<String, Object?> m) {
-  if (!m.containsKey('audioProfiles')) return AsrAudioProfile.values;
+  if (!m.containsKey('audioProfiles')) return kAsrPackAudioProfiles;
   final List<String> names = _asStringList(m, 'audioProfiles');
   if (names.isEmpty) {
     throw const FormatException('audioProfiles 写了就不能为空（缺省 = 全部素材）');
   }
+  // 只认 [kAsrPackAudioProfiles]：`song` 是混音 + 前处理，不是包属性。
   return <AsrAudioProfile>[
     for (final String name in names)
       _asEnum(<String, Object?>{'audioProfiles': name}, 'audioProfiles',
-          AsrAudioProfile.values, (AsrAudioProfile v) => v.name),
+          kAsrPackAudioProfiles, (AsrAudioProfile v) => v.name),
   ];
 }
 
@@ -575,6 +646,25 @@ const AsrModelFile kAsrVadFile = AsrModelFile(
       'asr-models/silero_vad.onnx',
   expectedBytes: 643854,
   role: AsrModelRole.vad,
+);
+
+/// 人声分离模型：UVR MDX-Net `UVR_MDXNET_9482`（ONNX，取 sherpa-onnx 的发布件，
+/// 它在 ONNX 元数据里写明了 STFT 参数：n_fft 4096 / hop 1024 / hann / center /
+/// dim_f 2048 / dim_t 256 / 44.1 kHz，`asr_vocal_separation.dart` 的常量逐项对照
+/// 它）。sherpa-onnx 文档明确要求从它的发布页取，不要从 TRvlvr/model_repo 取（那边
+/// 的文件没有元数据、输入名不同）。
+///
+/// 选它而不是同发布页的 `UVR-MDX-NET-Voc_FT`（64 MB）：体积一半、窗口参数相同；
+/// 歌词识别要的是「伴奏压下去、唱词还在」，不是可听的高保真人声。
+///
+/// 许可：UVR 项目（Anjok07/ultimatevocalremovergui）MIT；模型权重随 UVR 公开发布、
+/// 无单独许可文件。只按需下载，不随包分发。
+const AsrModelFile kAsrVocalSeparatorFile = AsrModelFile(
+  fileName: 'UVR_MDXNET_9482.onnx',
+  url: 'https://github.com/k2-fsa/sherpa-onnx/releases/download/'
+      'source-separation-models/UVR_MDXNET_9482.onnx',
+  expectedBytes: 29704738,
+  role: AsrModelRole.vocalSeparator,
 );
 
 const String _kHf = 'https://huggingface.co/';
@@ -1269,9 +1359,16 @@ const List<AsrModelPack> kAsrModelPacks = <AsrModelPack>[
 ///
 /// [profile]：要转的素材。传了就会让给只适用该素材的专用包（Parakeet 日语之于
 /// 视频）；不传只在通用包里选——老调用方的结果逐字不变。
+///
+/// [AsrAudioProfile.song] 取混音素材的包再挂上人声分离模型
+/// （[AsrModelPack.withVocalSeparation]）。
 AsrModelPack asrModelPackFor(AsrLanguage language, {AsrAudioProfile? profile}) {
-  final AsrModelPack? pack =
+  final AsrModelPack? found =
       asrModelRegistry.packForLanguage(language, profile: profile);
+  final AsrModelPack? pack =
+      found != null && profile != null && profile.separatesVocals
+          ? found.withVocalSeparation()
+          : found;
   if (pack == null) {
     throw StateError(
       '当前模型注册表里没有服务 ${language.tag} 的包；'

@@ -8,7 +8,9 @@ import 'package:fushi_asr_core/src/asr/asr_model_manifest.dart';
 import 'package:fushi_asr_core/src/asr/asr_model_store.dart';
 import 'package:fushi_asr_core/src/asr/asr_nemo_ctc_decoder.dart';
 import 'package:fushi_asr_core/src/asr/asr_transducer_decoder.dart';
+import 'package:fushi_asr_core/src/asr/asr_types.dart';
 import 'package:fushi_asr_core/src/asr/asr_vad.dart';
+import 'package:fushi_asr_core/src/asr/asr_vocal_separation.dart';
 import 'package:fushi_asr_core/src/onnx/onnx_inference.dart';
 import 'package:path/path.dart' as p;
 
@@ -27,6 +29,19 @@ class _FakeSession implements OnnxSession {
 
   @override
   Future<void> close() async => closed = true;
+}
+
+class _NullPcm implements AsrPcmSource {
+  @override
+  Future<int?> probeDurationMs(String audioPath) async => null;
+
+  @override
+  Stream<AsrPcmChunk> decode(
+    String audioPath, {
+    int startSample = 0,
+    int chunkSeconds = 600,
+  }) =>
+      const Stream<AsrPcmChunk>.empty();
 }
 
 class _FakeFactory implements OnnxSessionFactory {
@@ -259,6 +274,56 @@ void main() {
       expect(s.encoderResolution.effective, OnnxExecutionProvider.cpu);
       expect(s.nemoGpuBatchBudget, isNull);
       expect((s.newDecoder() as AsrNemoCtcDecoder).batchCapFor(window), isNull);
+      await s.close();
+    });
+
+    test('歌曲包：额外打开人声分离会话（走加速 EP），PCM 套分离层，close 一并关', () async {
+      final AsrModelStore song = AsrModelStore(
+        dir,
+        kAsrParakeetJapanesePack.withVocalSeparation(),
+      );
+      song
+          .fileFor(AsrModelRole.vocalSeparator)
+          .writeAsBytesSync(<int>[1, 2, 3]);
+      final _FakeFactory f = _FakeFactory(
+        available: const <OnnxExecutionProvider>{
+          OnnxExecutionProvider.directml,
+        },
+      );
+      final AsrEngineSessions s = await AsrEngineLoader(
+        factory: f,
+        platform: AsrPlatform.windows,
+      ).load(
+        store: song,
+        variant: AsrEncoderVariant.int8,
+        preference: AsrAccelerationPreference.auto,
+      );
+      final _FakeSession separator = s.vocalSeparator! as _FakeSession;
+      expect(p.basename(separator.path), kAsrVocalSeparatorFile.fileName);
+      expect(separator.providers.first, OnnxExecutionProvider.directml);
+      expect(separator.providers.last, OnnxExecutionProvider.cpu);
+      final AsrPcmSource base = _NullPcm();
+      expect(s.wrapPcmSource(base), isA<AsrVocalSeparatingPcmSource>());
+      // 健康检查回退换 EP 说明时不能把分离会话弄丢。
+      expect(
+        s.withEncoderResolution(s.encoderResolution).vocalSeparator,
+        same(separator),
+      );
+      await s.close();
+      expect(separator.closed, isTrue);
+    });
+
+    test('非歌曲包：不开分离会话，PCM 原样', () async {
+      final AsrEngineSessions s = await AsrEngineLoader(
+        factory: _FakeFactory(),
+      ).load(
+        store: parakeet,
+        variant: AsrEncoderVariant.int8,
+        preference: AsrAccelerationPreference.auto,
+      );
+      expect(s.vocalSeparator, isNull);
+      final AsrPcmSource base = _NullPcm();
+      expect(s.wrapPcmSource(base), same(base));
       await s.close();
     });
 
