@@ -53,7 +53,10 @@ AsrSegmenter buildAsrSegmenter({
                 scorer: EnergyVadScorer(),
                 maxSegmentMs: sessions.maxSegmentMs,
               ),
-            AsrAudioProfile.mixedAudio =>
+            // 歌曲按混音切段（[AsrAudioProfile.packProfile]）；切段器吃的已是分离后
+            // 的人声（[AsrVocalSeparatingPcmSource]）。
+            AsrAudioProfile.mixedAudio ||
+            AsrAudioProfile.song =>
               sessions.architecture == AsrModelArchitecture.nemoCtc
                   ? AsrSlidingWindowSegmenter()
                   : AsrVadSegmenter(
@@ -408,6 +411,10 @@ class AsrTranscriptionService {
       ..write('\n');
     if (profile == AsrAudioProfile.mixedAudio) {
       sb.write('profile=mixedAudio\n');
+    } else if (profile == AsrAudioProfile.song) {
+      // 歌曲与混音同一个包、同一种切段，但识别的是分离后的人声：结果不同，缓存
+      // 必须分开。
+      sb.write('profile=song\n');
     }
     if (segments != null) {
       sb
@@ -612,7 +619,7 @@ class AsrTranscriptionService {
         jobDir: jobDir,
         audioPaths: audioPaths,
         modelId: store.pack.id,
-        pcm: _pcm,
+        pcm: sessions.wrapPcmSource(_pcm),
         segmenter: buildAsrSegmenter(
           profile: audioProfile,
           sessions: sessions,

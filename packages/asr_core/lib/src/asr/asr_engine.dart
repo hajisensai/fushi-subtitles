@@ -22,6 +22,7 @@ import 'package:fushi_asr_core/src/asr/asr_transcribe_job.dart' show AsrSegmentD
 import 'package:fushi_asr_core/src/asr/asr_transducer_decoder.dart';
 import 'package:fushi_asr_core/src/asr/asr_types.dart';
 import 'package:fushi_asr_core/src/asr/asr_vad.dart' show kAsrDefaultMaxSegmentMs;
+import 'package:fushi_asr_core/src/asr/asr_vocal_separation.dart';
 import 'package:fushi_asr_core/src/onnx/onnx_inference.dart';
 
 /// 本子系统的 `dart:developer` 日志通道名（整本转录跑在后台 isolate，理由同
@@ -286,6 +287,7 @@ class AsrEngineSessions {
     this.encoderFp16 = false,
     this.nemoMel,
     this.nemoGpuBatchBudget,
+    this.vocalSeparator,
   }) : assert(
          asrIsCtcArchitecture(architecture) ||
              (decoder != null && joiner != null),
@@ -312,7 +314,43 @@ class AsrEngineSessions {
         encoderFp16: encoderFp16,
         nemoMel: nemoMel,
         nemoGpuBatchBudget: nemoGpuBatchBudget,
+        vocalSeparator: vocalSeparator,
       );
+
+  /// 挂上人声分离会话（[AsrAudioProfile.song]）；其余字段原样。
+  AsrEngineSessions withVocalSeparator(OnnxSession separator) =>
+      AsrEngineSessions(
+        encoder: encoder,
+        vad: vad,
+        tokens: tokens,
+        variant: variant,
+        encoderResolution: encoderResolution,
+        architecture: architecture,
+        decoder: decoder,
+        joiner: joiner,
+        greedy: greedy,
+        greedyPool: greedyPool,
+        greedyUnavailableReason: greedyUnavailableReason,
+        staticEncoders: staticEncoders,
+        decoderContextSize: decoderContextSize,
+        indexType: indexType,
+        encoderFp16: encoderFp16,
+        nemoMel: nemoMel,
+        nemoGpuBatchBudget: nemoGpuBatchBudget,
+        vocalSeparator: separator,
+      );
+
+  /// 人声分离会话：模型包带 [AsrModelRole.vocalSeparator]（歌曲素材）时由
+  /// [AsrEngineLoader.load] 打开，否则为 null。
+  final OnnxSession? vocalSeparator;
+
+  /// 两条装配路径（进程内 / isolate）共用：有分离会话就给 [pcm] 套上分离层。
+  AsrPcmSource wrapPcmSource(AsrPcmSource pcm) {
+    final OnnxSession? separator = vocalSeparator;
+    return separator == null
+        ? pcm
+        : AsrVocalSeparatingPcmSource(pcm, AsrVocalSeparator(separator));
+  }
 
   /// 模型包架构：决定 [newDecoder] 装哪种解码器、[maxSegmentMs] 取哪档。
   final AsrModelArchitecture architecture;
@@ -408,6 +446,7 @@ class AsrEngineSessions {
     await decoder?.close();
     await joiner?.close();
     await vad.close();
+    await vocalSeparator?.close();
     await greedy?.close();
     for (final OnnxSession s in greedyPool) {
       await s.close();
@@ -480,6 +519,76 @@ class AsrEngineLoader {
     int? materialMs,
     int? greedyIntraOpThreads = kAsrGreedyGraphIntraOpThreads,
     int? greedySessions,
+  }) async {
+    final AsrEngineSessions sessions = await _loadRecognizer(
+      store: store,
+      variant: variant,
+      preference: preference,
+      useGreedyGraph: useGreedyGraph,
+      useStaticEncoderBuckets: useStaticEncoderBuckets,
+      useFp16Encoder: useFp16Encoder,
+      staticBucketsOverride: staticBucketsOverride,
+      materialMs: materialMs,
+      greedyIntraOpThreads: greedyIntraOpThreads,
+      greedySessions: greedySessions,
+    );
+    if (!store.pack.hasVocalSeparator) return sessions;
+    try {
+      return sessions.withVocalSeparator(
+        await _openVocalSeparator(store, preference),
+      );
+    } catch (_) {
+      await sessions.close();
+      rethrow;
+    }
+  }
+
+  /// 人声分离会话：fp32 模型，有加速 EP 就上（每窗口一次大张量前向，GPU 上是
+  /// 零头），按编码器 fp32 变体同一套 EP 优先级选，CPU 兜底。
+  Future<OnnxSession> _openVocalSeparator(
+    AsrModelStore store,
+    AsrAccelerationPreference preference,
+  ) async {
+    Set<OnnxExecutionProvider> available = const <OnnxExecutionProvider>{};
+    if (preference != AsrAccelerationPreference.cpuOnly) {
+      try {
+        available = await _factory.availableAcceleratedProviders();
+      } catch (error) {
+        developer.log(
+          'ASR vocal separator: accelerated provider probe failed; using CPU',
+          name: kAsrLogName,
+          error: error,
+        );
+      }
+    }
+    final List<OnnxExecutionProvider> providers = selectAsrEncoderProviders(
+      platform: _resolvedPlatform,
+      available: available,
+      preference: preference,
+      variant: AsrEncoderVariant.fp32,
+    );
+    return _openManifestSession(
+      store,
+      AsrModelRole.vocalSeparator,
+      providers: providers,
+      onProviderResolved: (OnnxProviderResolution r) => developer.log(
+        'ASR vocal separator EP: $r',
+        name: kAsrLogName,
+      ),
+    );
+  }
+
+  Future<AsrEngineSessions> _loadRecognizer({
+    required AsrModelStore store,
+    required AsrEncoderVariant variant,
+    required AsrAccelerationPreference preference,
+    required bool useGreedyGraph,
+    required bool useStaticEncoderBuckets,
+    required bool useFp16Encoder,
+    required List<AsrEncoderBucket>? staticBucketsOverride,
+    required int? materialMs,
+    required int? greedyIntraOpThreads,
+    required int? greedySessions,
   }) async {
     Future<AsrEngineSessions> once(
       AsrAccelerationPreference pref,

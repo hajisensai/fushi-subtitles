@@ -31,6 +31,7 @@ export 'src/asr/asr_transcription_service.dart';
 export 'src/asr/asr_transducer_decoder.dart';
 export 'src/asr/asr_types.dart';
 export 'src/asr/asr_vad.dart';
+export 'src/asr/asr_vocal_separation.dart';
 export 'src/ffmpeg/ffmpeg_backend.dart';
 export 'src/moss/asr_quiet_cuts.dart';
 export 'src/moss/audiocpp_manifest.dart';

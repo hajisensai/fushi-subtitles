@@ -85,8 +85,9 @@ void main() {
             profile: AsrAudioProfile.cleanSpeech),
         same(kAsrJapanesePack),
       );
-      // 其它语言没有专用包：两种素材都是同一个通用包。
-      for (final AsrAudioProfile profile in AsrAudioProfile.values) {
+      // 其它语言没有专用包：两种声学素材都是同一个通用包（歌曲是派生包，见
+      // asr_vocal_separation_test.dart）。
+      for (final AsrAudioProfile profile in kAsrPackAudioProfiles) {
         expect(asrModelPackFor(AsrLanguage.english, profile: profile),
             same(kAsrEnglishPack));
       }

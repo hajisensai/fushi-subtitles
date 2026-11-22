@@ -404,12 +404,13 @@ class AsrServer {
     final AsrAudioProfile? audioProfile = switch (profileName) {
       'clean' => AsrAudioProfile.cleanSpeech,
       'mixed' => AsrAudioProfile.mixedAudio,
+      'song' => AsrAudioProfile.song,
       _ => null,
     };
     if (audioProfile == null) {
       response.statusCode = HttpStatus.badRequest;
       await _json(response, <String, Object?>{
-        'error': '未知 audioProfile "$profileName"，可选 clean / mixed',
+        'error': '未知 audioProfile "$profileName"，可选 clean / mixed / song',
       });
       return;
     }

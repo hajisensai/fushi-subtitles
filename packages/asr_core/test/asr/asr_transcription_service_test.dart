@@ -183,6 +183,32 @@ void main() {
         expect(plan.expectedProvider, OnnxExecutionProvider.directml);
       }
     });
+
+    test('歌曲：混音包在盘但缺分离模型 → 未就绪；补上分离模型 → 就绪', () async {
+      install(AsrEncoderVariant.int8);
+      AsrTranscriptionService song() => AsrTranscriptionService(
+            audioProfile: AsrAudioProfile.song,
+            backend: const AsrIsolateBackend(buildFactory: _unusedFactory),
+            loader: AsrEngineLoader(factory: _ProbeFactory()),
+            openStore: (AsrLanguage l, AsrAudioProfile p) async =>
+                AsrModelStore(tmp, asrModelPackFor(l, profile: p)),
+            jobsRoot: () async => tmp,
+            runInIsolate: false,
+          );
+      final AsrTranscribePlan before = await song().plan(
+        language: AsrLanguage.japanese,
+        preference: AsrAccelerationPreference.cpuOnly,
+      );
+      expect(before.modelReady, isFalse);
+      File(p.join(tmp.path, kAsrVocalSeparatorFile.fileName))
+          .writeAsBytesSync(<int>[1]);
+      final AsrTranscribePlan after = await song().plan(
+        language: AsrLanguage.japanese,
+        preference: AsrAccelerationPreference.cpuOnly,
+      );
+      expect(after.modelReady, isTrue);
+      expect(after.variant, AsrEncoderVariant.int8);
+    });
   });
 
   group('jobIdFor：文件名 + 字节数 + 模型包 id（A7 纯函数守卫）', () {
@@ -264,8 +290,7 @@ void main() {
       );
     });
 
-    test('素材进哈希：视频与有声书不共用缓存；有声书与老 id 相同（进行中任务不失联）',
-        () {
+    test('素材进哈希：视频与有声书不共用缓存；有声书与老 id 相同（进行中任务不失联）', () {
       final File a = write('a', 'x.mkv', 100);
       final String legacy = AsrTranscriptionService.jobIdFor(
         <String>[a.path],

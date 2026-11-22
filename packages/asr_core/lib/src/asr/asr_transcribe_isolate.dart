@@ -436,7 +436,7 @@ Future<void> _isolateMain(_IsolateArgs args) async {
       jobDir: Directory(spec.jobDirPath),
       audioPaths: spec.audioPaths,
       modelId: store.pack.id,
-      pcm: pcm,
+      pcm: sessions.wrapPcmSource(pcm),
       segmenter: buildAsrSegmenter(
         profile: spec.audioProfile,
         sessions: sessions,
