@@ -16,6 +16,8 @@
 ///    合并、跟读显示余量。判定本体在 Rust（`native/asr_cue_post`），本包只打包 / 写回；
 ///    原生库是硬依赖，宿主可以把 crate 编进自己的原生库再注入
 ///    （[AsrCuePostLibrary.fromDynamicLibrary]）。
+/// 6. 纯文本歌词（没有时间轴）对到这首歌的 ASR 转录上（[alignLyricsToTranscript]）：
+///    整首一次全局单调对齐，专门照顾拖音、和声、重复段；显示仍用歌词原文。
 ///
 /// 转录从哪来本包不管：喂进来的只是 [RetimingTranscription] 这个窄接口（cue 列表
 /// 加可选的逐 token 发射时间）。宿主可以用本仓的 ONNX 转录，也可以用别处产的
@@ -25,6 +27,7 @@ library;
 export 'src/cancellation.dart';
 export 'src/cue_post/cue_post_library.dart';
 export 'src/cue_post/cue_post_processor.dart';
+export 'src/lyrics_alignment.dart';
 export 'src/subtitle_clock.dart';
 export 'src/subtitle_format.dart';
 export 'src/subtitle_long_cue_split.dart';
