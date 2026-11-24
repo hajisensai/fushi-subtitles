@@ -103,6 +103,7 @@ class LyricsAlignment {
     required this.lyricChars,
     required this.matchedChars,
     required this.transcriptChars,
+    this.chanceMatchedChars = 0,
   });
 
   /// 与输入行一一对应（同序、同数）。
@@ -114,19 +115,30 @@ class LyricsAlignment {
   final int matchedChars;
   final int transcriptChars;
 
+  /// 底噪：歌词对「按字倒过来的同一份转录」逐字对上的字数（字的分布相同、先后
+  /// 关系全无时 DP 也能凑出这么多）。
+  final int chanceMatchedChars;
+
   /// 可信行占要唱的行的比例。
   double get anchoredRatio => sungLines == 0 ? 0 : anchoredLines / sungLines;
 
   /// 歌词逐字对上的比例。
   double get charCoverage => lyricChars == 0 ? 0 : matchedChars / lyricChars;
 
-  /// 结果能不能用：可信行至少 [kLyricsAlignMinAnchoredLines] 行，且可信行比例、逐字
-  /// 覆盖率都过门槛。不过门槛多半是转录与歌词根本不是同一首（或这首没人声 / 识别
+  /// 底噪覆盖率（见 [chanceMatchedChars]）。
+  double get chanceCoverage =>
+      lyricChars == 0 ? 0 : chanceMatchedChars / lyricChars;
+
+  /// 高出底噪的覆盖率：真对上同一首歌时才明显大于 0。
+  double get excessCoverage => charCoverage - chanceCoverage;
+
+  /// 结果能不能用：可信行至少 [kLyricsAlignMinAnchoredLines] 行，且可信行比例、高出
+  /// 底噪的逐字覆盖率（[excessCoverage]）都过门槛。不过门槛多半是转录与歌词根本不是同一首（或这首没人声 / 识别
   /// 全错），调用方应当告诉用户对不上，而不是存一份乱跳的时间轴。
   bool get isReliable =>
       anchoredLines >= kLyricsAlignMinAnchoredLines &&
       anchoredRatio >= kLyricsAlignMinAnchoredRatio &&
-      charCoverage >= kLyricsAlignMinCharCoverage;
+      excessCoverage >= kLyricsAlignMinExcessCoverage;
 
   Map<String, Object?> get stats => <String, Object?>{
         'sungLines': sungLines,
@@ -136,14 +148,22 @@ class LyricsAlignment {
         'transcriptChars': transcriptChars,
         'anchoredRatio': anchoredRatio,
         'charCoverage': charCoverage,
+        'chanceCoverage': chanceCoverage,
+        'excessCoverage': excessCoverage,
         'reliable': isReliable,
       };
 }
 
 /// [LyricsAlignment.isReliable] 的门槛。
+///
+/// 只看逐字覆盖率挡不住不相干的歌：DP 会尽量多凑逐字对上的字，同一套假名写的两首
+/// 不相干日文歌（转录是歌词的 1～3 倍长）实测覆盖率 0.20～0.34、可信行比例最高
+/// 0.42，旧门槛（0.2 / 0.3）会把它们当成同一首。所以覆盖率减去底噪
+/// （[LyricsAlignment.chanceCoverage]）再比：不相干的歌实测 ≤ 0.06，同一首歌汉字
+/// 歌词对假名转录 0.31～0.48。
 const int kLyricsAlignMinAnchoredLines = 2;
-const double kLyricsAlignMinAnchoredRatio = 0.3;
-const double kLyricsAlignMinCharCoverage = 0.2;
+const double kLyricsAlignMinAnchoredRatio = 0.5;
+const double kLyricsAlignMinExcessCoverage = 0.15;
 
 /// 一行算「可信」至少要逐字对上的比例（且至少 2 个字；1 个字的行要全对上）。
 const double kLyricsAlignLineAnchorRatio = 0.34;
@@ -211,7 +231,17 @@ LyricsAlignment alignLyricsToTranscriptSync(
   }
   final Int32List aligned = n == 0 || m == 0
       ? (Int32List(n)..fillRange(0, n, -1))
-      : _align(lyrics, transcript);
+      : _align(lyrics, transcript.chars);
+  // 底噪：同一份转录按字倒过来再对一遍。字的分布不变、先后关系全打乱，DP 在这上面
+  // 凑出的逐字对上就是「不相干的文本也能对上这么多」的水平。
+  int chanceMatched = 0;
+  if (n > 0 && m > 0) {
+    final Int32List chance =
+        _align(lyrics, transcript.chars.reversed.toList(growable: false));
+    for (final int v in chance) {
+      if (v >= 0) chanceMatched++;
+    }
+  }
 
   final List<_LineFit> fits = <_LineFit>[];
   int matchedTotal = 0;
@@ -268,6 +298,7 @@ LyricsAlignment alignLyricsToTranscriptSync(
     lyricChars: n,
     matchedChars: matchedTotal,
     transcriptChars: m,
+    chanceMatchedChars: chanceMatched,
   );
 }
 
@@ -470,9 +501,8 @@ const int _fromTranscriptGap = 2; // 转录多出来的字（向左）
 /// 半全局对齐：歌词必须整段用完，转录两端白送。返回与歌词字等长的数组：
 /// 对上（逐字或替换）的转录下标，歌词空位为 -1；逐字对上的下标存成 `j`，替换存成
 /// `-(j + 2)`（≤ -2），调用方据此区分。
-Int32List _align(_Lyrics lyrics, _Transcript transcript) {
+Int32List _align(_Lyrics lyrics, List<int> b) {
   final List<int> a = lyrics.chars;
-  final List<int> b = transcript.chars;
   final int n = a.length;
   final int m = b.length;
   final int width = m + 1;

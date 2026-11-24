@@ -227,6 +227,84 @@ void main() {
     expectMonotonic(a);
   });
 
+  // 短句看不出底噪：DP 会尽量凑逐字对上的字，同一套假名写的两首不相干的歌整首
+  // 对下来逐字覆盖率有 0.2～0.34，可信行比例能到 0.42。门槛要扣掉这层底噪。
+  const List<String> songAKanji = <String>[
+    '夜明け前の街を歩いて',
+    '君の名前をそっと呼んだ',
+    '冷たい風が頬をなでて',
+    '遠い記憶が目を覚ます',
+    'いつかまた会えると信じて',
+    '今日もひとりで空を見上げる',
+    '涙はもう流さないと',
+    'あの日の約束を胸に抱いて',
+    '走り出したこの道の先に',
+    '光があると信じているよ',
+    '君がいない世界でも',
+    '僕は歌い続けるだろう',
+  ];
+  const List<String> songAKana = <String>[
+    'よあけまえのまちをあるいて',
+    'きみのなまえをそっとよんだ',
+    'つめたいかぜがほほをなでて',
+    'とおいきおくがめをさます',
+    'いつかまたあえるとしんじて',
+    'きょうもひとりでそらをみあげる',
+    'なみだはもうながさないと',
+    'あのひのやくそくをむねにだいて',
+    'はしりだしたこのみちのさきに',
+    'ひかりがあるとしんじているよ',
+    'きみがいないせかいでも',
+    'ぼくはうたいつづけるだろう',
+  ];
+  const List<String> songBKana = <String>[
+    'さくらのはながちるころに',
+    'わたしはこのまちをでていくの',
+    'ありがとうっていえなくて',
+    'ごめんねばかりくりかえした',
+    'はるのあめにぬれながら',
+    'あなたのせなかをおいかけた',
+    'もしもじかんがもどせるなら',
+    'もういちどだけわらってほしい',
+    'さよならなんていわないで',
+    'こころのなかにずっといるから',
+    'きせつがめぐりはながさいて',
+    'またこのばしょであいましょう',
+  ];
+  RetimingTranscription sungAs(List<String> lines) => asr(<(String, int, int)>[
+        for (int i = 0; i < lines.length; i++)
+          (lines[i], 10000 + i * 5000, 14000 + i * 5000),
+      ]);
+
+  test('a full-length unrelated song in the same kana is unreliable', () {
+    for (final (List<String>, List<String>) pair
+        in <(List<String>, List<String>)>[
+      (songAKana, songBKana),
+      (songAKana, <String>[...songBKana, ...songBKana, ...songBKana]),
+      // 旧门槛（覆盖率 0.2 / 可信行 0.3）下这一对被当成同一首：覆盖率 0.34、
+      // 可信行 0.42，但底噪就有 0.30。
+      (songBKana, <String>[...songAKana, ...songAKana, ...songAKana]),
+    ]) {
+      final LyricsAlignment a =
+          alignLyricsToTranscriptSync(pair.$1, sungAs(pair.$2));
+      expect(a.isReliable, isFalse, reason: '${a.stats}');
+    }
+    expect(
+        alignLyricsToTranscriptSync(songAKanji, sungAs(songBKana)).isReliable,
+        isFalse);
+  });
+
+  test('the same song with kanji lyrics and a kana transcript is reliable', () {
+    final LyricsAlignment a =
+        alignLyricsToTranscriptSync(songAKanji, sungAs(songAKana));
+    expect(a.isReliable, isTrue, reason: '${a.stats}');
+    expect(a.excessCoverage, greaterThan(0.3), reason: '${a.stats}');
+    for (int i = 0; i < songAKanji.length; i++) {
+      expectNear(a.lines[i].startMs, 10000 + i * 5000, tolerance: 1500);
+    }
+    expectMonotonic(a);
+  });
+
   test('lines before the first anchor pack right against it', () {
     final LyricsAlignment a = alignLyricsToTranscriptSync(
       <String>['序', 'きみのなまえをよんだ', 'とおいそらのしたで'],
